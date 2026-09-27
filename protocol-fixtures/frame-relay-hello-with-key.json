@@ -1,0 +1,8 @@
+{
+  "type": "hello",
+  "pairId": "pR4dT9wKmZ2xL7vQn3sB8A",
+  "keyEnvelope": {
+    "epk": "Wrw0Odlp10UMvomb4H-GgbJQDaiLhV_Dc775GqEZ3Sg",
+    "sealed": "AenHhutjdHbSEDCRMMWtOlyGKVpnJ4TumKu22ZtDd96xeDm2oPraajYacOmttbTiFPjzNuDBNRVXVVP2WA"
+  }
+}

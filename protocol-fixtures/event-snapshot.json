@@ -1,0 +1,31 @@
+{
+  "kind": "snapshot",
+  "snapshot": {
+    "agents": [
+      {
+        "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+        "online": true,
+        "lastSeenAt": "2026-09-17T08:00:00Z",
+        "sealed": "Aekmh4kP6vzlHzk7cKjMfww57UFoGNo0wnqkBNEoEUjKF_mzGTLkqcFCVPeX_fo5zzwfCw_BbHobDqs3JVnHYanNBDgQTVc1L2R1SnimOHjqVycrAYnXLic_BvHflBOe8KHEO_M3p4noxeqXP4dceP3wey5DOVtrv_yUZIAgkVxxE6c6gifLPhnBF73oLpmRKntKTYeiZCniAvRf7ek6bSYn2MT84ipFQKsXNK8Pkb4vr1zmxPf6DZIQoEnhzEsxvP7uvJxYRUNZpbbb43wUCNPlLIFj3PD_p1iOlFONCZluyBVPL8NJsKTfydszJZ5AODkiNfWJPFWYFWX6zQLH2A7PKYecYkMF0G_lzR2rwTOdbK9Ustvv7Ph3d-Ou2kM7WwQDkhFFp-rAZoPB-rxEUb9aUyxqFr5N1LHmC40Ps5OO0USRRFfqi9rCxIJh1qCnrgFEwt0M7rd_6Ruw09Msn5JhPr7ABqxtIHtwyXd2mtUFtW4CYzBkmo0F6eZ3d9Ra3MNdBlIStYVvipRQGqnvDh7q5Y4V"
+      }
+    ],
+    "tasks": [
+      {
+        "id": "codex:01a0ab79-8c36-7011-bda3-10587db84466",
+        "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+        "updatedAt": "2026-09-17T08:00:00Z",
+        "sealed": "AYKU8-nyYTrf1HLdaYnmsP_L6XneV8GtcIW1nAF2w16PAPWLKjq2eG4RBAo7dhan5pUa1eYXTR28Ov-UZuWh9oD9rj53367oXZONTxogcVxf1zhPqB4L5-YTB6pQhqM0tx_ueIajmwYeSp8iSlMm-AXcVOuaXsXCEsIv6oVV0JIDHwxn5OTF3j-RE830CrDldhRDUCmu7tRuygBzC1QYnst-kCBHoV7LIoumbRXueiTqTmfMsRIAe9H2tY8wTX8Qrdzrnd5z0jT4yeo3tlUzwYu4BFX_dLMV9T7VSiUbAcgOLpkEjZ-cTg22-Zffwhjg7bdpmCG1Wu-TPeAO7xK2w7GeKwvMGSH8KBPnaSsSAulJxh3CK8HVpRvyTJxHjsHNMIUwOOHxokTDt5mB-FSvtQouKH_7FKb4y4DU2WYfln4645ZhAZhe8SL6JkRwUT70ywTuTjK3yrK0Fp6ltP3C_7swPnwuOK-27onjznW9UMaAXJFeHFXFBta9x2RzMrq7wCDD79u3vrh6nbhrUvmpp30zI6CV4n5pwHTHnuOO8Rt4PPNZIReBGu_3BerLiPxMgeheqjI7fUBVBwWTg4tMSJ6URLfOYQ"
+      }
+    ],
+    "projects": [
+      {
+        "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+        "sealed": "AUy9XH8cn7ZPQIC6hc92YIBT1Ns4cRsRZ9jQshmI-Xhh7BBJNDa_DbTxp7mnD06TJNvZr1gh99lv6WC5-EbScSCUf5aoepnnGLS1SVaBl3QZyYSuHdH5WkwMNh4CCy1t-wfV6p7eySi-oF7C4Y32wVMDF6a96zq2oZLLKreuGbkBBvO5PI9Bkiw3goH-P1NgQvYbTipPsqFJoRM06CMC6Ng4MLIqLScJU7TH001xsdRaa1Yp910bgyY"
+      }
+    ],
+    "recentResults": [],
+    "recentMessages": [],
+    "seq": 0,
+    "generatedAt": "2026-09-17T08:00:00Z"
+  }
+}

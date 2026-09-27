@@ -1,0 +1,9 @@
+{
+  "kind": "notify",
+  "notify": {
+    "taskId": "claude:7c1e2f3a-4b5c-4d6e-8f90-a1b2c3d4e5f6",
+    "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+    "category": "TASK_INPUT",
+    "sealed": "AZJEaRA8l_CUpXvaEWybc2UC70EszKJ-EpKPTN6hU1sCoFEQu1bFr8zeFKqOsVGW-x_4swc4ifTeukLKPyJYsnLJaSQHg7pcdvWtkvd0WY-0aIM7Eth11P7lSOede_oDEBhxuTfpZhAT-VY6PFH4IDeDbG6U0g1aWDcM44GKjF7D7W-fnMmupIkTkLBVknXyCKSjhESUkqvCrMyJP0wxSnrVime0NWvctGxx-8ubFpp6G7_pYQ3dJpByvsSUCy1B3ZKZZR5knw"
+  }
+}

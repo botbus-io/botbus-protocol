@@ -1,0 +1,44 @@
+{
+  "devices": [
+    {
+      "sealedName": "AZSP5gP2HcA2tcWW3BsigzCIiMha7mqwjoLtcBUEX5j597I2cp5kFdRNp1eMGw",
+      "platform": "ios",
+      "lastSeenAt": "2026-09-17T08:20:30Z",
+      "clientId": "c1RhbmRhcmQx"
+    },
+    {
+      "sealedName": "AZSP5gP2HcA2tcWW3BsigzCIiMha7mqYrprue1BxkiCwWuZ3SI2sO2NCcGPeDmGh5Wqe",
+      "platform": "watchos",
+      "lastSeenAt": "2026-09-17T08:19:00Z",
+      "clientId": "c1RhbmRhcmQx"
+    },
+    {
+      "sealedName": "AZSP5gP2HcA2tcWW3BuAcfrHwX-hDmha_F6uhtX7cGnfdAjxRUzW",
+      "platform": "ios",
+      "lastSeenAt": "2026-09-10T02:00:00Z"
+    },
+    {
+      "sealedName": "AZSP5gP2HcA2tcWW3BsigzCIiMha7mqYsI7wcRlC0engS3f0_4aIFD-G0tXwxF8",
+      "platform": "android",
+      "lastSeenAt": "2026-09-17T08:18:00Z",
+      "clientId": "c1RhbmRhcmQz"
+    }
+  ],
+  "clients": [
+    {
+      "id": "c1RhbmRhcmQx",
+      "sealedName": "AZSP5gP2HcA2tcWW3BsigzCIiMha7mqwjoLtcBUEX5j597I2cp5kFdRNp1eMGw",
+      "addedAt": "2026-09-17T08:06:00Z"
+    },
+    {
+      "id": "c1RhbmRhcmQy",
+      "sealedName": "AZSP5gP2HcA2tcWW3BuDQtoAPIcm9vD72JKmfNR-jbnviqYfq4QWFQ",
+      "addedAt": "2026-09-20T09:14:00Z"
+    },
+    {
+      "id": "c1RhbmRhcmQz",
+      "sealedName": "AZSP5gP2HcA2tcWW3BsigzCIiMha7mqYsI7wcRlC0engS3f0_4aIFD-G0tXwxF8",
+      "addedAt": "2026-09-21T09:14:00Z"
+    }
+  ]
+}

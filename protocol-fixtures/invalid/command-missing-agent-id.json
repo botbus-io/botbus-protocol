@@ -1,0 +1,8 @@
+{
+  "id": "2f3e4d5c-6b7a-4980-8172-635445362718",
+  "createdAt": "2026-09-17T08:26:00Z",
+  "kind": "interrupt",
+  "interrupt": {
+    "taskId": "codex:01a0ab79-8c36-7011-bda3-10587db84466"
+  }
+}

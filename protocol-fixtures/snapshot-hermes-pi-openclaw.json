@@ -1,0 +1,40 @@
+{
+  "agents": [
+    {
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "online": true,
+      "lastSeenAt": "2026-09-24T08:21:00Z",
+      "sealed": "Aekmh4kP6vzlHzk7cKjMfww57UFoGNo0wnqkBNEoEUjKF_mzGTLkqcFCVPeX_fo5zzwfCw_BbHobDqs3JVnHYanLBDgQTVc1L2R1SnimOHjqVycrAYnXLic_BvHflBOe8KHEO_M3p4noxeqXP4dceP3wey5DOVtrv_yUZIAgkVxxE6c6gifLPhnBF73oLpmRKntKTYeiZCniAvRf7ek6bSYn2MT84ipFQKsXNK8Pkb4vr1zmxPf6DZIQoEnhzEsxvP7uvJxYRUNZpbbb43wUCNPlLIFj3PD_rFGdjFKbC_YjyR4MYY1JuueH0cwiYogWISUpffXYd1OZRTK93UyKjxneat_LYhVehnX9zQur2jnMK85Ppsbwja0zZLv3whIwZ0FNnxJatpufd5_167JcF-QZEXYmX8kBiOOQAZdl6oGYwxGlBxmkgN-Nm9QpgYHu4QUNSyOq9Nhu43vznst4rpR7b7DYS61qazk3nyxxg-MP7CIGLWshgc4MpqU7NNBX3s5CQQ0-Oi_yITuYxOTIvlS6ggSnwnjrJ1c5i34_5HHZmwZo8cDhDqtI-MkSPDgGxzpRwub3lpuFotFau5AHRKkJWmZpyKOqVVbzmFbN4pzJ3rnCpGdBJ0Lj0O-nNMEc_JFNPJ3VnwRxbxT1VPxgh8tG01lkxQXZpWyZcSs0KjZXpQ6SzsWt5UefkO6YFjFCr8uoc1-gl2OZSAqKgap6taCNjZbRypp1iJN7SbpOHIFk0mq6n34tjXApPx2vl-GdT4QuMDKPH4IWAFGIf3C14m-uBKGmJQ9Ce_O2Z-KXGWccGXmM5pDgr57ZLZDoVVQXkm-ZKiqTfdk4XicGjaAGMCSIiTOcCELI78DH3JsxCEqqufLOMwFxKopW"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "pi:019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b",
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "updatedAt": "2026-09-24T08:20:00Z",
+      "sealed": "AbUOaBKyV0leQE5dxq0H77w6PnJ-FY9VjDEKOTbOyhgX-0E0f1q_sc1eUbeP4-91Da4NcSQiBfjX46XXUeeRoixZX9xx6ey1KZMYHUR4LLuR3t8P3Risqp_nY3rwTsu3Kmo4UV9fqr0BYNYB5f0j-1AfgQim7YNppkqOYcMaJjT-7x-AnDl8TeRlqspWT0TG-iZ-O-z2VqPbGBNQm3RsyXpvYcchI6mRk5CEzYNhZbZ6XUyjatr2tpdtGX2O3QJWC0L_uBlihZ0LAZhR5ilDAa8ko1PffBYuULJ5craBkwvYo5NjBzUqMjPyHOXJBSADsh6fQb3V6HlxaF6Ubj_ke9asVypt1by8Mw8RqLk89k2AKrRgh_gzrDuXUOfRcIUPdjBH6gpa95TqLHYRrv65l4j9-L7xmvod1bF5Of2dMFVDSXGBBKVlnzrThnHLhAEueN_b6GDbUxLpR8jQ5jX3JSCTTCh8XO6DuTM"
+    },
+    {
+      "id": "hermes:20260924_080102_a1b2c3",
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "updatedAt": "2026-09-24T08:15:00Z",
+      "sealed": "AQVmdoesLWX8tNa9TPFKNEfHGIrDMmsfrgKc4wSQaNdlVy8JDWgiz46efW1MQ66NEOk3JFta6gGpsi8pndS4aFfan9YrxsUll9k9d35geGlBI7v5XH9zKT6yOdrP52c4L2pWCZapI46He_3T1J0HI5_qk335M3C9u-vr4cdnpXC0cPJ2i6hjpB3nzQx3b1n6TkwfvpML6z0U7RvYm_FcacLROOh7EHu85kq5CJobSefjjBBqunFqskBSV_VNSrZvCmWFLGsaKBkGGp7VhLZQKuh-jJcfXmYXwIP7PkmVJUhrB8hw_ok2OgrzBFh7hbnyLAKfedqR2a55IDN7yHZQFk7CP2IjiW8dUC19dN8mSfP4beDyAGdroCKntptvL1aM4dk39rFHFE1REw_d2n99VNZYHimG611SfcO_Zoo6KvCHg4y7d7xeauACWwK6-fgv2Q3d4jA4eDQTBrXkUbRMfcgImjLuG9UI4x5FZUDohB5vBCOpvFz-3r7053FnlaxyVPxnz-0FzT2wCEbeXXwi0BShciCLRDQrtP9Yi8RTBs9vPqJz2g"
+    },
+    {
+      "id": "openclaw:agent:main:main",
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "updatedAt": "2026-09-24T08:12:00Z",
+      "sealed": "Af7KPtIXpeBuXEuYUEG3iLpQyeEPwpAWvhFPy5IDLtowU8OHW1QNZCv_jrsWSANh5XRL1tsP9913m3UJbSFlF5LS9c4zIuTq_nlycadPaS6_RJ6pbmOeYpSoX8fu_MArerQanQW8DOry5G7uvtr79l6gyev9BjBWJ74WR2_9PH1uMelhGpMwIqKrBxP-BXCDg2RXCzpSdqjTT7rv8uAtJsqeX8zTcTi0CG4-I-Ux9eS55K_vlwKRkNFJm8NspZmvmE9vczh91Nk0VG6c2o2d0J5NzWBSUs2hip2kVpi1jH90Rn0ym-N2lYtlvDo3RDZEOi1_24s3R-SZxPMbdGPEsRuSDF7EzeDcvXxYtEmLuke29_PtmqfvBJMUroJAbZHijtLsaDzSOFKS6cprCJjmv4eshYUb3k7ciAZhl-gs_BenlaiTtZUFm3zsSptzhCeSZLXvEfkVLxiyw2WckHDnOdWfQDQ7ZDMqiEagST42zIuPuBsky6gsrlunr-dJ8JYCmdZckDorGQJjvUzg8ug4EhjoG3X9b4VfVD3F-nXlCkPvXKlKVlTs7Bc4-QZjkozCgR1PGXVdfUeNuZ_iM9m44sDVlDrRXpCzjIYDiuBaxwaHQW26TekhE4ElSG86DF_77WU8"
+    }
+  ],
+  "projects": [
+    {
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "sealed": "AUy9XH8cn7ZPQIC6hc92YIBT1Ns4cRsRZ9jQshmI-Xhh7BBJNDa_DbTxp7mnD06TJNvZr1gh99lv6WC5-EbScSCUf5aoepnnG7e1SVaBlXQZyYSuHdH5WkwMNh4CCyVt5RuX5cPNmWH9pFDEq4Pukx0iDOH1ujqHt5rWdsixE_w0F-igdohQjGx2hoL9chFvUe0QQTtE4rkD4g8u4zA6VJmKOcEw6_1RGWn4Zp3P8w"
+    }
+  ],
+  "recentResults": [],
+  "recentMessages": [],
+  "seq": 42,
+  "generatedAt": "2026-09-24T08:21:00Z"
+}
