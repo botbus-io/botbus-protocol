@@ -1,0 +1,17 @@
+# gitleaks config for botbus-protocol. Everything allowlisted below is a synthetic test value:
+# fixture tokens are patterned hex or base64url of a sentence, the dsh test secret is base64url of 0x00…0x1f.
+title = "botbus-protocol"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic protocol fixtures and test vectors"
+paths = [
+  '''^protocol-fixtures/.*\.json$''',
+  '''^upstream-fixtures/.*''',
+  '''^scripts/seal-fixtures\.mjs$''',
+]
+regexes = [
+  '''AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd''',   # DshWebTests: base64url(0x00…0x1f), a fake cookie signing key
+]

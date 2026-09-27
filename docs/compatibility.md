@@ -30,6 +30,18 @@ For these changes, deploy a compatible Relay first, release iOS/Android/Watch, t
 
 The repository's code version, BotBus wire version, and Mac app version are separate. A connector-only patch does not raise the wire version or minimum mobile version.
 
+## Frozen enums
+
+`ProtocolFreezeTests` in `Tests/BotBusProtocolTests` pins every enum an installed client must recognise: `TaskSource`, `ConnectorKind`, `TaskStatus`, `TaskOrigin`, `PendingRequest.Kind`, `ArtifactKind`, `Command.Kind`, `Event.Kind`, `Notify.Category`, `Message.Role`, `ConnectorInfo.Status`. Changing any of them means bumping `ProtocolVersion.current`, updating `PROTOCOL.md` and this file, and following the client-release sequence above. New agents never add a `TaskSource`: they use `acp` with a `connectorId`.
+
+## Stable task IDs
+
+A connector's task ID for a given upstream session (`codex:<threadId>`, `claude:<sessionId>`, `acp:<connectorId>:<sessionId>`, …) is part of the contract: a connector update must not turn an existing session into a new task. The `expected/` records under `upstream-fixtures/` are the frozen values; an intentional change needs a migration note in `CHANGELOG.md`. An agent served as `acp:<connectorId>` is not promoted to a first-tier source later unless the ID change is accepted and a client release ships with it.
+
+## Planned one-time client release (3.3)
+
+To stop needing client releases for per-agent differences, the next regular client release adds optional fields that old clients ignore: `ConnectorInfo.capabilities` (`acceptsImages`, `canInterrupt`, `accentColor`), `ConnectorInfo.upstreamVersion`, and raises `AgentInfo.maxConnectors` from 16 to 32. The higher limit follows the client-release sequence above because 3.2 clients reject a snapshot with more than 16 connectors.
+
 ## Known BotBus 3.2 presentation limit
 
 Current mobile clients offer image sending for ACP sources before knowing an individual agent's image capability. The Mac rejects an image prompt if that agent did not advertise image support; it must not silently send text without the image. A future optional, per-connector capability field can improve this UI in a normal mobile release. Text tasks and existing commands remain usable without that field.
