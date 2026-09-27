@@ -1,6 +1,6 @@
 # BotBusConnectors
 
-公开仓库 `botbus-io/botbus-protocol` 的 `Sources/BotBusConnectors`。一档连接器（Codex、Claude Code、Hermes、Pi、OpenClaw、DeepSeek Harness）与 ACP 的全部实现，只依赖 [Kit](connector-kit.md) 与 `BotBusProtocol`；按 app 仓库的开源连接器设计稿（`docs/superpowers/specs/2026-09-27-open-connectors-design.md`） 第二步起随公开仓库 `botbus-io/botbus-protocol` 发布。上游 agent 改了格式只改这里并发 Mac 版；手机只认 Protocol，新 agent 一律走 `acp` + `connectorId`，不加 `TaskSource` 枚举值。以下源码均在 `Sources/BotBusConnectors/`，按来源分子目录。
+公开仓库 `botbus-io/botbus-protocol` 的 `Sources/BotBusConnectors`。一档连接器（Codex、Claude Code、Hermes、Pi、OpenClaw、DeepSeek Harness）与 ACP 的全部实现，只依赖 [Kit](connector-kit.md) 与 `BotBusProtocol`；源码与测试由 BotBus 的 app 仓库同步到这里，app 仓库是事实来源，改动方式见 [CONTRIBUTING.md](../CONTRIBUTING.md)。上游 agent 改了格式只改这里并发 Mac 版；手机只认 Protocol，新 agent 一律走 `acp` + `connectorId`，不加 `TaskSource` 枚举值。以下源码均在 `Sources/BotBusConnectors/`，按来源分子目录。
 
 ## 逐层定位
 
@@ -9,15 +9,15 @@
 | Codex 观察 | `CodexObserver.swift`、`CodexThreadReader.swift`、`CodexPaths.swift`（`SQLiteDatabase.swift` 在 Kit） | 只读数据库、轮询、任务与项目映射 |
 | Codex 控制 | `CodexConnector.swift`、`CodexAppServer.swift`、`CodexSubprocess.swift` | 线程/轮次、stdio RPC、子进程与重启 |
 | Codex 桌面桥接 | `CodexBridgeRouter.swift`、`CodexDesktopBridgeHost.swift`、`CodexDesktopBridgeClient.swift`、`CodexBridge/CodexBridgeMain.swift` | 桌面原协议请求复用、ID 隔离、审批竞争、私有回环接入 |
-| Codex 编解码 | `CodexAppServerMessages.swift`、`CodexJSON.swift` | JSON RPC 消息、通知、服务端请求；`CodexJSON.swift` 只保留公开 `BotBusConnectorParsers` 包的类型别名（Kit 的 `Reexports.swift` 已整包导出），实际通用 JSON 帧解析在公开仓库 |
-| Claude | `ClaudeConnector.swift`、`ClaudeHooks.swift`、`ClaudeHookInstaller.swift`、`ClaudeSessionHistory.swift`、`ClaudeModels.swift` | hook 映射、设置合并、`claude -p` 输出；`StreamJSONReader` 来自公开解析器包（经 Kit 导出）；启动时从 transcript 补回 7 天内的会话；运行中从 transcript 跟进 app 起的标题；手机能选的模型别名与 transcript 模型名的换算（协议 3.2） |
+| Codex 编解码 | `CodexAppServerMessages.swift`、`CodexJSON.swift` | JSON RPC 消息、通知、服务端请求；`CodexJSON.swift` 是 app-server 的按行帧（`CodexIncomingMessage` / `CodexOutgoingMessage`、`CodexRequestID`），日志描述只带方法名、不带参数；通用的 `JSONValue` 在 Kit |
+| Claude | `ClaudeConnector.swift`、`ClaudeHooks.swift`、`ClaudeHookInstaller.swift`、`ClaudeSessionHistory.swift`、`ClaudeModels.swift` | hook 映射、设置合并、`claude -p` 输出；stream-json 读取器 `StreamJSONReader` 在 Kit；启动时从 transcript 补回 7 天内的会话；运行中从 transcript 跟进 app 起的标题；手机能选的模型别名与 transcript 模型名的换算（协议 3.2） |
 | Pi | `PiSessionReader.swift`、`PiConnector.swift`、`PiMessageReader.swift` | 会话 JSONL（树，当前分支沿 `parentId` 回溯）的解析与带缓存的观察源；`pi --mode json` 子进程；对话记录 |
 | Hermes | `HermesStateReader.swift`、`HermesConnector.swift`、`HermesMessageReader.swift` | 只读 `~/.hermes/state.db`（按列存在与否容错、压缩父会话隐藏）；`hermes chat -q --format stream-json` 子进程；对话记录 |
 | OpenClaw | `OpenClawConfig.swift`、`OpenClawGateway.swift`、`OpenClawConnector.swift`、`OpenClawMessageReader.swift` | `openclaw.json`（JSON5）；Gateway WebSocket v4 握手与请求关联；连接器既观察又控制（全部 `claimLive`）；`chat.history` |
 | ACP（协议 2.13） | `AcpHub.swift`、`AcpConnector.swift`、`AcpConnector+Reverse.swift`、`AcpDiscovery.swift`、`JSONRPCPeer.swift` 等 | 第三方 ACP agent 的发现、子进程驱动与反向扩展，见下方「ACP」一节 |
 | DeepSeek Harness（协议 3.1） | `DshConnector.swift`、`DshTaskMapping.swift`、`DshPaths.swift`、`DshWeb*.swift`、`DshSessionScanner.swift`、`DshTranscript.swift` | 一档来源 `dsh`：连接器（ACP 子进程 + `dsh web` + 扫盘）、对账与 waterfall 映射、对话记录，见下方「DeepSeek Harness」一节 |
 | 描述符表与终端接续 | `ConnectorDescriptors.swift`、`DesktopResume.swift` | `ConnectorDescriptor.all(...)` 与各一档描述符（探测可执行文件与数据目录），`ConnectorRegistry.init(enabled:acpEnabled:)` 便利构造；`DesktopResume` 按来源拼在终端里接上会话的命令 |
-| 桥接器 | `Bridges/` | 预留给不支持 ACP 的 agent（设计 §8）：随 Mac 发布、以 `Origin.bridge` 进 `AcpHub`，目前为空 |
+| 桥接器 | `Bridges/` | 预留给不支持 ACP 的 agent（设计 §8）：随 Mac 发布、以 `Origin.bridge` 进 `AcpHub`；目前只有占位的 `Bridges.swift`（放 README.md 会让 SwiftPM 报未处理的文件） |
 
 ## 必须保留的行为
 

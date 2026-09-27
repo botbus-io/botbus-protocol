@@ -25,7 +25,7 @@ For these changes, deploy a compatible Relay first, release iOS/Android/Watch, t
 1. Add synthetic, credential-free upstream samples for the broken and fixed formats.
 2. Add parser and mapping tests. Check stable task IDs, status, message order, approval mapping, and command results.
 3. Run public conformance tests and the app repository's Swift, Kotlin, and Relay fixture tests.
-4. Tag this repository; pin the reviewed commit in the app repository. Do not load connector code from GitHub at runtime.
+4. Land the change in the app repository, which is the source of truth; it syncs the files back here in a sync pull request that is merged by fast-forward. Tag this repository when a release is cut. Do not load connector code from GitHub at runtime.
 5. Build, sign, notarize, and test the Mac app, then publish it through the existing update channel. A bad release is corrected with a newer Mac build.
 
 The repository's code version, BotBus wire version, and Mac app version are separate. A connector-only patch does not raise the wire version or minimum mobile version.

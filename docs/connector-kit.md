@@ -1,6 +1,6 @@
 # BotBusConnectorKit
 
-公开仓库 `botbus-io/botbus-protocol` 的 `Sources/BotBusConnectorKit`。连接器契约、`TaskStore`、`CommandDispatcher` 与连接器共用的本机基础设施；按 app 仓库的开源连接器设计稿（`docs/superpowers/specs/2026-09-27-open-connectors-design.md`） 第二步起随公开仓库 `botbus-io/botbus-protocol` 发布。只依赖 `BotBusProtocol` 与公开的 `BotBusConnectorParsers`；**不能** import `BotBusAgentCore` 或 `BotBusConnectors`，凡是要碰 Relay、凭据、产物上传、预览、远程操作的都留在 AgentCore，分发器对它们只认 `DispatcherServices.swift` 里的协议。以下源码均在 `Sources/BotBusConnectorKit/`。
+公开仓库 `botbus-io/botbus-protocol` 的 `Sources/BotBusConnectorKit`。连接器契约、`TaskStore`、`CommandDispatcher` 与连接器共用的本机基础设施；源码与测试由 BotBus 的 app 仓库同步到这里，app 仓库是事实来源，改动方式见 [CONTRIBUTING.md](../CONTRIBUTING.md)。只依赖 `BotBusProtocol`；**不能** import `BotBusAgentCore` 或 `BotBusConnectors`，凡是要碰 Relay、凭据、产物上传、预览、远程操作的都留在 AgentCore，分发器对它们只认 `DispatcherServices.swift` 里的协议。以下源码均在 `Sources/BotBusConnectorKit/`。
 
 ## 逐层定位
 
@@ -17,7 +17,7 @@
 | 对话读取 | `MessageReader.swift`、`TranscriptEntry.swift`（`CodexMessageReader.swift` / `ClaudeMessageReader.swift` 在 BotBusConnectors） | Codex SQLite / Claude transcript（Hermes / Pi / OpenClaw 的读取器在各自一行），只读且独立于控制连接器；产出 `TranscriptEntry`（消息 + 用户发的图、Codex 生成图的来源 + Agent 回复里的路径候选），纯图片消息 `text` 为空串也保留 |
 | 回复里的文件 | `TranscriptFileRefs.swift` | 协议 2.9 `Message.files`：`candidates(in:)` 从 Agent 回复的**未截断**原文里认媒体路径（反引号、Markdown 链接目标含 `<…>`、裸路径；只认图片 / 视频 / PDF 扩展名，不认 URL；每条最多 32 个），在公共 `transcriptEntry` 里只给 `.agent` 填（Claude / Pi 整份解析再截尾，只给最终窗口里的回复认）；`resolve` / `validate` 按任务项目目录做 realpath 校验，分发器补卡片与 `fetchFile` 复核共用 |
 | 网络抽象 | `WebSocketTransport.swift`、`URLSessionWebSocketTransport.swift` | 可替换 transport、握手、关闭码、ping |
-| 小工具 | `MediaType.swift`、`StringExtensions.swift`、`Reexports.swift` | 按扩展名定 MIME（产物上传与文件卡片共用）；`String.trimmed`；`@_exported import BotBusConnectorParsers`，让依赖 Kit 的包直接拿到 `JSONValue`、`StreamJSONReader` 与 Codex 帧类型（公开仓库 v0.2.0 并入后删除） |
+| 小工具 | `MediaType.swift`、`StringExtensions.swift`、`JSONValue.swift`、`StreamJSONReader.swift` | 按扩展名定 MIME（产物上传与文件卡片共用）；`String.trimmed`；任意 JSON 值 `JSONValue`（整数与浮点分开存，JSON-RPC 的 id 原样回写）；`claude -p --output-format stream-json` 的读取器（只取 session id、最后一段文字与成败，未知行一律忽略） |
 
 `ConnectorRegistry()` 不传描述符时用 `ConnectorDescriptor.placeholders()`：每个一档 kind 一条、视为已装已启用、不探测本机，给测试与不探测的调用方用；app 一律传 BotBusConnectors 的 `ConnectorDescriptor.all(...)`。
 

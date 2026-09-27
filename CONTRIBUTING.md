@@ -16,4 +16,8 @@ Connector fixes should come with a small reproducible sample of the upstream for
 
 ## Review and release
 
-Public pull request CI does not receive BotBus release credentials. Maintainers review, merge, tag a release, pin the commit in the app repository and ship it through the normal signed Mac build. A connector-only change does not bump the wire protocol version or the minimum mobile version.
+Most files here are synced from the BotBus app repository, which is the source of truth: `Sources/`, `Tests/`, `PROTOCOL.md`, `protocol-fixtures/*.json`, `upstream-fixtures/`, `src/protocol.ts`, `test/protocol.test.ts`, `scripts/seal-fixtures.mjs`, `scripts/check-remote-page-crypto.mjs` and `scripts/acp-registry-snapshot.py`. Pull requests that touch them are reviewed here, then a maintainer ports the change into the app repository; the next sync pull request brings it back, and it ships in the next signed Mac build. Changes to synced files are not merged here directly, because a change merged here without being ported would be reverted by the next sync.
+
+README, `docs/`, `CHANGELOG.md`, `Package.swift`, CI and `.gitleaks.toml` are maintained in this repository and merged here.
+
+Public pull request CI does not receive BotBus release credentials. Sync pull requests are merged by fast-forward, so every commit keeps its original author and committer. A connector-only change does not bump the wire protocol version or the minimum mobile version.

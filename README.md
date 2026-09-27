@@ -1,8 +1,8 @@
 # BotBus Protocol
 
-BotBus lets a phone or watch follow and control AI agents running on a computer. This repository is the public half of the BotBus computer app: the stable wire contract the mobile apps decode, and the Swift code that adapts each upstream agent (Codex, Claude Code, Hermes, Pi, OpenClaw, DeepSeek Harness, any ACP agent) into that contract. The Mac app compiles these packages directly at a pinned commit; there is no second, display-only copy.
+BotBus lets a phone or watch follow and control AI agents running on a computer. This repository is the public half of the BotBus computer app: the stable wire contract the mobile apps decode, and the Swift code that adapts each upstream agent (Codex, Claude Code, Hermes, Pi, OpenClaw, DeepSeek Harness, any ACP agent) into that contract. The BotBus app repository is the source of truth for this code and syncs it here through pull requests, so what you read here is exactly what the Mac app compiles; there is no second, display-only copy.
 
-When an upstream agent changes its files, CLI or protocol, the fix lands here and ships in a Mac update. iPhone, Android and Apple Watch never parse an agent's native format, so they do not need a release for that.
+When an upstream agent changes its files, CLI or protocol, the fix ships in a Mac update and is synced here. iPhone, Android and Apple Watch never parse an agent's native format, so they do not need a release for that.
 
 ## Packages
 
@@ -35,11 +35,15 @@ npm ci && npm run typecheck && npm test
 
 `protocol-fixtures/` sealed vectors are regenerated from `plain/` with `npm run seal-fixtures`; `npm run check:remote-page` checks the remote-control page's JavaScript crypto against the Swift implementation.
 
+## Where changes come from
+
+These files are synced from the BotBus app repository: `Sources/`, `Tests/`, `PROTOCOL.md`, `protocol-fixtures/*.json`, `upstream-fixtures/`, `src/protocol.ts`, `test/protocol.test.ts`, `scripts/seal-fixtures.mjs`, `scripts/check-remote-page-crypto.mjs` and `scripts/acp-registry-snapshot.py`. Changes arrive in pull requests titled "Sync from app repository" and are merged by fast-forward, so every commit keeps its original author. README, `docs/`, `CHANGELOG.md`, `Package.swift`, CI and `.gitleaks.toml` are maintained in this repository.
+
 ## Contributing a connector fix
 
 1. Reproduce the upstream change with a synthetic sample under `upstream-fixtures/<source>/<version>/` (see its README) — never real conversations, tokens, cookies or home directories.
 2. Fix the connector in `Sources/BotBusConnectors/<Source>/` and add or update tests.
 3. Keep task IDs, statuses, request kinds and command kinds unchanged; `ProtocolFreezeTests` fails if a frozen enum moves.
-4. Open a pull request. CI runs without any BotBus credentials; maintainers pin the reviewed commit into the next Mac build.
+4. Open a pull request. CI runs without any BotBus credentials. A maintainer ports the reviewed change into the app repository, which syncs it back here and ships it in the next Mac build.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Code and documentation are licensed under [Apache-2.0](LICENSE).
