@@ -17,3 +17,9 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+
+  swift-parsers:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test
