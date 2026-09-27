@@ -5,7 +5,7 @@ BotBus 3.2 already has one extensible agent source: `acp`. A connector is identi
 ## Which adapter to build
 
 1. If the agent speaks [Agent Client Protocol](https://agentclientprotocol.com), provide a BotBus manifest at `~/.botbus/agents/<connectorId>.json` or use an agent in the registry snapshot.
-2. If it has a different protocol, ship a bridge with the BotBus Mac app. The bridge speaks ACP to BotBus and translates to the agent's native API, CLI, or event stream. It remains Mac-side code; the phone never sees the native protocol.
+2. If it has a different protocol, ship a bridge with the BotBus Mac app (`Sources/BotBusConnectors/Bridges/`). A bridge hands `AcpHub` an `AcpAgentSpec` with `origin: .bridge` and an `AcpLauncherFactory`: it can run a real subprocess or implement the ACP agent side in-process over an in-memory pipe. Discovery and observation of sessions the agent opened itself are the bridge's job (the same pattern as the DeepSeek Harness connector), reported through the reverse extension. It remains Mac-side code; the phone never sees the native protocol.
 3. Built-in Codex and Claude Code adapters continue to use their existing `codex` and `claude` identities. Upstream changes in these adapters ship in a Mac release.
 
 Example manifest:
@@ -40,4 +40,4 @@ BotBus acts as an ACP client over newline-delimited JSON-RPC 2.0. It sends `init
 
 For a bridge that must report sessions opened in the agent's own terminal or IDE, see the [BotBus ACP guide and reverse extension](acp-agents.md). That extension is Mac-local and does not change the phone protocol.
 
-The authoritative field and limit definitions are in [PROTOCOL.md](../PROTOCOL.md). Existing samples are in [`protocol-fixtures/`](../protocol-fixtures/).
+Connector code lives in `Sources/BotBusConnectors/<Source>/` and implements the contracts in `Sources/BotBusConnectorKit` (`TaskConnector`, `MessageReader`, `ConnectorDescriptor`); `TaskStore` owns task identity and live-vs-observer ownership, `CommandDispatcher` routes phone commands by task-ID prefix. The authoritative field and limit definitions are in [PROTOCOL.md](../PROTOCOL.md). Existing samples are in [`protocol-fixtures/`](../protocol-fixtures/).

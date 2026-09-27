@@ -1,4 +1,4 @@
-name: Protocol conformance
+name: CI
 
 on:
   push:
@@ -6,7 +6,16 @@ on:
   pull_request:
 
 jobs:
-  conformance:
+  swift:
+    # Package platforms are macOS / iOS / watchOS 26.0, so the toolchain must be Xcode 27 on macOS 26.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - run: swift build
+      - run: swift test
+
+  typescript:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,9 +26,12 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - run: npm run check:remote-page
 
-  swift-parsers:
-    runs-on: macos-latest
+  secrets:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: swift test
+        with:
+          fetch-depth: 0
+      - run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest git /repo --config /repo/.gitleaks.toml --redact --no-banner

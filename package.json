@@ -6,7 +6,9 @@
   "description": "Public BotBus wire schema and conformance fixtures",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:remote-page": "node scripts/check-remote-page-crypto.mjs",
+    "seal-fixtures": "node scripts/seal-fixtures.mjs"
   },
   "dependencies": {
     "zod": "^4.6.5"
