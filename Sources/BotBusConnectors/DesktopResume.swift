@@ -5,7 +5,7 @@ import BotBusConnectorKit
 /// 在电脑上接着一条会话聊下去的终端命令：Mac 菜单「在电脑上继续」用。
 ///
 /// 手机任务是 BotBus 起的无界面子进程（`claude -p`、`codex app-server`、`hermes chat -q`……），
-/// 各家桌面 App 未必列得出来（Claude 桌面 App 只列它自己建的会话），所以统一交给各自 CLI 的交互模式接上。
+/// 各家桌面 App 未必列得出来（Claude 桌面 App 的列表不收 `claude -p` 起的会话），所以统一交给各自 CLI 的交互模式接上。
 public struct DesktopResumeCommand: Hashable, Sendable {
     public var executable: String
     public var arguments: [String]
