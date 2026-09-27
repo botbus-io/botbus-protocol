@@ -91,7 +91,10 @@ public final class StreamJSONReader: @unchecked Sendable {
             guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { continue }
             switch object["type"] as? String {
             case "system":
-                guard sessionID == nil, let id = object["session_id"] as? String, !id.isEmpty else { break }
+                // 只认 `init`：`--resume` 时 SessionStart hook 的 `hook_started` / `hook_response` 行排在它前面，
+                // 带的是一个临时 session id，拿它当会话 id 会让续聊被误判成分支。
+                guard sessionID == nil, object["subtype"] as? String == "init",
+                      let id = object["session_id"] as? String, !id.isEmpty else { break }
                 sessionID = id
                 newSessionID = id
                 sessionIDCallback = self.sessionIDCallback

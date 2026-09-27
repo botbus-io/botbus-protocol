@@ -32,6 +32,31 @@ final class StreamJSONReaderTests: XCTestCase {
         XCTAssertEqual(result.value?.lastText, "final answer")
         XCTAssertEqual(result.value?.failed, false)
     }
+
+    /// `claude -p --resume` 配了 SessionStart hook 时，hook 行排在 `init` 前面，带的是临时 id。
+    func testSessionIDComesFromInitNotFromEarlierHookLines() throws {
+        let pipe = Pipe()
+        let finished = expectation(description: "stream finished")
+        let result = LockedResult()
+        let reader = StreamJSONReader(handle: pipe.fileHandleForReading)
+        reader.onSessionID = { id in result.sessionID = id }
+        reader.onFinished = { value in
+            result.value = value
+            finished.fulfill()
+        }
+        reader.start()
+        let lines = [
+            #"{"type":"system","subtype":"hook_started","session_id":"temporary-hook-id"}"#,
+            #"{"type":"system","subtype":"hook_response","session_id":"temporary-hook-id"}"#,
+            #"{"type":"system","subtype":"init","session_id":"resumed-session"}"#,
+            #"{"type":"result","subtype":"success","result":"ok"}"#,
+        ]
+        try pipe.fileHandleForWriting.write(contentsOf: Data((lines.joined(separator: "\n") + "\n").utf8))
+        try pipe.fileHandleForWriting.close()
+        wait(for: [finished], timeout: 2)
+        XCTAssertEqual(result.sessionID, "resumed-session")
+        XCTAssertEqual(result.value?.sessionID, "resumed-session")
+    }
 }
 
 private final class LockedResult: @unchecked Sendable {
