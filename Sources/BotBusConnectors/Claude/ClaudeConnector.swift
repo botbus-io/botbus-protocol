@@ -30,6 +30,8 @@ public actor ClaudeConnector: TaskConnector {
     /// 等 `claude -p` 吐出 `system/init`（里面才有 session id）的上限。
     /// 命令回执只表示"后端已接受"，不该为了它等一整轮。
     static let sessionIDTimeout: TimeInterval = 20
+    /// `claude` 一行 init 都没吐就退出了（参数不认、没登录……）。新建时认它来决定要不要去掉 `--name` 重起。
+    static let exitedWithoutSessionID = ConnectorError("claude 退出了，没有拿到 session id")
     /// 标题上限，对齐协议里 Claude 取首条 prompt 截断 80 字。
     static let titleLimit = 80
     /// 只发图、不写字新建任务时的标题，与 `CodexConnector.imageOnlyTitle` 一致。仍记为占位，之后第一条带字的 prompt 会换掉它。
@@ -133,6 +135,9 @@ public actor ClaudeConnector: TaskConnector {
     }
     /// 正在追 transcript 标题的会话。同一会话同时只跑一个。
     private var titleRefreshes: [String: Task<Void, Never>] = [:]
+    /// 不认 `--name` 的 claude（软链接解析到底的路径）：之后新建时直接不带名字，免得每次多起一个失败的进程。
+    /// 升级后路径变了，自然再试一次。
+    private var binaryWithoutName: String?
     private let titleRetryDelays: [TimeInterval]
     /// 盯收尾标记的循环；没有要盯的会话时自己退出。
     private var turnEndCheck: Task<Void, Never>?
@@ -569,6 +574,19 @@ public actor ClaudeConnector: TaskConnector {
                        updatedAt: timestamp)
     }
 
+    /// 手机新建会话时给 `claude --name` 的名字：和列表里的标题同一个来源（首条 prompt 截断），
+    /// 控制字符与连续空白压成一个空格。名字写进 transcript 的 `custom-title`，终端的 `/resume` 列表、
+    /// Claude 桌面 App 导入这条会话时都显示它；之后这里读回来是 `.named`，只有空白和标题不同。
+    /// 只发图、没写字时不起名（标题是会被换掉的「图片」占位）。
+    static func sessionName(for prompt: String) -> String? {
+        // 控制字符（换行、制表、ESC……）一律当空白：名字之后会进终端标题，不能夹带转义序列。
+        let visible = String(prompt.trimmed.prefix(titleLimit)).unicodeScalars
+            .map { $0.properties.generalCategory == .control ? " " : String($0) }
+            .joined()
+        let name = visible.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return name.isEmpty ? nil : name
+    }
+
     /// 手机新建（或分支出）的会话用 prompt 起标题。prompt 去掉空白后是空的：只发图时记「图片」，
     /// 否则留着 `makeSession` 的项目名占位——列表里这一行不能没有名字。
     static func applyPromptTitle(_ session: inout Session, prompt: String, hasImages: Bool) {
@@ -659,11 +677,24 @@ public actor ClaudeConnector: TaskConnector {
         let chosen = try Self.resolve(selection, current: nil)
         let input = try Self.streamingInput(prompt: prompt, images: images)
         let injection = await AgentToolsInjection.make(tools(), registry: registry)
-        let sessionID = try await run(arguments: Self.arguments(prompt: prompt, resuming: nil, injection: injection,
-                                                                streamingInput: input != nil,
-                                                                model: chosen.model, effort: chosen.effort),
-                                      workingDirectory: projectPath, environment: injection?.environment ?? [:],
-                                      stdin: input)
+        let executable = binary().map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
+        let name = executable != nil && executable == binaryWithoutName ? nil : Self.sessionName(for: prompt)
+        let launch = { (name: String?) in
+            try await self.run(arguments: Self.arguments(prompt: prompt, resuming: nil, injection: injection,
+                                                         streamingInput: input != nil,
+                                                         model: chosen.model, effort: chosen.effort, name: name),
+                               workingDirectory: projectPath, environment: injection?.environment ?? [:], stdin: input)
+        }
+        let sessionID: String
+        do {
+            sessionID = try await launch(name)
+        } catch let error as ConnectorError where name != nil && error == Self.exitedWithoutSessionID {
+            // 老版本 claude 不认 `--name`，一行 init 都没吐就退了（这时什么都还没做）：不带名字再起一次。
+            // 别的原因（没登录……）早退的，第二次照样报同一个错。
+            Self.log.info("claude 没吐 init 就退出了，去掉 --name 再起一次")
+            sessionID = try await launch(nil)
+            binaryWithoutName = executable
+        }
         if let injection { await registry.bind(injection.token, taskId: taskId(for: sessionID)) }
         var session = makeSession(id: sessionID, projectPath: projectPath, origin: .watch)
         session.chosenModel = chosen.model
@@ -852,13 +883,16 @@ public actor ClaudeConnector: TaskConnector {
     /// `streamingInput`（发图时）：prompt 连同图改走 stdin 的一行 stream-json（见 `stdinPayload`），
     /// 不再有位置参数；可变参数改由紧跟其后的 `--input-format` 收尾。不发图时参数与以前逐项相同。
     /// `model` / `effort`（协议 3.2）是 `--model` / `--effort`，排在 prompt 之前；值已由 `resolve` 限定在
-    /// `ClaudeModels` 里，不会以 `-` 开头。
+    /// `ClaudeModels` 里，不会以 `-` 开头。`name`（只在新建时给，见 `sessionName`）也排在 prompt 之前，
+    /// 写成一个 `--name=…`：名字来自用户的话，可能以 `-` 开头，分成两个参数会被当成别的选项。
     static func arguments(prompt: String, resuming sessionID: String?, injection: AgentToolsInjection?,
-                          streamingInput: Bool = false, model: String? = nil, effort: String? = nil) -> [String] {
+                          streamingInput: Bool = false, model: String? = nil, effort: String? = nil,
+                          name: String? = nil) -> [String] {
         var arguments = ["-p"]
         if let sessionID { arguments += ["--resume", sessionID] }
         if let model { arguments += ["--model", model] }
         if let effort { arguments += ["--effort", effort] }
+        if let name { arguments.append("--name=\(name)") }
         if !streamingInput { arguments.append(prompt) }
         if let injection { arguments += injection.claudeArguments() }
         if streamingInput { arguments += ["--input-format", "stream-json"] }
@@ -948,7 +982,7 @@ public actor ClaudeConnector: TaskConnector {
         }
         process.terminationHandler = { _ in
             // 一行 init 都没吐出来就退了：别让调用方一直等到超时。
-            sessionID.resume(throwing: ConnectorError("claude 退出了，没有拿到 session id"))
+            sessionID.resume(throwing: Self.exitedWithoutSessionID)
             reader.finish()
         }
 

@@ -170,7 +170,7 @@ final class AgentToolsInjectionTests: XCTestCase {
         XCTAssertEqual(bound, "claude:sess-1")
         XCTAssertEqual(first.arguments, ClaudeConnector.arguments(
             prompt: "做个落地页", resuming: nil,
-            injection: AgentToolsInjection(configuration: configuration, token: token)))
+            injection: AgentToolsInjection(configuration: configuration, token: token), name: "做个落地页"))
 
         // 等这一轮跑完再续聊：还在跑时的续聊会排队（见 ClaudeFollowUpQueueTests）。
         await assertEventually(timeout: 5) { await store.task(id: "claude:sess-1")?.status == .completed }
@@ -193,11 +193,48 @@ final class AgentToolsInjectionTests: XCTestCase {
                                         binary: { claude.path })
         _ = try await connector.start(projectPath: directory.path, prompt: "hi")
         let recorded = try recorded(directory, "sess-1")
-        XCTAssertEqual(recorded.arguments, ["-p", "hi", "--output-format", "stream-json", "--verbose"])
+        XCTAssertEqual(recorded.arguments, ["-p", "--name=hi", "hi", "--output-format", "stream-json", "--verbose"])
         XCTAssertEqual(recorded.environment[1], ProcessInfo.processInfo.environment["BOTBUS_TASK_TOKEN"] ?? "")
         // 空环境的 claude 找不到 HOME 下的登录态，只会回 "Not logged in"。
         let home = try String(contentsOf: directory.appendingPathComponent("sess-1.home"), encoding: .utf8)
         XCTAssertEqual(home, ProcessInfo.processInfo.environment["HOME"])
+        await connector.stop()
+    }
+
+    /// 老版本 claude 不认 `--name`：一行 init 都没吐就退了。不带名字再起一次，会话照样开起来。
+    func testClaudeStartRetriesWithoutNameWhenOldCLIRejectsIt() async throws {
+        let directory = try tempDirectory()
+        let record = directory.path
+        let claude = try executable("claude", in: directory, script: """
+        #!/bin/sh
+        for a in "$@"; do case "$a" in --name=*) echo "error: unknown option '$a'" >&2; exit 1;; esac; done
+        for a in "$@"; do printf '%s\\0' "$a"; done > "\(record)/sess-1.args"
+        printf '\\n\\n\\n' > "\(record)/sess-1.env"
+        echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
+        echo '{"type":"result","subtype":"success","result":"done"}'
+        sleep 0.5
+        """)
+        let connector = ClaudeConnector(store: makeClaudeStore(),
+                                        paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                        binary: { claude.path })
+        let outcome = try await connector.start(projectPath: directory.path, prompt: "修复手表同步")
+        XCTAssertEqual(outcome.taskId, "sess-1")
+        XCTAssertEqual(try recorded(directory, "sess-1").arguments,
+                       ["-p", "修复手表同步", "--output-format", "stream-json", "--verbose"])
+
+        // 记住这个版本不认：第二次新建直接不带名字，只起一个进程。
+        let attempts = directory.appendingPathComponent("attempts")
+        try FileManager.default.removeItem(at: claude)
+        _ = try executable("claude", in: directory, script: """
+        #!/bin/sh
+        echo x >> "\(attempts.path)"
+        for a in "$@"; do case "$a" in --name=*) exit 1;; esac; done
+        echo '{"type":"system","subtype":"init","session_id":"sess-2"}'
+        echo '{"type":"result","subtype":"success","result":"done"}'
+        sleep 0.5
+        """)
+        _ = try await connector.start(projectPath: directory.path, prompt: "再开一个")
+        XCTAssertEqual(try String(contentsOf: attempts, encoding: .utf8), "x\n")
         await connector.stop()
     }
 
@@ -271,7 +308,7 @@ final class AgentToolsInjectionTests: XCTestCase {
         XCTAssertEqual(outcome.taskId, "sess-1")
         let recorded = try recorded(directory, "sess-1")
         XCTAssertEqual(recorded.arguments, ClaudeConnector.arguments(prompt: "看图", resuming: nil, injection: nil,
-                                                                     streamingInput: true))
+                                                                     streamingInput: true, name: "看图"))
         let stdin = try Data(contentsOf: directory.appendingPathComponent("sess-1.stdin"))
         let expected = try ClaudeConnector.stdinPayload(prompt: "看图", images: [
             (data: try Data(contentsOf: big), contentType: "image/png"),
