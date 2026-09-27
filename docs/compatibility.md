@@ -40,7 +40,12 @@ A connector's task ID for a given upstream session (`codex:<threadId>`, `claude:
 
 ## Planned one-time client release (3.3)
 
-To stop needing client releases for per-agent differences, the next regular client release adds optional fields that old clients ignore: `ConnectorInfo.capabilities` (`acceptsImages`, `canInterrupt`, `accentColor`), `ConnectorInfo.upstreamVersion`, and raises `AgentInfo.maxConnectors` from 16 to 32. The higher limit follows the client-release sequence above because 3.2 clients reject a snapshot with more than 16 connectors.
+To stop needing client releases for per-host and per-agent differences, the next regular client release adds optional fields that old clients ignore. Capabilities come in two layers, both optional objects of optional booleans; unknown keys are ignored and a missing object means "an older Mac, assume today's macOS behaviour".
+
+- **Host** (`AgentInfo.capabilities`): `remoteControl` (has a display and the remote-control service), `previews` (can share local previews), `fetchFile`, `fetchChanges`. A headless host such as the planned Linux CLI reports `remoteControl: false`; clients then hide the remote-control entry and never auto-open it.
+- **Connector** (`ConnectorInfo.capabilities`): `acceptsImages`, `canInterrupt`, `accentColor` (`#RRGGBB`); plus `ConnectorInfo.upstreamVersion` for display.
+- `AgentInfo.platform` gains `linux` and `windows`, and clients decode an unknown platform as `other` instead of rejecting the snapshot, so later platforms need no client release.
+- `AgentInfo.maxConnectors` rises from 16 to 32. This one follows the client-release sequence above because 3.2 clients reject a snapshot with more than 16 connectors.
 
 ## Known BotBus 3.2 presentation limit
 
