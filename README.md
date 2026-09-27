@@ -21,6 +21,7 @@ Dependency direction: `BotBusProtocol` ← `BotBusConnectorKit` ← `BotBusConne
 - [Compatibility policy](docs/compatibility.md): which changes ship in a Mac update and which need a client release; frozen enums and stable task IDs.
 - [Public fixtures](protocol-fixtures/README.md) and [upstream fixtures](upstream-fixtures/README.md): synthetic samples checked against Swift, Kotlin and TypeScript.
 - [ACP guide](docs/acp-agents.md): manifests, the ACP subset BotBus uses and the reverse extension.
+- [ConnectorKit guide](docs/connector-kit.md) and [Connectors guide](docs/connectors.md): file-by-file map of the two Swift packages and the behaviours their tests pin down (Chinese).
 
 ## Build and test
 
