@@ -2,7 +2,7 @@
 
 版本 **3.2**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
 
-Swift 实现在本仓库的 `Sources/BotBusProtocol`（BotBus 的 Mac、iPhone、Watch 经 SwiftPM 按固定提交依赖它），TypeScript 实现在本仓库的 `src/protocol.ts`（Relay 保留逐字节相同的副本），Kotlin 实现（Android）在 app 仓库的 `android/core/src/main/kotlin/io/botbus/core/Protocol.kt`，密封层在同目录的 `Sealing.kt` / `SealedTypes.kt`。三端都必须通过 `protocol-fixtures/` 下全部样本的往返测试，且拒绝 `invalid/` 下的样本：顶层是线上的密封形状，`plain/` 是密文里的明文结构（见文末「Fixture 与类型对应」）。Swift 中 `Task` 命名为 `TaskRecord`。
+Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，Kotlin 实现（Android）是 `Protocol.kt`，密封层在同目录的 `Sealing.kt` / `SealedTypes.kt`。在 app 仓库里它们分别位于 `Packages/BotBusProtocol`、`relay/src/protocol.ts` 与 `android/core/src/main/kotlin/io/botbus/core/`；公开仓库 `botbus-io/botbus-protocol` 由 app 仓库自动同步，前两者在那里是 `Sources/BotBusProtocol` 与 `src/protocol.ts`。三端都必须通过 `protocol-fixtures/` 下全部样本的往返测试，且拒绝 `invalid/` 下的样本：顶层是线上的密封形状，`plain/` 是密文里的明文结构（见文末「Fixture 与类型对应」）。Swift 中 `Task` 命名为 `TaskRecord`。
 
 本文按功能分章。总则讲三种载体、加密、帧与版本握手；之后八章各讲一类领域对象，每章末尾附上这一类的命令；附录 A 是逐版本的沿革，附录 B 是样本与类型的对应。
 
