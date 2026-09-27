@@ -350,7 +350,7 @@ agent 回传给手机的一件产物（2.3 起），挂在 `Task.artifacts` 上�
 |---|---|---|
 | id | string | image / file / video / link：Agent 生成，22 字符 base64url（16 随机字节）；preview：Relay 分配的 26 字符小写 base32（`[a-z2-7]`），同时是预览主机名 `p-<id>` 的一部分 |
 | kind | `image` \| `file` \| `video` \| `preview` \| `link` | 闭集，未知值拒绝整条 |
-| title | string | 截断 80 字 |
+| title | string | 截断 80 字。image / file / video 的客户端拿它当下载后的文件名，没有扩展名时按 `contentType` 补；Agent 保证 file 的标题带原文件的扩展名 |
 | createdAt | string | |
 | contentType | string? | image / file / video 必填，如 `image/png` |
 | size | integer? | image / file / video 必填，字节数，≥ 0 |

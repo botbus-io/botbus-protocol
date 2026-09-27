@@ -117,6 +117,10 @@ public actor ClaudeConnector: TaskConnector {
     /// 正在起 `--resume`、还没拿到 session id 的会话。这几秒里 `ownProcesses` 还没登记，
     /// 期间到达的续聊同样要排队（actor 在等 id 时会重入）。
     private var launching: Set<String> = []
+    /// `--resume` 分支出新 session 后，旧 session id 就放在这里。
+    /// 之后从桌面来的 hook 事件照样带着旧 id，如果放行就会把旧会话重新拉进列表，
+    /// 用户在手机上又看到两条——所以这里拦截，让旧会话安静地留在电脑上。
+    private var superseded: Set<String> = []
 
     /// 一条排队的续聊。图在收到时就读好（读不到当场报错），轮到它时直接写进 stdin。
     struct QueuedTurn: Sendable {
@@ -167,6 +171,7 @@ public actor ClaudeConnector: TaskConnector {
         queued.removeAll()
         for process in ownProcesses.values where process.isRunning { process.terminate() }
         ownProcesses.removeAll()
+        superseded.removeAll()
         for refresh in titleRefreshes.values { refresh.cancel() }
         titleRefreshes.removeAll()
         turnEndCheck?.cancel()
@@ -182,6 +187,9 @@ public actor ClaudeConnector: TaskConnector {
     public func handleHook(_ request: LocalHookServer.Request) async -> LocalHookServer.Reply {
         guard let event = ClaudeHookEvent(json: request.body) else { return .now(.noContent) }
         guard !event.sessionID.isEmpty else { return .now(.noContent) }
+        // 被分支取代的旧会话：桌面 hook 继续来，但 BotBus 不再管它。
+        // 放行的话会重建已移除的会话，手机上又变成两条。
+        guard !superseded.contains(event.sessionID) else { return .now(.noContent) }
 
         switch event.kind {
         case .sessionStart:
@@ -421,6 +429,8 @@ public actor ClaudeConnector: TaskConnector {
 
     /// 取出（或新建）一个会话，改完它，记下时间。Task 的产出统一在 `publish()`。
     private func apply(_ event: ClaudeHookEvent, _ mutate: (inout Session, ClaudeHookEvent) -> Void) {
+        // 被分支取代的旧会话：桌面 hook 继续来，但手机上只该看到分支那一条。
+        guard !superseded.contains(event.sessionID) else { return }
         let existing = sessions[event.sessionID]
         var session = existing ?? makeSession(id: event.sessionID, projectPath: event.cwd, origin: .desktop)
         if let path = event.transcriptPath, !path.isEmpty { session.transcriptPath = path }
@@ -710,7 +720,7 @@ public actor ClaudeConnector: TaskConnector {
         let existing = sessions[sessionID]
         let workingDirectory = existing?.projectPath ?? FileManager.default.currentDirectoryPath
         // `--resume` 对桌面上正在交互的会话会**分支**出一个新 session，而不是接进原会话。
-        // v1 接受这个行为：把新 id 回给客户端，由它提示"已作为分支继续"。
+        // 分支出来后旧 session 从列表里移除（`superseded`），手机上只看到分支那一条。
         // 续聊沿用这条任务之前的 token（agent 若把它记在了别处也照样有效）；分支出新 session 时改绑到新 id。
         launching.insert(sessionID)
         defer { launching.remove(sessionID) }
@@ -729,6 +739,10 @@ public actor ClaudeConnector: TaskConnector {
             branched.chosenModel = existing?.chosenModel
             branched.chosenEffort = existing?.chosenEffort
             sessions[newID] = branched
+            // 旧会话被分支取代：从列表中移除，之后的桌面 hook 事件也不再接收。
+            // 手机上只看到分支那一条，不会出现"一个会话变成两个"。
+            if let old = sessions.removeValue(forKey: sessionID) { releaseHold(for: old) }
+            superseded.insert(sessionID)
         } else {
             apply(ClaudeHookEvent.synthetic(kind: .userPromptSubmit, sessionID: sessionID, cwd: workingDirectory)) {
                 session, _ in session.status = .running
