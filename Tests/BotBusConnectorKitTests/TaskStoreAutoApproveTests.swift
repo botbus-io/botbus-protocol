@@ -97,6 +97,30 @@ final class TaskStoreAutoApproveTests: XCTestCase {
         XCTAssertEqual(project, "/work/app")
     }
 
+    /// 子目录项目（协议 3.4 的 worktree 会话）：手机选 `/work/app/web` 开的会话跑在 `<wt>/web`，
+    /// 归回 `/work/app/web`——设置记在哪个项目，查的时候也得是这个项目，不能漂到主仓库根上。
+    func testWorktreeSessionInSubdirectoryProjectMatchesThePickedProject() async {
+        let store = makeStore()
+        await store.setAutoApprove(true, project: "/work/app/web")
+        let cwd = "/work/app/.claude/worktrees/a1b2c3/web"
+
+        let fresh = await store.autoApproves(taskId: "claude:new", workingDirectory: cwd)
+        XCTAssertTrue(fresh, "第一轮还没进 store，按工作目录归项目也要对上")
+        let project = await store.autoApproveProject(forWorkingDirectory: cwd)
+        XCTAssertEqual(project, "/work/app/web")
+
+        await store.upsert(task("sub", path: cwd))
+        let stamped = await store.task(id: "claude:sub")
+        XCTAssertEqual(stamped?.projectPath, "/work/app/web")
+        XCTAssertEqual(stamped?.worktreePath, cwd)
+        XCTAssertEqual(stamped?.autoApprove, true)
+        // 主仓库根上的设置不外溢到子目录项目。
+        await store.setAutoApprove(false, project: "/work/app/web")
+        await store.setAutoApprove(true, project: "/work/app")
+        let rootOnly = await store.task(id: "claude:sub")
+        XCTAssertNil(rootOnly?.autoApprove)
+    }
+
     func testOutsideProjectNeverCarriesAutoApprove() async {
         let store = makeStore()
         await store.upsert(task("home", path: "/Users/me"))

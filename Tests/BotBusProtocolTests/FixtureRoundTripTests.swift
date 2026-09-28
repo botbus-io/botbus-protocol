@@ -99,6 +99,9 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(Command.self, "plain/command-remote-control.json"),
         roundTripCase(Command.self, "plain/command-start-task-acp.json"),
         roundTripCase(Command.self, "plain/command-set-connector-enabled-acp.json"),
+        roundTripCase(Command.self, "plain/command-start-task-worktree.json"),
+        roundTripCase(Command.self, "plain/command-start-task-worktree-auto-approve.json"),
+        roundTripCase(Command.self, "plain/command-merge-worktree.json"),
     ] }
 
     private static var eventCases: [FixtureCase] { [
@@ -124,6 +127,7 @@ final class FixtureRoundTripTests: XCTestCase {
 
     private static var changesCases: [FixtureCase] { [
         roundTripCase(WorkingChanges.self, "plain/working-changes.json"),
+        roundTripCase(WorkingChanges.self, "plain/working-changes-merge-target.json"),
     ] }
 
     private static var agentCases: [FixtureCase] { [
@@ -131,6 +135,7 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(ConnectorInfo.self, "plain/connector-info-unavailable.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-acp.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-models.json"),
+        roundTripCase(AgentInfo.self, "plain/agent-info-worktrees.json"),
     ] }
 
     private static var relayCases: [FixtureCase] { [
@@ -172,6 +177,10 @@ final class FixtureRoundTripTests: XCTestCase {
         "plain/invalid/command-follow-up-bad-model.json",
         "plain/invalid/command-start-task-bad-effort.json",
         "plain/invalid/connector-info-effort-not-listed.json",
+        "plain/invalid/command-start-task-worktree-new-project.json",
+        "plain/invalid/command-start-task-worktree-openclaw.json",
+        "plain/invalid/command-start-task-worktree-outside-project.json",
+        "plain/invalid/agent-info-worktrees-false.json",
     ]
 
     // MARK: - 往返
@@ -412,6 +421,34 @@ final class FixtureRoundTripTests: XCTestCase {
         XCTAssertFalse(ModelOption.isValidId(""))
         XCTAssertFalse(ModelOption.isValidEffort("High"))
         XCTAssertTrue(ModelOption.isValidEffort("xhigh"))
+    }
+
+    /// 协议 3.4：worktree 只和非空的已有项目一起出现，不和 newProject 同时出现，OpenClaw 不收。
+    func testWorktreeFieldsAreValidated() throws {
+        XCTAssertThrowsError(try decodeFixture(Command.self, "plain/invalid/command-start-task-worktree-new-project.json"))
+        XCTAssertThrowsError(try decodeFixture(Command.self, "plain/invalid/command-start-task-worktree-openclaw.json"))
+        XCTAssertThrowsError(try decodeFixture(Command.self, "plain/invalid/command-start-task-worktree-outside-project.json"))
+        XCTAssertThrowsError(try decodeFixture(AgentInfo.self, "plain/invalid/agent-info-worktrees-false.json"))
+
+        let start = try XCTUnwrap(decodeFixture(Command.self, "plain/command-start-task-worktree.json").startTask)
+        XCTAssertEqual(start.worktree, true)
+        // 3.3 的 autoApprove 与 3.4 的 worktree 可以同时出现在一条 startTask 里。
+        let both = try XCTUnwrap(decodeFixture(Command.self, "plain/command-start-task-worktree-auto-approve.json").startTask)
+        XCTAssertEqual(both.worktree, true)
+        XCTAssertEqual(both.autoApprove, true)
+        XCTAssertNil(try XCTUnwrap(decodeFixture(Command.self, "plain/command-start-task.json").startTask).worktree)
+        let merge = try decodeFixture(Command.self, "plain/command-merge-worktree.json")
+        XCTAssertEqual(merge.kind, .mergeWorktree)
+        XCTAssertEqual(merge.mergeWorktree?.taskId, "claude:4f1c2a9e-0000-4000-8000-000000000033")
+        XCTAssertEqual(try decodeFixture(AgentInfo.self, "plain/agent-info-worktrees.json").worktrees, true)
+        XCTAssertNil(try decodeFixture(AgentInfo.self, "plain/agent-info.json").worktrees)
+        XCTAssertEqual(try decodeFixture(WorkingChanges.self, "plain/working-changes-merge-target.json").mergeTarget, "main")
+
+        // 空的 projectPath（「不在项目中」）不能带 worktree。
+        let empty = #"{"source":"claude","projectPath":" ","prompt":"hi","worktree":true}"#
+        XCTAssertThrowsError(try ProtocolJSON.decoder().decode(Command.StartTask.self, from: Data(empty.utf8)))
+        let falsy = #"{"source":"claude","projectPath":"/p","prompt":"hi","worktree":false}"#
+        XCTAssertThrowsError(try ProtocolJSON.decoder().decode(Command.StartTask.self, from: Data(falsy.utf8)))
     }
 
     /// 协议 3.3：项目级自动批准。能力与状态都只写 true（没有时整键省略）；命令里 true / false 都有意义。

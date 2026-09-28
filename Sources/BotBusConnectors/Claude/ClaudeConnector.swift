@@ -348,7 +348,7 @@ public actor ClaudeConnector: TaskConnector {
 
     /// 本连接器自己起的那一轮还没收尾（含起进程到拿到 session id 的几秒）。看登记而不是 `isRunning`：
     /// 进程退出到 `finish` 摘掉登记之间到达的 SessionEnd 若抢先记了 interrupted，`finish` 就改不回 completed 了。
-    private func isOwnTurn(_ sessionID: String) -> Bool {
+    func isOwnTurn(_ sessionID: String) -> Bool {
         launching.contains(sessionID) || ownProcesses[sessionID] != nil
     }
 
@@ -1056,6 +1056,20 @@ public actor ClaudeConnector: TaskConnector {
         return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
     }
 
+    /// 协议 3.4：手机合并并结束了这个会话（`TaskStore.hide` 已经把它藏起来）。transcript 留在磁盘上不动，
+    /// 这里只让连接器忘掉它：挂着的审批放掉、排队的续聊作废，并像被分支取代的旧会话一样记进 `superseded`——
+    /// 之后桌面 hook 再来既不重建它，也不挂起审批（手机上看不到，挂着只会让 Claude Code 干等 120 秒）。
+    public func discard(taskId: String) async {
+        guard let sessionID = try? nativeID(taskId) else { return }
+        queued.removeValue(forKey: sessionID)
+        if let session = sessions.removeValue(forKey: sessionID) { releaseHold(for: session) }
+        // 已经退出的进程登记直接摘；还在退出的由 `finish` 摘（会话不在了它也照摘）。
+        if ownProcesses[sessionID]?.isRunning != true { ownProcesses.removeValue(forKey: sessionID) }
+        superseded.insert(sessionID)
+        // 项目列表随之更新：worktree 目录不该还挂在手机的最近项目里。
+        await publish()
+    }
+
     private func nativeID(_ taskId: String) throws -> String {
         guard let colon = taskId.firstIndex(of: ":") else { return taskId }
         let native = String(taskId[taskId.index(after: colon)...])
@@ -1230,7 +1244,8 @@ public actor ClaudeConnector: TaskConnector {
 
     /// 后台读完一轮之后的收尾：写最终状态。
     private func finish(_ result: StreamJSONReader.Result) async {
-        guard let sessionID = result.sessionID, sessions[sessionID] != nil else { return }
+        guard let sessionID = result.sessionID else { return }
+        // 进程登记先摘：会话可能已经被 `discard` 拿掉（合并并结束和这一轮退出撞上），登记不能跟着留下。
         ownProcesses.removeValue(forKey: sessionID)
         if let stdin = controls.removeValue(forKey: sessionID) {
             stdin.close()
@@ -1240,6 +1255,7 @@ public actor ClaudeConnector: TaskConnector {
                 questionHolds.removeValue(forKey: key)
             }
         }
+        guard sessions[sessionID] != nil else { return }
         let next = queued[sessionID]?.first
         if next != nil { queued[sessionID]?.removeFirst() }
         if queued[sessionID]?.isEmpty == true { queued.removeValue(forKey: sessionID) }

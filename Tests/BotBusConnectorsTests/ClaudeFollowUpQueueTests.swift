@@ -99,6 +99,18 @@ final class ClaudeFollowUpQueueTests: XCTestCase {
         await connector.stop()
     }
 
+    /// 协议 3.4：合并并结束和一轮正在退出的进程撞上时，进程退出后的收尾照样摘掉进程登记，不留一个永远"自己在跑"的会话。
+    func testDiscardWhileOwnProcessExitsLeavesNothingBehind() async throws {
+        let (_, connector, directory) = try await makeRig()
+        _ = try await connector.followUp(taskId: "claude:sess-q", prompt: "slow one", images: [])
+        let running = await connector.isOwnTurn("sess-q")
+        XCTAssertTrue(running)
+        await connector.discard(taskId: "claude:sess-q")
+        await assertEventually(timeout: 5) { self.calls(directory).contains("end slow one") }
+        await assertEventually(timeout: 2) { await !connector.isOwnTurn("sess-q") }
+        await connector.stop()
+    }
+
     func testInterruptDropsQueuedFollowUps() async throws {
         let (store, connector, directory) = try await makeRig()
         _ = try await connector.followUp(taskId: "claude:sess-q", prompt: "slow one", images: [])

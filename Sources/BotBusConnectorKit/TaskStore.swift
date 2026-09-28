@@ -45,6 +45,10 @@ public actor TaskStore {
     public static var defaultPhoneTasksURL: URL {
         LocalHookServer.defaultSupportDirectory.appendingPathComponent("phone-tasks.json")
     }
+    /// app 用的「合并并结束后隐藏的会话」持久化位置，见 `HiddenTaskArchive`。
+    public static var defaultHiddenTasksURL: URL {
+        LocalHookServer.defaultSupportDirectory.appendingPathComponent("hidden-tasks.json")
+    }
     /// app 用的「开了自动批准的项目」持久化位置（协议 3.3），见 `AutoApproveArchive`。
     public static var defaultAutoApproveURL: URL {
         LocalHookServer.defaultSupportDirectory.appendingPathComponent("auto-approve.json")
@@ -113,6 +117,12 @@ public actor TaskStore {
     private let phoneTasksURL: URL?
     private var pendingPhoneTasksSave: Task<Void, Never>?
 
+    /// 手机「合并并结束」后隐藏的会话（协议 3.4）：任务 id → 隐藏的时间。`apply` 一律丢掉它们。
+    private var hidden: [String: String] = [:]
+    private let hiddenTasksURL: URL?
+    /// 这台电脑能不能从手机开 worktree 会话（`AgentInfo.worktrees`）：装了 `WorktreeManaging` 才是 true。
+    private let supportsWorktrees: Bool
+
     /// 开了「自动批准」的项目路径（协议 3.3，盖章后的 `projectPath`：worktree 记主仓库）。和产物一样在
     /// `stamped(_:)` 与 `mergedProjects()` 里打到外发的任务与项目上，连接器与观察者不感知；
     /// 连接器遇到审批时经 `autoApproves(taskId:workingDirectory:)` 来问。改了立刻落盘，重启后仍在。
@@ -122,11 +132,15 @@ public actor TaskStore {
     /// - Parameters:
     ///   - artifactsURL: 产物持久化文件；nil = 只在内存里（测试默认）。app 传 `defaultArtifactsURL`。
     ///   - autoApproveURL: 自动批准的项目设置；nil = 只在内存里（测试默认）。app 传 `defaultAutoApproveURL`。
+    ///   - hiddenTasksURL: 隐藏会话的持久化文件；nil = 只在内存里。app 传 `defaultHiddenTasksURL`。
+    ///   - supportsWorktrees: 分发器装了 `WorktreeManaging` 时传 true，快照的 `AgentInfo.worktrees` 随之为 true。
     public init(identity: AgentIdentity = AgentIdentity(),
                 connectors: ConnectorRegistry = ConnectorRegistry(),
                 artifactsURL: URL? = nil,
                 phoneTasksURL: URL? = nil,
                 autoApproveURL: URL? = nil,
+                hiddenTasksURL: URL? = nil,
+                supportsWorktrees: Bool = false,
                 artifactSaveDelay: TimeInterval = TaskStore.defaultArtifactSaveDelay,
                 outsideProjects: OutsideProjectRule = OutsideProjectRule(),
                 worktrees: WorktreeResolver = WorktreeResolver(),
@@ -140,6 +154,8 @@ public actor TaskStore {
         self.artifactsURL = artifactsURL
         self.phoneTasksURL = phoneTasksURL
         self.autoApproveURL = autoApproveURL
+        self.hiddenTasksURL = hiddenTasksURL
+        self.supportsWorktrees = supportsWorktrees
         self.artifactSaveDelay = artifactSaveDelay
         self.systemPermissionInspector = systemPermissionInspector
         self.systemPermissionInspectionTimeout = systemPermissionInspectionTimeout
@@ -153,6 +169,9 @@ public actor TaskStore {
                                                          limit: Self.maxPhoneStartedTasks)
         }
         if let autoApproveURL { self.autoApproveProjects = AutoApproveArchive.load(from: autoApproveURL) }
+        if let hiddenTasksURL {
+            self.hidden = HiddenTaskArchive.trimmed(HiddenTaskArchive.load(from: hiddenTasksURL))
+        }
     }
 
     /// 配对完成后把 Relay 分配的 agentId 填进来，并给已存的任务与项目重新盖章。
@@ -289,6 +308,8 @@ public actor TaskStore {
     /// 把一个 id 交给实时数据源：从此 `reconcile` 对它既不 upsert 也不 remove。
     /// 允许在任务还不存在时先声明（`startTask` 先 claim 再等第一条实时数据）。
     public func claimLive(_ id: String) {
+        // 手机合并并结束过的会话（协议 3.4）：连接器照旧 claim（Claude 的 `publish`），这里不给它挂所有权。
+        guard hidden[id] == nil else { return }
         owners[id] = .live
         handoffDeadlines.removeValue(forKey: id)
     }
@@ -401,6 +422,42 @@ public actor TaskStore {
         return events
     }
 
+    /// 手机「合并并结束」一个会话（协议 3.4）：记进隐藏集合并立刻落盘，再像 `remove` 一样删掉、发 `taskRemoved`。
+    /// 之后只读观察报上来、实时连接器 upsert 都进不来。store 里本来就没有它时也发一次 `taskRemoved`，免得 Relay 里残留。
+    ///
+    /// 挂着的产物一并摘掉：会话都没了，产物留着只会占 200 个任务的名额。其中若有还在转发的预览，这里停不了
+    /// （预览分享在 AgentCore），它照旧转发到过期（2 小时），手机上已经没有入口能打开它。
+    @discardableResult
+    public func hide(id: String) -> [Event] {
+        hidden[id] = ProtocolJSON.timestamp(now())
+        hidden = HiddenTaskArchive.trimmed(hidden)
+        flushHiddenTasks()
+        if artifactsByTask.removeValue(forKey: id) != nil { scheduleArtifactSave() }
+        guard tasks[id] != nil else {
+            clearSystemPermission(for: id)
+            let events = [Event.taskRemoved(id)]
+            publish(events)
+            return events
+        }
+        return remove(id: id)
+    }
+
+    /// 这个 id 是不是被手机合并并结束过（协议 3.4）。重试的 `mergeWorktree` 靠它认出"已经做完了"。
+    public func isHidden(_ id: String) -> Bool { hidden[id] != nil }
+
+    /// 工作目录在这个 worktree 里的全部任务（协议 3.4）。Claude 在桌面会话上续聊会分支出新 session，
+    /// 同一个 worktree 可能挂着好几条，合并后要一起隐藏。按字符串前缀比（不读盘），工作目录与 `worktree.path`
+    /// 都是真实路径，见 `ManagedWorktree.contains`。
+    public func tasks(workingIn worktree: ManagedWorktree) -> [TaskRecord] {
+        tasks.values.filter { worktree.contains($0.workingDirectory) }
+    }
+
+    /// 把隐藏集合写盘。`hide` 已经同步写过；测试与退出前也可以直接调。
+    public func flushHiddenTasks() {
+        guard let hiddenTasksURL else { return }
+        HiddenTaskArchive.save(hidden, to: hiddenTasksURL)
+    }
+
     public func task(id: String) -> TaskRecord? { tasks[id] }
 
     /// 把一个不改变任务状态的事件推进事件流。目前只有 `taskMessages`——它是一次查询的结果，
@@ -493,7 +550,8 @@ public actor TaskStore {
             let events = performSetConnectorEnabled(payload.connector, enabled: payload.enabled)
             publish(events)
             return (CommandResult(commandId: command.id, ok: true, finishedAt: finishedAt), events)
-        case .startTask, .followUp, .approve, .interrupt, .fetchMessages, .fetchFile, .fetchChanges, .remoteControl:
+        case .startTask, .followUp, .approve, .interrupt, .fetchMessages, .fetchFile, .fetchChanges, .remoteControl,
+             .mergeWorktree:
             // 这些都归 CommandDispatcher（要连接器或 MessageReader）；走到这里说明调用方绕过了它。
             return failure("这个版本的 Agent 还不支持 \(command.kind.rawValue)")
         }
@@ -512,7 +570,8 @@ public actor TaskStore {
         let me = AgentInfo(agentId: identity.agentId, name: identity.name, platform: .macos, online: true,
                            lastSeenAt: generatedAt, appVersion: identity.appVersion,
                            connectors: connectors.connectors(taskCounts: counts),
-                           projectsRoot: outsideProjects.projectsRoot)
+                           projectsRoot: outsideProjects.projectsRoot,
+                           worktrees: supportsWorktrees ? true : nil)
         return Snapshot(agents: [me], tasks: visible, projects: mergedProjects(),
                         recentResults: [], seq: 0, generatedAt: generatedAt)
     }
@@ -776,6 +835,8 @@ public actor TaskStore {
             Self.log.warning("丢弃 id 前缀不匹配的任务：\(task.id, privacy: .public)，应以 \(task.source.rawValue, privacy: .public): 开头")
             return []
         }
+        // 手机合并并结束过的会话（协议 3.4）：观察器与连接器再报上来也不收。
+        guard hidden[task.id] == nil else { return [] }
         let previous = tasks[task.id]
         guard previous != task else { return [] }
         if task.status != .failed { clearSystemPermission(for: task.id) }

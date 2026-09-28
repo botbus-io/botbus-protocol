@@ -452,9 +452,9 @@ final class TaskStoreTests: XCTestCase {
         await assertEventually { firstFinished.current }
 
         _ = await store.reconcile(source: .codex, tasks: [task("a", .completed, updatedAt: "2026-09-18T02:05:00Z")], projects: [])
-        await assertEventually { secondEvents.current.contains(.taskUpdated) }
+        // taskUpdated 与 notify 是同一批发出的，但消费者逐条处理：两条都等到，不能见到第一条就查第二条。
+        await assertEventually { secondEvents.current.contains(.taskUpdated) && secondEvents.current.contains(.notify) }
         XCTAssertEqual(firstEvents.current, [.taskUpdated], "被顶掉的订阅者不该再收到任何事件")
-        XCTAssertTrue(secondEvents.current.contains(.notify))
 
         firstConsumer.cancel()
         secondConsumer.cancel()

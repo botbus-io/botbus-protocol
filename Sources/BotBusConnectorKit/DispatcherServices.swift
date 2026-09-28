@@ -40,8 +40,74 @@ public protocol FileFetching: Sendable {
 }
 
 /// 手机看任务目录里没提交的改动（协议 2.11 的 `fetchChanges`）：读 git 并上传，返回产物 id。
+/// `worktree` 非 nil（协议 3.4，BotBus 开的 worktree 会话）时范围从基准分支的 merge-base 算起，清单带 `mergeTarget`。
 public protocol WorkingChangesUploading: Sendable {
-    func upload(directory: String) async throws -> String?
+    func upload(directory: String, worktree: ManagedWorktree?) async throws -> String?
+}
+
+/// BotBus 从手机开的一个 worktree（协议 3.4）。Agent 本机持久化，只有有记录的才能合并。
+public struct ManagedWorktree: Codable, Hashable, Sendable {
+    /// worktree 根目录（真实路径），`<仓库>/.claude/worktrees/<名字>`。
+    public var path: String
+    /// 主仓库根目录（真实路径）。
+    public var repository: String
+    /// worktree 自己的分支，`botbus/<名字>`。
+    public var branch: String
+    /// 建它时 `projectPath` 所在那份检出（通常是主仓库）的当前分支：合并落到这里。
+    public var baseBranch: String
+    /// 建它时基准分支的提交。基准分支之后被删掉时，差异面板拿它当比较起点。
+    public var baseCommit: String
+
+    public init(path: String, repository: String, branch: String, baseBranch: String, baseCommit: String) {
+        self.path = path
+        self.repository = repository
+        self.branch = branch
+        self.baseBranch = baseBranch
+        self.baseCommit = baseCommit
+    }
+
+    /// `directory` 是不是在这个 worktree 里（根目录本身或它的子目录）。只比字符串前缀、不读盘：
+    /// `path` 是真实路径（解开了软链接，`/private/var/…` 而不是 `/var/…`），调用方也得传真实路径。
+    /// 任务盖过章的工作目录可以直接传（连接器报的 cwd 与 BotBus 交给连接器的 worktree 目录都是真实路径）；
+    /// 来路不明的目录先 `TranscriptFileRefs.realPath`，`WorktreeManager.worktree(containing:)` 就是这么做的。
+    public func contains(_ directory: String) -> Bool {
+        directory == path || directory.hasPrefix(path + "/")
+    }
+}
+
+/// `WorktreeManaging.create` 建好的结果。
+public struct WorktreeCreation: Sendable, Equatable {
+    /// 交给连接器的 cwd：worktree 里与原 `projectPath` 对应的目录。
+    public var workingDirectory: String
+    public var worktree: ManagedWorktree
+
+    public init(workingDirectory: String, worktree: ManagedWorktree) {
+        self.workingDirectory = workingDirectory
+        self.worktree = worktree
+    }
+}
+
+/// `WorktreeManaging.mergeAndRemove` 成功时的两种结果。
+public enum WorktreeMergeOutcome: Sendable, Equatable {
+    /// 合并了（或本来就没什么可合），worktree、分支与记录都删了。
+    case merged
+    /// squash 提交已经在基准分支上，但 worktree 里又有了新文件（合并期间才写进去的），所以 worktree、它的分支与
+    /// 记录都留着没删。调用方应当告诉手机、不隐藏会话：再合并一次会把新文件也合进去。
+    case mergedButKept
+}
+
+/// 手机开的 worktree 会话（协议 3.4）：建、查、合并回检出分支。git 写操作在 AgentCore 的 `WorktreeManager`。
+public protocol WorktreeManaging: Sendable {
+    /// 在 `projectPath` 所在仓库新开一个 worktree。建不了（不是 git 仓库、没有提交、detached HEAD）返回 nil，
+    /// 调用方照旧在 `projectPath` 里跑；真出错（git 失败、磁盘满）抛错。
+    func create(from projectPath: String) async throws -> WorktreeCreation?
+    /// 连接器没起来：删掉刚建的 worktree、分支与记录。尽力而为，不抛。
+    func discard(_ worktree: ManagedWorktree) async
+    /// 有记录、目录还在、`directory` 在它里面的那个 worktree。
+    func worktree(containing directory: String) async -> ManagedWorktree?
+    /// squash 合并回 `baseBranch`，成功后删 worktree、分支与记录。失败抛错（文案给手机看），什么都不删。
+    /// 合并落地但 worktree 删不掉（又有了新文件）时返回 `.mergedButKept`，见 `WorktreeMergeOutcome`。
+    func mergeAndRemove(_ worktree: ManagedWorktree, message: String) async throws -> WorktreeMergeOutcome
 }
 
 /// 远程操作（协议 2.12）：开关这台电脑的桌面远程操作，返回预览产物。

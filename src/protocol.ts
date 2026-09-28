@@ -308,6 +308,8 @@ export const AgentInfo = z.object({
     }),
   /** 协议 2.6：手机新建项目时电脑在这个目录下建子文件夹；省略 = 这台电脑不接受新建项目。 */
   projectsRoot: z.string().optional(),
+  /** 协议 3.4：能从手机开 worktree 会话、能 mergeWorktree。只写 true。 */
+  worktrees: z.literal(true).optional(),
 });
 
 // ---- Snapshot ----
@@ -379,13 +381,15 @@ export const WorkingChanges = z.object({
   generatedAt: z.string(),
   files: z.array(ChangedFile),
   totalFiles: z.number().int().nonnegative(),
+  /** 协议 3.4：可以把这些改动合并回去的分支；只有 BotBus 开的 worktree 会话才有。 */
+  mergeTarget: z.string().optional(),
 });
 
 // ---- Command ----
-/** 协议 2.9 起加入 fetchFile，2.11 起加入 fetchChanges，2.12 起加入 remoteControl。 */
+/** 协议 2.9 起加入 fetchFile，2.11 起加入 fetchChanges，2.12 起加入 remoteControl，3.4 起加入 mergeWorktree。 */
 export const CommandKind = z.enum([
   "startTask", "followUp", "approve", "interrupt", "setConnectorEnabled", "fetchMessages", "fetchFile",
-  "fetchChanges", "remoteControl",
+  "fetchChanges", "remoteControl", "mergeWorktree",
 ]);
 
 export const Command = z
@@ -414,8 +418,16 @@ export const Command = z
         effort: ModelEffort.optional(),
         /** 协议 3.3：把所在项目的自动批准设为开 / 关，之后沿用；省略 = 不动。 */
         autoApprove: z.boolean().optional(),
+        /** 协议 3.4：在项目仓库新开的 git worktree 里跑。只和非空 projectPath 一起出现，不配 newProject，openclaw 不收。 */
+        worktree: z.literal(true).optional(),
       })
-      .superRefine((s, ctx) => acpConnectorIdRule(s.source === "acp", s.connectorId, ctx))
+      .superRefine((s, ctx) => {
+        acpConnectorIdRule(s.source === "acp", s.connectorId, ctx);
+        if (s.worktree && (s.newProject !== undefined || s.source === "openclaw" || s.projectPath.trim() === "")) {
+          ctx.addIssue({ code: "custom", path: ["worktree"],
+            message: "worktree needs a non-empty projectPath, no newProject, and a source other than openclaw" });
+        }
+      })
       .optional(),
     /**
      * model / effort（3.2 起）：从这一轮起换模型与思考强度，之后的续聊沿用；省略 = 不换。
@@ -457,6 +469,8 @@ export const Command = z
      * CommandResult.artifactId 回来。Relay 只转发，不碰服务本身——画面和输入都走既有的预览隧道。
      */
     remoteControl: z.object({ enabled: z.boolean() }).optional(),
+    /** 协议 3.4：把 BotBus 开的 worktree 会话 squash 合并回检出分支，删 worktree 与分支，隐藏会话。 */
+    mergeWorktree: z.object({ taskId: z.string().min(1) }).optional(),
   })
   .superRefine((c, ctx) => {
     if (c[c.kind] === undefined) {

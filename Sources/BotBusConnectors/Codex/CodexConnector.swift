@@ -485,6 +485,24 @@ public actor CodexConnector: TaskConnector {
         return ConnectorOutcome(taskId: Self.protocolId(threadId), retainsLiveOwnership: true)
     }
 
+    /// 协议 3.4：合并并结束后把线程归档（`thread/archive {threadId}`），Codex 自己的列表里也不再显示。
+    /// 尽力而为：桌面正在接管、app-server 不认这个方法都只记日志，会话早已由 `TaskStore.hide` 藏起来。
+    public func discard(taskId: String) async {
+        guard let threadId = try? Self.nativeId(taskId) else { return }
+        do {
+            try enterCommand()
+        } catch {
+            Self.log.info("桌面正在接管，跳过 thread/archive")
+            return
+        }
+        defer { activeCommands -= 1 }
+        do {
+            _ = try await server.request("thread/archive", params: ["threadId": .string(threadId)])
+        } catch {
+            Self.log.error("thread/archive 失败：\(String(describing: error), privacy: .public)")
+        }
+    }
+
     // MARK: - 事件
 
     private func handle(_ event: CodexAppServerEvent) async {

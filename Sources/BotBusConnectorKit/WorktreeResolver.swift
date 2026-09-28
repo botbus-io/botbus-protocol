@@ -8,10 +8,12 @@ import os
 ///
 /// **尽量不读盘**：项目多半在「文稿」「桌面」里，菜单栏 app 一碰那里的文件，系统就会弹访问授权——
 /// 只是看看手机上的会话列表，不该换来这么一个弹窗。所以：
-/// - `<仓库>/.claude/worktrees/<名字>`（及其子目录）按路径直接归到 `<仓库>`，不读盘；目录删了也照样认得出。
+/// - `<仓库>/.claude/worktrees/<名字>` 按路径直接归到 `<仓库>`，不读盘；目录删了也照样认得出。
 /// - 其余只对路径里有一层 `worktrees` 目录的读盘：从工作目录往上、最多到那层 `worktrees` 为止找 `.git`。
 ///   它是**文件**、写着 `gitdir: <主仓库>/.git/worktrees/<名字>` 才算 worktree，主仓库按这个路径的形状取，
-///   不再去读主仓库里的东西（它往往就在「文稿」里）。`.git` 是目录（普通仓库）、指向 `.git/modules/…`（submodule）、
+///   不再去读主仓库里的东西（它往往就在「文稿」里）。
+/// - 两种都一样：工作目录是 worktree 里的子目录时，归到主仓库里的同一个子目录（`<wt>/web` → `<仓库>/web`），
+///   和不在 worktree 里的会话按 cwd 分项目是同一个口径——手机选 `<仓库>/web` 开的 worktree 会话仍归在 `<仓库>/web` 下。`.git` 是目录（普通仓库）、指向 `.git/modules/…`（submodule）、
 ///   公共 git 目录不叫 `.git`（bare 仓库）都不算，原样当项目。
 /// - 路径里没有 `worktrees` 的一概不查——手动 `git worktree add` 到别处的目录认不出来，原样当项目。
 ///
@@ -128,25 +130,34 @@ public final class WorktreeResolver: @unchecked Sendable {
 
     // MARK: - 解析
 
-    /// Claude app 的 `<仓库>/.claude/worktrees/<名字>[/子目录]` → `<仓库>`。只看路径。
+    /// Claude app 的 `<仓库>/.claude/worktrees/<名字>` → `<仓库>`，`…/<名字>/<子目录>` → `<仓库>/<子目录>`。只看路径。
     public static func resolveByShape(_ path: String) -> String? {
         guard let marker = path.range(of: claudeWorktreesMarker, options: .backwards),
               marker.upperBound < path.endIndex, marker.lowerBound > path.startIndex else { return nil }
-        return String(path[..<marker.lowerBound])
+        let repository = String(path[..<marker.lowerBound])
+        let rest = path[marker.upperBound...]
+        guard let slash = rest.firstIndex(of: "/") else { return repository }
+        let subpath = normalized(String(rest[rest.index(after: slash)...]))
+        return subpath.isEmpty || subpath == "/" ? repository : repository + "/" + subpath
     }
 
     /// 路径里有一层 `worktrees` 时，从 `path` 往上找第一个 `.git`（不越过那层 `worktrees`），按它判断。
+    /// `path` 是 worktree 里的子目录时，结果是主仓库里的同一个子目录。
     public static func resolveOnDisk(_ path: String, fileManager: FileManager = .default) -> String? {
         let components = URL(fileURLWithPath: path).pathComponents
         guard let marker = worktreesComponent(in: path) else { return nil }
         var isDirectory: ObjCBool = false
         var directory = URL(fileURLWithPath: path, isDirectory: true)
+        /// 从 `path` 往上走过的目录名，由近及远。
+        var climbed: [String] = []
         for _ in 0..<(components.count - marker - 1) {
             let dotGit = directory.appendingPathComponent(".git")
             if fileManager.fileExists(atPath: dotGit.path, isDirectory: &isDirectory) {
                 // 第一个 `.git` 就决定了：是目录说明在普通仓库里（或 worktree 里嵌着的另一个仓库），不再往上找。
-                return isDirectory.boolValue ? nil : mainRepository(dotGitFile: dotGit)
+                guard !isDirectory.boolValue, let root = mainRepository(dotGitFile: dotGit) else { return nil }
+                return climbed.isEmpty ? root : root + "/" + climbed.reversed().joined(separator: "/")
             }
+            climbed.append(directory.lastPathComponent)
             directory = directory.deletingLastPathComponent()
         }
         return nil

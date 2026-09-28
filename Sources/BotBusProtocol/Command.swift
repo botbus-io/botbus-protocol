@@ -3,7 +3,7 @@ import Foundation
 public struct Command: Codable, Hashable, Sendable, Identifiable {
     public enum Kind: String, Codable, Sendable, CaseIterable {
         case startTask, followUp, approve, interrupt, setConnectorEnabled, fetchMessages, fetchFile, fetchChanges
-        case remoteControl
+        case remoteControl, mergeWorktree
     }
 
     public struct StartTask: Codable, Hashable, Sendable {
@@ -25,10 +25,14 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         /// 协议 3.3：把这条会话所在项目的「自动批准」设为开（true）或关（false），从第一轮起生效、之后沿用。
         /// 省略 = 不动。只有报了 `ConnectorInfo.canAutoApprove` 的 agent 收；「不在项目中」的会话不收。
         public var autoApprove: Bool?
+        /// 协议 3.4：在项目仓库新开的 git worktree 里跑（`<仓库>/.claude/worktrees/<名字>`，分支 `botbus/<名字>`）。
+        /// 只写 true；只和非空的 `projectPath` 一起出现，不和 `newProject` 同时出现，OpenClaw 不收。
+        /// 电脑建不了（不是 git 仓库、还没有提交、detached HEAD）时照旧在 `projectPath` 里跑。
+        public var worktree: Bool?
 
         public init(source: TaskSource, projectPath: String, prompt: String, newProject: String? = nil,
                     attachments: [MessageAttachment]? = nil, connectorId: String? = nil,
-                    model: String? = nil, effort: String? = nil, autoApprove: Bool? = nil) {
+                    model: String? = nil, effort: String? = nil, autoApprove: Bool? = nil, worktree: Bool? = nil) {
             self.source = source
             self.projectPath = projectPath
             self.prompt = prompt
@@ -38,10 +42,11 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
             self.model = model
             self.effort = effort
             self.autoApprove = autoApprove
+            self.worktree = worktree
         }
 
         private enum CodingKeys: String, CodingKey {
-            case source, projectPath, prompt, newProject, attachments, connectorId, model, effort, autoApprove
+            case source, projectPath, prompt, newProject, attachments, connectorId, model, effort, autoApprove, worktree
         }
 
         public init(from decoder: Decoder) throws {
@@ -55,6 +60,7 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
             model = try container.decodeIfPresent(String.self, forKey: .model)
             effort = try container.decodeIfPresent(String.self, forKey: .effort)
             autoApprove = try container.decodeIfPresent(Bool.self, forKey: .autoApprove)
+            worktree = try container.decodeIfPresent(Bool.self, forKey: .worktree)
             if let model, !ModelOption.isValidId(model) {
                 throw DecodingError.dataCorruptedError(forKey: .model, in: container, debugDescription: "invalid model id")
             }
@@ -68,6 +74,14 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
                 throw DecodingError.dataCorruptedError(
                     forKey: .connectorId, in: container,
                     debugDescription: "connectorId is required for source acp and only allowed there")
+            }
+            if let worktree {
+                guard worktree, newProject == nil, source != .openclaw,
+                      !projectPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .worktree, in: container,
+                        debugDescription: "worktree must be true, with a non-empty projectPath, without newProject, not for openclaw")
+                }
             }
         }
 
@@ -209,6 +223,13 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         public init(taskId: String) { self.taskId = taskId }
     }
 
+    /// 协议 3.4：把 BotBus 从手机开的 worktree 会话的改动压成一个提交，合并回建 worktree 时的检出分支，
+    /// 然后删掉 worktree 与分支、把会话从列表隐藏。只对 `WorkingChanges.mergeTarget` 出现过的会话发。
+    public struct MergeWorktree: Codable, Hashable, Sendable {
+        public var taskId: String
+        public init(taskId: String) { self.taskId = taskId }
+    }
+
     /// 远程操作这台电脑的桌面（协议 2.12）。人不在电脑前、agent 卡在只有人能做的那一步时
     /// （登录、密码、确认弹窗），手机接管鼠标键盘。
     ///
@@ -237,13 +258,14 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
     public var fetchFile: FetchFile?
     public var fetchChanges: FetchChanges?
     public var remoteControl: RemoteControl?
+    public var mergeWorktree: MergeWorktree?
 
     public init(id: String = UUID().uuidString.lowercased(), createdAt: String, agentId: String, kind: Kind,
                 startTask: StartTask? = nil, followUp: FollowUp? = nil,
                 approve: Approve? = nil, interrupt: Interrupt? = nil,
                 setConnectorEnabled: SetConnectorEnabled? = nil, fetchMessages: FetchMessages? = nil,
                 fetchFile: FetchFile? = nil, fetchChanges: FetchChanges? = nil,
-                remoteControl: RemoteControl? = nil) {
+                remoteControl: RemoteControl? = nil, mergeWorktree: MergeWorktree? = nil) {
         self.id = id
         self.createdAt = createdAt
         self.agentId = agentId
@@ -257,11 +279,12 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         self.fetchFile = fetchFile
         self.fetchChanges = fetchChanges
         self.remoteControl = remoteControl
+        self.mergeWorktree = mergeWorktree
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, createdAt, agentId, kind, startTask, followUp, approve, interrupt, setConnectorEnabled, fetchMessages
-        case fetchFile, fetchChanges, remoteControl
+        case fetchFile, fetchChanges, remoteControl, mergeWorktree
     }
 
     private var hasPayloadForKind: Bool {
@@ -275,6 +298,7 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         case .fetchFile: fetchFile != nil
         case .fetchChanges: fetchChanges != nil
         case .remoteControl: remoteControl != nil
+        case .mergeWorktree: mergeWorktree != nil
         }
     }
 
@@ -295,6 +319,7 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         fetchFile = try container.decodeIfPresent(FetchFile.self, forKey: .fetchFile)
         fetchChanges = try container.decodeIfPresent(FetchChanges.self, forKey: .fetchChanges)
         remoteControl = try container.decodeIfPresent(RemoteControl.self, forKey: .remoteControl)
+        mergeWorktree = try container.decodeIfPresent(MergeWorktree.self, forKey: .mergeWorktree)
 
         guard hasPayloadForKind else {
             throw DecodingError.dataCorruptedError(
@@ -310,6 +335,7 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         if kind != .fetchFile { fetchFile = nil }
         if kind != .fetchChanges { fetchChanges = nil }
         if kind != .remoteControl { remoteControl = nil }
+        if kind != .mergeWorktree { mergeWorktree = nil }
     }
 
     /// 编码方向同样守住这条规则：载荷缺失直接拒绝编码，与 kind 不符的载荷不写出。
@@ -330,6 +356,7 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         case .fetchFile: try container.encode(required(fetchFile, encoder), forKey: .fetchFile)
         case .fetchChanges: try container.encode(required(fetchChanges, encoder), forKey: .fetchChanges)
         case .remoteControl: try container.encode(required(remoteControl, encoder), forKey: .remoteControl)
+        case .mergeWorktree: try container.encode(required(mergeWorktree, encoder), forKey: .mergeWorktree)
         }
     }
 
@@ -396,5 +423,11 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
                                            agentId: String) -> Command {
         Command(id: id, createdAt: createdAt, agentId: agentId, kind: .setConnectorEnabled,
                 setConnectorEnabled: payload)
+    }
+
+    public static func mergeWorktree(_ payload: MergeWorktree, createdAt: String,
+                                     id: String = UUID().uuidString.lowercased(),
+                                     agentId: String) -> Command {
+        Command(id: id, createdAt: createdAt, agentId: agentId, kind: .mergeWorktree, mergeWorktree: payload)
     }
 }

@@ -15,6 +15,14 @@ final class CodexBridgeRouterTests: XCTestCase {
         XCTAssertNoThrow(try router.agent(["id": 2, "method": "thread/loaded/list"], session: "phone"))
     }
 
+    func testAgentMayArchiveThreadsButNotCallOtherMethods() throws {
+        var router = readyRouter()
+        _ = router.attach("phone")
+        // 协议 3.4：合并并结束后归档线程要经桥发出去。
+        XCTAssertNoThrow(try router.agent(["id": 1, "method": "thread/archive", "params": ["threadId": "t"]], session: "phone"))
+        XCTAssertThrowsError(try router.agent(["id": 2, "method": "thread/unarchive", "params": ["threadId": "t"]], session: "phone"))
+    }
+
     func testOptionalInitializedNotificationPassesThroughButDoesNotMakeFailedHandshakeReady() throws {
         var router = CodexBridgeRouter()
         let sent = try XCTUnwrap(router.desktop(["id": 1, "method": "initialize"]).first?.message)

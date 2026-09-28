@@ -85,6 +85,10 @@ public protocol TaskConnector: Sendable {
 
     /// 中断当前轮次。
     func interrupt(taskId: String) async throws -> ConnectorOutcome
+
+    /// 协议 3.4：会话被手机「合并并结束」后，给后端一个收尾的机会（Codex 归档线程）。尽力而为，不抛；
+    /// 会话本身已经由 `TaskStore.hide` 从列表里拿掉了。默认什么都不做（Claude 的 transcript 留在磁盘上）。
+    func discard(taskId: String) async
 }
 
 public extension TaskConnector {
@@ -113,6 +117,8 @@ public extension TaskConnector {
         guard selection.isEmpty else { throw ConnectorError("这个 agent 不能从手机换模型") }
         return try await followUp(taskId: taskId, prompt: prompt, images: images)
     }
+
+    public func discard(taskId: String) async {}
 
     /// 把后端的原生 id（threadId / sessionId）拼成协议里的 `Task.id`。
     public func taskId(for native: String) -> String { "\(kind.rawValue):\(native)" }

@@ -58,6 +58,14 @@ public actor CommandDispatcher {
     private let files: (any FileFetching)?
     /// 手机看任务目录里没提交的改动（协议 2.11 的 `fetchChanges`）。nil = 一律失败（测试默认）。
     private let changes: (any WorkingChangesUploading)?
+    /// 手机开的 worktree 会话（协议 3.4）。nil = 不建 worktree（`startTask.worktree` 照旧在原目录跑）、不能合并。
+    private let worktrees: (any WorktreeManaging)?
+    /// 正在合并的 worktree，按发起合并的任务 id 记。同一个 worktree 的两条 `mergeWorktree`（id 不同，去重表挡不住）
+    /// 不并发执行；合并期间工作目录在它里面的任务也不接续聊、审批、中断（`onTask`）。
+    private var merging: [String: ManagedWorktree] = [:]
+    /// 正在执行的针对已有任务的命令（`onTask`）：任务 id → 条数。有命令在跑时不合并——Claude 要等命令返回
+    /// 才把状态翻成 running，光看 `status` 挡不住刚发出去的续聊。
+    private var activeTaskCommands: [String: Int] = [:]
     private var remoteControl: (any RemoteControlling)?
     private var systemPermissionInspector: SystemPermissionInspector?
     private let systemPermissionInspectionTimeout: TimeInterval
@@ -73,6 +81,7 @@ public actor CommandDispatcher {
                 inbox: (any AttachmentReceiving)? = nil,
                 files: (any FileFetching)? = nil,
                 changes: (any WorkingChangesUploading)? = nil,
+                worktrees: (any WorktreeManaging)? = nil,
                 systemPermissionInspector: SystemPermissionInspector? = nil,
                 systemPermissionInspectionTimeout: TimeInterval = 10,
                 now: @escaping @Sendable () -> Date = { Date() }) {
@@ -81,6 +90,7 @@ public actor CommandDispatcher {
         self.inbox = inbox
         self.files = files
         self.changes = changes
+        self.worktrees = worktrees
         self.systemPermissionInspector = systemPermissionInspector
         self.systemPermissionInspectionTimeout = systemPermissionInspectionTimeout
         self.now = now
@@ -316,14 +326,29 @@ public actor CommandDispatcher {
                let project = await store.autoApproveProject(forWorkingDirectory: projectPath) {
                 await store.setAutoApprove(autoApprove, project: project)
             }
+            // 协议 3.4：手机要在 worktree 里跑。建不了（不是 git 仓库、没有提交、detached HEAD）就照旧在原目录跑；
+            // 排在下载图、建新项目文件夹之后：前面失败时不留下没人用的 worktree。
+            var worktree: ManagedWorktree?
+            if payload.worktree == true, let worktrees {
+                if let created = try await worktrees.create(from: projectPath) {
+                    projectPath = created.workingDirectory
+                    worktree = created.worktree
+                }
+            }
             // startTask 还没有 id，所有权只能等连接器把 id 还回来才认领得上。
             let outcome: ConnectorOutcome
-            if let target {
-                outcome = try await target.connector.start(connectorId: target.connectorId, projectPath: projectPath,
-                                                           prompt: payload.prompt, images: images)
-            } else {
-                outcome = try await connector.start(projectPath: projectPath, prompt: payload.prompt, images: images,
-                                                    selection: selection)
+            do {
+                if let target {
+                    outcome = try await target.connector.start(connectorId: target.connectorId, projectPath: projectPath,
+                                                               prompt: payload.prompt, images: images)
+                } else {
+                    outcome = try await connector.start(projectPath: projectPath, prompt: payload.prompt, images: images,
+                                                        selection: selection)
+                }
+            } catch {
+                // 连接器没起来：刚建的 worktree 没人用，删掉，不留空目录与分支。
+                if let worktree { await worktrees?.discard(worktree) }
+                throw error
             }
             let taskId = try normalized(outcome.taskId, kind: kind)
             // 先 claim 再按需 release：即使连接器不保留所有权，这一手也给新任务挣到了
@@ -382,6 +407,9 @@ public actor CommandDispatcher {
             guard let payload = command.fetchFile else { throw DispatchFailure("缺少 fetchFile 载荷") }
             try await fetchFile(payload)
             return payload.taskId
+        case .mergeWorktree:
+            guard let payload = command.mergeWorktree else { throw DispatchFailure("缺少 mergeWorktree 载荷") }
+            return try await mergeWorktree(payload)
         case .setConnectorEnabled, .fetchChanges, .remoteControl:
             return nil // 走不到：execute 已经先分出去了。
         }
@@ -477,7 +505,8 @@ public actor CommandDispatcher {
     ///
     /// 与 `fetchFile` 一样只读：不认领所有权、不碰任务状态，产物也不进 `Task.artifacts`。
     /// 目录用任务自己的工作目录（worktree 会话是 worktree），按取文件同一套规则挡掉 home、`/Users` 这类太宽的目录；
-    /// 「不在项目中」的会话没有项目可看，直接拒绝。
+    /// 「不在项目中」的会话没有项目可看，直接拒绝。BotBus 从手机开的 worktree 会话（协议 3.4）看整个 worktree：
+    /// 合并压的是整个 worktree，子目录项目也不能只给看子目录——看到的就是会合进去的。
     private func fetchChanges(_ payload: Command.FetchChanges) async throws -> String? {
         let taskId = payload.taskId
         guard let source = TaskSource(taskId: taskId), let kind = ConnectorKind(source) else {
@@ -493,14 +522,94 @@ public actor CommandDispatcher {
             throw DispatchFailure("这个会话不在项目中，没有可看的改动", taskId: taskId)
         }
         guard let changes else { throw DispatchFailure("本机无法读取改动", taskId: taskId) }
-        guard let directory = TranscriptFileRefs.projectRoot(task.workingDirectory) else {
+        // 协议 3.4：手机开的 worktree 会话按 merge-base 比较、报 `mergeTarget`，范围是整个 worktree；
+        // 别的目录照旧在工作目录里和 HEAD 比。
+        let managed = await worktrees?.worktree(containing: task.workingDirectory)
+        guard let directory = TranscriptFileRefs.projectRoot(managed?.path ?? task.workingDirectory) else {
             throw DispatchFailure("这个任务的目录已经不在了，或者不能读取", taskId: taskId)
         }
         do {
-            return try await changes.upload(directory: directory)
+            return try await changes.upload(directory: directory, worktree: managed)
         } catch {
             throw DispatchFailure(Self.describe(error), taskId: taskId)
         }
+    }
+
+    /// 手机「合并到 <分支> 并结束会话」（协议 3.4）：squash 合并回建 worktree 时的检出分支，删 worktree 与分支，
+    /// 隐藏会话并让连接器收尾。会话还在跑、或不是 BotBus 开的 worktree 时拒绝；合并失败时什么都不删。
+    /// 合并落地但 worktree 里又冒出新改动（`.mergedButKept`）时回失败、不隐藏：手机上会话还在，可以再合并一次。
+    ///
+    /// 不认领所有权：合并只碰 git，不碰 agent；成功后任务直接被 `TaskStore.hide` 拿掉。
+    private func mergeWorktree(_ payload: Command.MergeWorktree) async throws -> String {
+        let taskId = payload.taskId
+        guard let source = TaskSource(taskId: taskId), let kind = ConnectorKind(source) else {
+            throw DispatchFailure("无法识别的任务 id：\(taskId)", taskId: taskId)
+        }
+        guard store.connectors.isEnabled(kind) else {
+            throw DispatchFailure("\(kind.rawValue) 连接器已停用", taskId: taskId)
+        }
+        guard let task = await store.task(id: taskId) else {
+            // 已经合并并隐藏过：多半是回执没送到、手机换了个 id 重发。做完了就是做完了，照样回成功。
+            if await store.isHidden(taskId) { return taskId }
+            throw DispatchFailure("本机没有这个任务：\(taskId)", taskId: taskId)
+        }
+        guard let worktrees, let managed = await worktrees.worktree(containing: task.workingDirectory) else {
+            throw DispatchFailure("这个会话不是从手机开的 worktree，没法合并", taskId: taskId)
+        }
+        // 同一个 worktree 里可能挂着好几条会话（Claude 在桌面会话上续聊会分支出新 session、电脑上又接着开了一条），
+        // 哪条还在进行中、哪条有命令在跑都不行：合并会把它们脚下的目录删掉。
+        let sessions = await store.tasks(workingIn: managed)
+        guard !Self.isBusy(task.status), !sessions.contains(where: { Self.isBusy($0.status) }) else {
+            throw DispatchFailure("会话还在进行中，等它停下来再合并", taskId: taskId)
+        }
+        let related = Set(sessions.map(\.id)).union([taskId])
+        // 从这里到登记进 `merging` 没有挂起点：与 `onTask` 的检查互斥，两条并发的合并也只有一条能过。
+        guard !related.contains(where: { activeTaskCommands[$0] != nil }) else {
+            throw DispatchFailure("会话还在进行中，等它停下来再合并", taskId: taskId)
+        }
+        guard !merging.values.contains(where: { $0.path == managed.path }) else {
+            throw DispatchFailure("这个会话正在合并", taskId: taskId)
+        }
+        merging[taskId] = managed
+        defer { merging.removeValue(forKey: taskId) }
+        // 登记之后再看一眼：上面等 store 的那几下里，状态可能刚翻成进行中，也可能又多了一条会话。
+        let latest = await store.tasks(workingIn: managed) + [await store.task(id: taskId)].compactMap { $0 }
+        if latest.contains(where: { Self.isBusy($0.status) }) {
+            throw DispatchFailure("会话还在进行中，等它停下来再合并", taskId: taskId)
+        }
+        let outcome: WorktreeMergeOutcome
+        do {
+            outcome = try await worktrees.mergeAndRemove(managed, message: task.title)
+        } catch {
+            throw DispatchFailure(Self.describe(error), taskId: taskId)
+        }
+        guard outcome == .merged else {
+            throw DispatchFailure("已经合并到 \(managed.baseBranch)，但 worktree 里又有新的改动，没有删除；可以再合并一次",
+                                  taskId: taskId)
+        }
+        // 合并成功到隐藏之间 Agent 若崩溃，隐藏没落盘，会话会带着已删掉的 worktree 重新出现（续聊会被挡下、
+        // 差异面板读不到目录）。窗口只有几毫秒，接受；用户在电脑上删掉即可。
+        var hiddenIds = Set((await store.tasks(workingIn: managed)).map(\.id))
+        hiddenIds.insert(taskId)
+        var discards: [(connector: any TaskConnector, taskId: String)] = []
+        for id in hiddenIds.sorted() {
+            await store.hide(id: id)
+            if let source = TaskSource(taskId: id), let kind = ConnectorKind(source), let connector = connectors[kind] {
+                discards.append((connector, id))
+            }
+        }
+        // 连接器收尾（Codex 归档线程要等 app-server 应答）尽力而为、不影响结果：隐藏已落盘就回执，不等它们。
+        if !discards.isEmpty {
+            Task.detached {
+                for discard in discards { await discard.connector.discard(taskId: discard.taskId) }
+            }
+        }
+        return taskId
+    }
+
+    /// 还在进行中、不能合并的状态。
+    private static func isBusy(_ status: TaskStatus) -> Bool {
+        status == .running || status == .waitingApproval || status == .waitingInput
     }
 
     /// 上传结束后的那一次补发。**不再**因为还有没传好的图（失败、限额）发起下一轮后台上传：
@@ -583,8 +692,18 @@ public actor CommandDispatcher {
         // 只查"本机认不认识这个 id"，不查 controllable：那面旗子是给客户端画按钮用的提示，
         // 由快照的那一刻决定，命令到达时早就可能过期了（桌面上刚开跑 = controllable 变 false）。
         // 真正能不能执行由连接器说了算，它给出的失败原因也比"不可控制"具体得多。
-        guard await store.task(id: taskId) != nil else {
+        guard let task = await store.task(id: taskId) else {
             throw DispatchFailure("本机没有这个任务：\(taskId)", taskId: taskId)
+        }
+        // 协议 3.4：它所在的 worktree 正在合并，这时开新一轮会和删 worktree 撞上。检查与登记之间没有挂起点，
+        // 和 `mergeWorktree` 的检查互斥。
+        guard !isMerging(taskId: taskId, workingDirectory: task.workingDirectory) else {
+            throw DispatchFailure("这个会话正在合并", taskId: taskId)
+        }
+        activeTaskCommands[taskId, default: 0] += 1
+        defer {
+            let remaining = (activeTaskCommands[taskId] ?? 1) - 1
+            activeTaskCommands[taskId] = remaining > 0 ? remaining : nil
         }
         await store.claimLive(taskId)
         do {
@@ -606,6 +725,13 @@ public actor CommandDispatcher {
             if error is CancellationError { throw error }
             throw DispatchFailure(Self.describe(error), taskId: taskId)
         }
+    }
+
+    /// 这个任务是否正在被合并，或者它的工作目录在一个正在合并的 worktree 里。
+    /// `workingDirectory` 是 store 里盖过章的工作目录（连接器报的 cwd、BotBus 交给连接器的 worktree 路径都是真实路径），
+    /// 和 `ManagedWorktree.path` 同一种写法，直接比前缀，见 `ManagedWorktree.contains`。
+    private func isMerging(taskId: String, workingDirectory: String) -> Bool {
+        merging[taskId] != nil || merging.values.contains { $0.contains(workingDirectory) }
     }
 
     private func connector(for kind: ConnectorKind) throws -> any TaskConnector {
@@ -642,6 +768,7 @@ public actor CommandDispatcher {
         case .fetchMessages: command.fetchMessages?.taskId
         case .fetchFile: command.fetchFile?.taskId
         case .fetchChanges: command.fetchChanges?.taskId
+        case .mergeWorktree: command.mergeWorktree?.taskId
         case .startTask, .setConnectorEnabled, .remoteControl: nil
         }
     }

@@ -39,7 +39,7 @@ final class ProtocolFreezeTests: XCTestCase {
 
     func testCommandKindIsFrozen() {
         assertFrozen(Command.Kind.self, ["startTask", "followUp", "approve", "interrupt", "setConnectorEnabled",
-                                         "fetchMessages", "fetchFile", "fetchChanges", "remoteControl"])
+                                         "fetchMessages", "fetchFile", "fetchChanges", "remoteControl", "mergeWorktree"])
     }
 
     func testEventKindIsFrozen() {
@@ -59,6 +59,6 @@ final class ProtocolFreezeTests: XCTestCase {
     }
 
     func testProtocolVersionMatchesTheFrozenContract() {
-        XCTAssertEqual(ProtocolVersion.current, "3.3")
+        XCTAssertEqual(ProtocolVersion.current, "3.4")
     }
 }
