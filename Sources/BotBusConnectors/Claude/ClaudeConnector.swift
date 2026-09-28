@@ -10,6 +10,8 @@ import BotBusConnectorKit
 ///   各打一次本机回环 HTTP（`LocalHookServer`），本连接器把它们映射成 Task 状态。电脑上按停止没有 hook，
 ///   靠盯 transcript 末尾的中断标记补上（`checkTurnEndings`）。
 /// - **动手**：`startTask` / `followUp` 各起一个 `claude -p` 子进程，从 stream-json 里认领 session id。
+///   prompt 与审批都走 stdin / stdout 的 stream-json（`--permission-prompt-tool stdio`，见 `ClaudeControlRequest`）：
+///   手机那一轮要人点头时不靠 PermissionRequest hook（2.1.268 之前的 `-p` 不发），hooks 没装也照样能审批。
 /// - **补历史**：hooks 只看得见启动之后有动静的会话，所以每次启动时 `restoreRecentSessions()`
 ///   从 transcript 补回 7 天内的会话（`ClaudeSessionHistory`），只做一次，不轮询。
 /// - **跟标题**：桌面 app 与 Claude Code 会给会话起名并写进 transcript，hook 负载里却没有。
@@ -105,8 +107,54 @@ public actor ClaudeConnector: TaskConnector {
     private let registry: TaskContextRegistry
 
     private var sessions: [String: Session] = [:]
-    /// 挂起的 `PermissionRequest`：requestId → 那条还没回的 HTTP 响应。
-    private var holds: [String: LocalHookServer.Hold] = [:]
+    /// 挂起的审批：requestId → 从哪条路回答（电脑上会话的 hook 响应，或自己子进程的 stdin）。
+    private var holds: [String: PendingHold] = [:]
+    /// 自己起的 `claude -p` 的 stdin，按 session id。控制协议的回答写这里，这一轮 `result` 后关掉。
+    private var controls: [String: ClaudeControlChannel] = [:]
+    /// 手机那一轮里等审批的上限；到点按拒绝回（绝不能变成允许），这一轮接着跑。
+    private let approvalTimeout: TimeInterval
+
+    /// 一条挂着等手机回答的审批。`token` 分辨同一个 requestId 先后挂的两次，超时只收自己那一次。
+    struct PendingHold: Sendable {
+        enum Channel: Sendable {
+            /// 电脑上的会话：挂住的 PermissionRequest hook 响应。
+            case hook(LocalHookServer.Hold)
+            /// 本连接器自己的 `claude -p`：控制协议，回答写进它的 stdin。`input` 是原入参，允许时带回。
+            case control(ClaudeControlChannel, requestID: String, input: Data)
+        }
+        let channel: Channel
+        let token = UUID()
+
+        var isControl: Bool {
+            if case .control = channel { return true }
+            return false
+        }
+
+        func isOn(_ stdin: ClaudeControlChannel) -> Bool {
+            if case .control(let channel, _, _) = channel { return channel === stdin }
+            return false
+        }
+
+        /// 送出回答；送不到（hook 已超时、这一轮已结束）返回 false。
+        func answer(_ decision: ClaudePermissionDecision) -> Bool {
+            switch channel {
+            case .hook(let hold):
+                return hold.answer(.json(ClaudeHookOutput.permission(decision)))
+            case .control(let stdin, let requestID, let input):
+                return stdin.send(ClaudeControlOutput.response(requestID: requestID, decision: decision,
+                                                               originalInput: input))
+            }
+        }
+
+        /// 没人会回答了（停机、会话收尾、超时）：hook 回空，由 Claude Code 自己处理；
+        /// 控制协议没有"交还给电脑"这一说，只能拒绝——绝不能变成允许。
+        func release(_ message: String) {
+            switch channel {
+            case .hook(let hold): _ = hold.answer(.noContent)
+            case .control: _ = answer(.deny(message: message))
+            }
+        }
+    }
     /// 其中是 `AskUserQuestion` 的那些：requestId → 哪个会话、问了什么（回答时要原样带回入参）。
     private var questionHolds: [String: QuestionHold] = [:]
 
@@ -129,7 +177,7 @@ public actor ClaudeConnector: TaskConnector {
     /// 一条排队的续聊。图在收到时就读好（读不到当场报错），轮到它时直接写进 stdin。
     struct QueuedTurn: Sendable {
         var prompt: String
-        var input: Data?
+        var input: Data
         var hasImages: Bool
         /// 这一轮的 `--model` / `--effort`，收到时就定下来（排队期间再换，只影响之后收到的续聊）。
         var model: String? = nil
@@ -155,6 +203,7 @@ public actor ClaudeConnector: TaskConnector {
     ///   - registry: 签发与绑定 task token；app 里与本机工具服务器共用同一个实例。
     ///   - titleRetryDelays: nil = `ClaudeConnector.titleRetryDelays`；测试传短的。
     ///   - turnEndCheckInterval: nil = `ClaudeConnector.turnEndCheckInterval`；测试传短的。
+    ///   - approvalTimeout: nil = `LocalHookServer.defaultHoldTimeout`（与 hook 挂起同一个上限）；测试传短的。
     public init(store: TaskStore,
                 paths: ClaudePaths = ClaudePaths(),
                 binary: @escaping @Sendable () -> String? = { ClaudePaths.detectClaudeBinary() },
@@ -162,7 +211,8 @@ public actor ClaudeConnector: TaskConnector {
                 tools: @escaping @Sendable () -> AgentToolsConfiguration? = { nil },
                 registry: TaskContextRegistry = TaskContextRegistry(),
                 titleRetryDelays: [TimeInterval]? = nil,
-                turnEndCheckInterval: TimeInterval? = nil) {
+                turnEndCheckInterval: TimeInterval? = nil,
+                approvalTimeout: TimeInterval? = nil) {
         self.store = store
         self.paths = paths
         self.binary = binary
@@ -172,6 +222,7 @@ public actor ClaudeConnector: TaskConnector {
         self.registry = registry
         self.titleRetryDelays = titleRetryDelays ?? Self.titleRetryDelays
         self.turnEndCheckInterval = turnEndCheckInterval ?? Self.turnEndCheckInterval
+        self.approvalTimeout = approvalTimeout ?? LocalHookServer.defaultHoldTimeout
         store.connectors.setModels(supportedEfforts.map { ClaudeModels.options(versions: [:], efforts: $0) },
                                    for: .claude)
     }
@@ -181,11 +232,13 @@ public actor ClaudeConnector: TaskConnector {
         supportedEfforts.map { ClaudeModels.options(versions: modelVersions, efforts: $0) }
     }
 
-    /// 停连接器：放掉所有挂起的审批（让 Claude Code 回落到自己的弹窗，而不是干等 120 秒），
+    /// 停连接器：放掉所有挂起的审批（让 Claude Code 回落到自己的弹窗，而不是干等；自己的子进程里按拒绝回），
     /// 并终止我们自己起的子进程。
     public func stop() {
-        for hold in holds.values { hold.answer(.noContent) }
+        for hold in holds.values { hold.release("BotBus 已停止，这次没有执行") }
         holds.removeAll()
+        for stdin in controls.values { stdin.close() }
+        controls.removeAll()
         questionHolds.removeAll()
         queued.removeAll()
         for process in ownProcesses.values where process.isRunning { process.terminate() }
@@ -299,34 +352,50 @@ public actor ClaudeConnector: TaskConnector {
         launching.contains(sessionID) || ownProcesses[sessionID] != nil
     }
 
-    /// 会话已经在电脑上收尾了，还挂着的审批 / 提问没人会再收：回空，把 hook 脚本放掉。
+    /// 会话已经收尾了，还挂着的审批 / 提问没人会再收：hook 回空把脚本放掉，自己的子进程里按拒绝回。
     private func releaseHold(for session: Session) {
         guard let requestID = session.pendingRequest?.id else { return }
         questionHolds.removeValue(forKey: requestID)
-        holds.removeValue(forKey: requestID)?.answer(.noContent)
+        holds.removeValue(forKey: requestID)?.release("这一轮已经结束")
     }
 
     /// `PermissionRequest`：建 pendingRequest，然后把 HTTP 响应挂住，等手机上点允许或拒绝。
     ///
-    /// 超时回落成"没有意见"（空响应），Claude Code 于是弹它自己的权限框——`-p` 模式下等同拒绝。
-    /// 这正是 hook 脚本 `--max-time 120` 想要的行为，两边必须说同一件事。
+    /// 超时回落成"没有意见"（空响应），Claude Code 于是弹它自己的权限框。
+    /// 这正是 hook 脚本 `--max-time` 想要的行为，两边必须说同一件事。
     ///
     /// `AskUserQuestion` 不是"批不批"而是"选哪个"：建成带 `questions` 的 `.input` 请求，任务记 `waitingInput`，
     /// 手机选好了经 `approve` 带 `answers` 回来，或者直接打字经 `followUp` 回来（见 `answerQuestion`）。
     ///
-    /// 协议 3.3：本连接器替手机跑的那一轮（`isOwnTurn`）里，会话所在项目开着自动批准时，审批直接回 `allow`，
-    /// 不建 pendingRequest、不推通知；`AskUserQuestion` 照旧交给手机。电脑上自己跑的轮次不受影响。
+    /// 本连接器替手机跑的那一轮（`isOwnTurn`）不走这里：审批经控制协议到 `handleControl`，
+    /// 那边管自动批准（协议 3.3）。hook 与控制协议并行、先答者生效，所以这里立刻回空，免得同一次审批两张卡。
     private func holdForApproval(_ event: ClaudeHookEvent) async -> LocalHookServer.Reply {
-        if event.askedQuestions == nil, isOwnTurn(event.sessionID),
-           await store.autoApproves(taskId: taskId(for: event.sessionID),
-                                    workingDirectory: sessions[event.sessionID]?.projectPath ?? event.cwd) {
-            Self.log.info("项目已开自动批准，放行 \(event.toolName ?? "权限请求", privacy: .public)")
-            return .now(.json(ClaudeHookOutput.permission(allow: true, reason: "项目已开自动批准")))
-        }
+        if isOwnTurn(event.sessionID) { return .now(.noContent) }
         let requestID = event.toolUseID ?? UUID().uuidString
-        let summary = event.toolName ?? "请求权限"
-        apply(event) { session, event in
-            if let asked = event.askedQuestions {
+        let hold = LocalHookServer.Hold(timeout: LocalHookServer.defaultHoldTimeout)
+        let pending = PendingHold(channel: .hook(hold))
+        // 先登记再发布：发布要 await，手机若在这之间就回答了，得找得到这条 hold。
+        holds[requestID] = pending
+        pend(event, requestID: requestID, toolName: event.toolName, detail: event.toolInput, asked: event.askedQuestions)
+        await publish()
+
+        // hold 超时后只收掉 holds 里的条目（让 PermissionRequest 路径直接报错），
+        // 但保留 questionHolds 和 pendingRequest：卡片不消失，
+        // 用户迟到的回答能走 followUp 送进去。
+        Task {
+            try? await Task.sleep(for: .seconds(LocalHookServer.defaultHoldTimeout + 1))
+            if self.holds[requestID]?.token == pending.token { self.holds.removeValue(forKey: requestID) }
+        }
+
+        return .hold(hold)
+    }
+
+    /// 给会话挂上一条待处理的审批或提问（hook 与控制协议共用）。
+    private func pend(_ event: ClaudeHookEvent, requestID: String, toolName: String?, detail: String?,
+                      asked: ClaudeAskedQuestions?) {
+        if let asked { questionHolds[requestID] = QuestionHold(sessionID: event.sessionID, asked: asked) }
+        apply(event) { session, _ in
+            if let asked {
                 session.status = .waitingInput
                 session.pendingRequest = PendingRequest(id: requestID, kind: .input, summary: asked.summary,
                                                         question: asked.plainText, questions: asked.questions)
@@ -335,27 +404,85 @@ public actor ClaudeConnector: TaskConnector {
                 session.pendingRequest = PendingRequest(
                     id: requestID,
                     kind: .permission,
-                    summary: summary,
-                    detail: event.toolInput.map { String($0.prefix(Self.detailLimit)) })
+                    summary: toolName ?? "请求权限",
+                    detail: detail.map { String($0.prefix(Self.detailLimit)) })
             }
         }
-        await publish()
+    }
 
-        let hold = LocalHookServer.Hold(timeout: LocalHookServer.defaultHoldTimeout)
-        holds[requestID] = hold
-        if let asked = event.askedQuestions {
-            questionHolds[requestID] = QuestionHold(sessionID: event.sessionID, asked: asked)
+    // MARK: - 控制协议（手机那一轮的审批）
+
+    /// 自己起的 `claude -p` 在 stdout 发来的控制请求（见 `ClaudeControlRequest`）。
+    ///
+    /// `can_use_tool`：项目开着自动批准（协议 3.3）且不是 `AskUserQuestion` 时立刻放行，不建 pendingRequest、不推通知；
+    /// 否则与 hook 一样建审批 / 提问，回答写回这个进程的 stdin。手机一直不回，`approvalTimeout` 到点按拒绝回——
+    /// 不能变成允许，也不能一直挂着让这一轮卡死。
+    private func handleControl(_ line: Data, sessionID: String?, stdin: ClaudeControlChannel,
+                               workingDirectory: String) async {
+        guard let request = ClaudeControlRequest(line: line) else { return }
+        switch request {
+        case .unsupported(let requestID, let subtype):
+            Self.log.info("claude 发来不认识的控制请求 \(subtype, privacy: .public)")
+            stdin.send(ClaudeControlOutput.error(requestID: requestID, message: "BotBus 不处理 \(subtype)"))
+        case .cancel(let requestID):
+            // claude 不等了（这一轮被打断之类）：卡片收掉。
+            guard let key = holds.first(where: { entry in
+                if case .control(let channel, let id, _) = entry.value.channel { return channel === stdin && id == requestID }
+                return false
+            })?.key else { return }
+            holds.removeValue(forKey: key)
+            questionHolds.removeValue(forKey: key)
+            if settle(key) { await publish() }
+        case .canUseTool(let requestID, let toolName, let input, let toolUseID):
+            guard let sessionID else {
+                // init 之前不会有工具调用；真遇到了也归不到任务上，只能拒绝。
+                stdin.send(ClaudeControlOutput.response(requestID: requestID,
+                                                        decision: .deny(message: "BotBus 还没认出这个会话"),
+                                                        originalInput: input))
+                return
+            }
+            let object = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any]
+            let asked = ClaudeAskedQuestions(toolName: toolName, input: object)
+            let cwd = sessions[sessionID]?.projectPath ?? workingDirectory
+            if asked == nil, await store.autoApproves(taskId: taskId(for: sessionID), workingDirectory: cwd) {
+                Self.log.info("项目已开自动批准，放行 \(toolName, privacy: .public)")
+                stdin.send(ClaudeControlOutput.response(requestID: requestID, decision: .allow(updatedInput: nil),
+                                                        originalInput: input))
+                return
+            }
+            let key = toolUseID ?? requestID
+            let pending = PendingHold(channel: .control(stdin, requestID: requestID, input: input))
+            holds[key] = pending
+            var event = ClaudeHookEvent.synthetic(kind: .permissionRequest, sessionID: sessionID, cwd: cwd)
+            event.toolName = toolName
+            pend(event, requestID: key, toolName: toolName, detail: ClaudeHookEvent.summarize(object), asked: asked)
+            await publish()
+            let timeout = approvalTimeout
+            Task {
+                try? await Task.sleep(for: .seconds(timeout))
+                await self.expire(key, token: pending.token)
+            }
         }
+    }
 
-        // hold 超时后只收掉 holds 里的条目（让 PermissionRequest 路径直接报错），
-        // 但保留 questionHolds 和 pendingRequest：卡片不消失，
-        // 用户迟到的回答能走 followUp 送进去。
-        Task {
-            try? await Task.sleep(for: .seconds(LocalHookServer.defaultHoldTimeout + 1))
-            self.holds.removeValue(forKey: requestID)
+    /// 控制协议里等太久的审批：按拒绝回，卡片收掉，这一轮接着跑（Claude 会说没拿到许可）。
+    private func expire(_ requestID: String, token: UUID) async {
+        guard let hold = holds[requestID], hold.token == token else { return }
+        holds.removeValue(forKey: requestID)
+        questionHolds.removeValue(forKey: requestID)
+        hold.release("手机上一直没有回应，这次没有执行")
+        if settle(requestID) { await publish() }
+    }
+
+    /// 挂着 `requestID` 的会话收掉卡片、回到运行中。没有这样的会话返回 false。
+    private func settle(_ requestID: String) -> Bool {
+        guard let session = sessions.values.first(where: { $0.pendingRequest?.id == requestID }) else { return false }
+        apply(ClaudeHookEvent.synthetic(kind: .userPromptSubmit, sessionID: session.sessionID,
+                                        cwd: session.projectPath)) { session, _ in
+            session.pendingRequest = nil
+            session.status = .running
         }
-
-        return .hold(hold)
+        return true
     }
 
     /// 取 Stop 时的最后一条 assistant 文本。2.1.273 起负载里直接带（`last_assistant_message`），
@@ -724,13 +851,12 @@ public actor ClaudeConnector: TaskConnector {
                       selection: ModelSelection) async throws -> ConnectorOutcome {
         // 先查模型、再读图：不对就别起进程，也别签 token。
         let chosen = try Self.resolve(selection, current: nil, options: modelOptions ?? [])
-        let input = try Self.streamingInput(prompt: prompt, images: images)
+        let input = try Self.stdinMessage(prompt: prompt, images: images)
         let injection = await AgentToolsInjection.make(tools(), registry: registry)
         let executable = binary().map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
         let name = executable != nil && executable == binaryWithoutName ? nil : Self.sessionName(for: prompt)
         let launch = { (name: String?) in
-            try await self.run(arguments: Self.arguments(prompt: prompt, resuming: nil, injection: injection,
-                                                         streamingInput: input != nil,
+            try await self.run(arguments: Self.arguments(resuming: nil, injection: injection,
                                                          model: chosen.model, effort: chosen.effort, name: name),
                                workingDirectory: projectPath, environment: injection?.environment ?? [:], stdin: input)
         }
@@ -744,12 +870,17 @@ public actor ClaudeConnector: TaskConnector {
             sessionID = try await launch(nil)
             binaryWithoutName = executable
         }
-        if let injection { await registry.bind(injection.token, taskId: taskId(for: sessionID)) }
+        // 先记下会话再 await：这一轮的审批随时可能从 stdout 到（见 `handleControl`），得找得到它。
         var session = makeSession(id: sessionID, projectPath: projectPath, origin: .watch)
         session.chosenModel = chosen.model
         session.chosenEffort = chosen.effort
         Self.applyPromptTitle(&session, prompt: prompt, hasImages: !images.isEmpty)
+        if let existing = sessions[sessionID], existing.pendingRequest != nil {
+            session.status = existing.status
+            session.pendingRequest = existing.pendingRequest
+        }
         sessions[sessionID] = session
+        if let injection { await registry.bind(injection.token, taskId: taskId(for: sessionID)) }
         await publish()
         return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
     }
@@ -777,11 +908,11 @@ public actor ClaudeConnector: TaskConnector {
             let text = prompt.trimmed
             if !text.isEmpty, let asked = questionHolds[requestID]?.asked,
                await answerQuestion(requestID, sessionID: sessionID,
-                                        with: ClaudeHookOutput.answer(asked, answers: asked.claudeAnswers(text: text))) {
+                                        with: .allow(updatedInput: asked.answeredInput(asked.claudeAnswers(text: text)))) {
                 return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
             }
         }
-        let input = try Self.streamingInput(prompt: prompt, images: images)
+        let input = try Self.stdinMessage(prompt: prompt, images: images)
         let turn = QueuedTurn(prompt: prompt, input: input, hasImages: !images.isEmpty,
                               model: chosen.model, effort: chosen.effort)
         // 我们自己起的那一轮还没跑完：排队，等它结束再 `--resume`。同时起两个 `claude -p --resume`
@@ -805,14 +936,17 @@ public actor ClaudeConnector: TaskConnector {
         launching.insert(sessionID)
         defer { launching.remove(sessionID) }
         let injection = await AgentToolsInjection.make(tools(), registry: registry, reusing: self.taskId(for: sessionID))
-        let newID = try await run(arguments: Self.arguments(prompt: turn.prompt, resuming: sessionID, injection: injection,
-                                                            streamingInput: turn.input != nil,
+        let newID = try await run(arguments: Self.arguments(resuming: sessionID, injection: injection,
                                                             model: turn.model, effort: turn.effort),
                                   workingDirectory: workingDirectory, environment: injection?.environment ?? [:],
                                   stdin: turn.input)
-        if let injection { await registry.bind(injection.token, taskId: self.taskId(for: newID)) }
+        // 会话先改好再 await（绑 token）：这一轮的审批随时可能从 stdout 到（见 `handleControl`）。
         if newID != sessionID {
             var branched = makeSession(id: newID, projectPath: workingDirectory, origin: .watch)
+            if let early = sessions[newID], early.pendingRequest != nil {
+                branched.status = early.status
+                branched.pendingRequest = early.pendingRequest
+            }
             Self.applyPromptTitle(&branched, prompt: turn.prompt, hasImages: turn.hasImages)
             // 分支是同一段对话的延续：手机选的模型跟过去。
             branched.model = existing?.model
@@ -824,10 +958,14 @@ public actor ClaudeConnector: TaskConnector {
             if let old = sessions.removeValue(forKey: sessionID) { releaseHold(for: old) }
             superseded.insert(sessionID)
         } else {
+            // 这一轮的审批若已经早到（挂在新进程的 stdin 上），别被"开始跑了"盖掉。
+            let earlyCard = sessions[sessionID]?.pendingRequest.flatMap { holds[$0.id] }
+                .map { hold in controls[sessionID].map(hold.isOn) ?? false } ?? false
             apply(ClaudeHookEvent.synthetic(kind: .userPromptSubmit, sessionID: sessionID, cwd: workingDirectory)) {
-                session, _ in session.status = .running
+                session, _ in if !earlyCard { session.status = .running }
             }
         }
+        if let injection { await registry.bind(injection.token, taskId: self.taskId(for: newID)) }
         return newID
     }
 
@@ -840,14 +978,14 @@ public actor ClaudeConnector: TaskConnector {
                         answers: [String: [String]]?) async throws -> ConnectorOutcome {
         let sessionID = try nativeID(taskId)
         if let asked = questionHolds[requestId]?.asked {
-            let reply: Data
+            let reply: ClaudePermissionDecision
             if decision == .deny {
                 // 不回答不等于中断：Claude 收到这句话会接着往下做，任务仍在跑。
-                reply = ClaudeHookOutput.permission(allow: false, reason: "用户在手机上跳过了这个问题")
+                reply = .deny(message: "用户在手机上跳过了这个问题")
             } else {
                 let mapped = asked.claudeAnswers(answers ?? [:])
                 guard !mapped.isEmpty else { throw ConnectorError("没有收到选项，请先选好再提交") }
-                reply = ClaudeHookOutput.answer(asked, answers: mapped)
+                reply = .allow(updatedInput: asked.answeredInput(mapped))
             }
             guard await answerQuestion(requestId, sessionID: sessionID, with: reply) else {
                 // hook 已超时，Claude Code 回落到了电脑上的提问框。
@@ -868,28 +1006,28 @@ public actor ClaudeConnector: TaskConnector {
             }
             return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
         }
-        guard let hold = holds.removeValue(forKey: requestId) else {
-            // 挂起的请求只活 120 秒，过了就没人收回答了；此时 Claude Code 已经回落到自己的弹窗。
-            throw ConnectorError("这条审批已经过期，请在电脑上处理")
-        }
+        // 电脑上的会话：挂起的 hook 过了时限，Claude Code 已经回落到自己的弹窗。
+        // 手机那一轮：超时已按拒绝回，或者这一轮已经结束。
+        let expired = ConnectorError(isOwnTurn(sessionID) ? "这条审批已经过期" : "这条审批已经过期，请在电脑上处理")
+        guard let hold = holds.removeValue(forKey: requestId) else { throw expired }
         let allow = decision == .allow
-        guard hold.answer(.json(ClaudeHookOutput.permission(allow: allow, reason: allow ? "已在手机上允许" : "已在手机上拒绝"))) else {
-            // hold 对象还在字典里但已超时（清理任务还差零点几秒）：回答送不出去了。
-            throw ConnectorError("这条审批已经过期，请在电脑上处理")
-        }
+        // hold 对象还在字典里但已超时（清理任务还差零点几秒）或进程已退出：回答送不出去了。
+        guard hold.answer(allow ? .allow(updatedInput: nil) : .deny(message: "用户在手机上拒绝了")) else { throw expired }
         apply(ClaudeHookEvent.synthetic(kind: .userPromptSubmit, sessionID: sessionID,
                                         cwd: sessions[sessionID]?.projectPath ?? "")) { session, _ in
             session.pendingRequest = nil
-            session.status = allow ? .running : .interrupted
+            // 电脑上的权限框里拒绝会中断这一轮；`-p` 里拒绝只是这个工具没执行，Claude 接着往下做。
+            session.status = allow || hold.isControl ? .running : .interrupted
         }
         await publish()
         return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
     }
 
     /// 把回答交给挂着的 AskUserQuestion。已经超时（Claude Code 回落到电脑上的提问框）返回 false。
-    private func answerQuestion(_ requestID: String, sessionID: String, with reply: Data) async -> Bool {
+    private func answerQuestion(_ requestID: String, sessionID: String,
+                                with reply: ClaudePermissionDecision) async -> Bool {
         questionHolds.removeValue(forKey: requestID)
-        guard let hold = holds.removeValue(forKey: requestID), hold.answer(.json(reply)) else { return false }
+        guard let hold = holds.removeValue(forKey: requestID), hold.answer(reply) else { return false }
         apply(ClaudeHookEvent.synthetic(kind: .userPromptSubmit, sessionID: sessionID,
                                         cwd: sessions[sessionID]?.projectPath ?? "")) { session, _ in
             if session.pendingRequest?.id == requestID { session.pendingRequest = nil }
@@ -908,6 +1046,7 @@ public actor ClaudeConnector: TaskConnector {
         kill(process.processIdentifier, SIGINT)
         // 中断就是不要了：排在后面的续聊一并作废，不在这一轮退出后又自己跑起来。
         queued.removeValue(forKey: sessionID)
+        if let session = sessions[sessionID] { releaseHold(for: session) }
         apply(ClaudeHookEvent.synthetic(kind: .stop, sessionID: sessionID,
                                         cwd: sessions[sessionID]?.projectPath ?? "")) { session, _ in
             session.status = .interrupted
@@ -943,34 +1082,30 @@ public actor ClaudeConnector: TaskConnector {
 
     // MARK: - 子进程
 
-    /// `claude` 的完整参数。顺序有讲究：`-p [--resume <id>] <prompt>` 在前；注入的
-    /// `--mcp-config` / `--allowedTools` 是可变参数，只能排在 prompt 位置参数之后，
-    /// 再由 `--output-format` 这个 `--flag` 收尾，否则 prompt 会被当成 MCP 配置文件或工具名吞掉。
+    /// `claude` 的完整参数。`-p [--resume <id>] [--model …] [--effort …] [--name=…]` 在前；注入的
+    /// `--mcp-config` / `--allowedTools` 是可变参数，由紧跟其后的 `--input-format` 这个 `--flag` 收尾，
+    /// 否则后面的参数会被当成 MCP 配置文件或工具名吞掉。
     ///
-    /// `streamingInput`（发图时）：prompt 连同图改走 stdin 的一行 stream-json（见 `stdinPayload`），
-    /// 不再有位置参数；可变参数改由紧跟其后的 `--input-format` 收尾。不发图时参数与以前逐项相同。
-    /// `model` / `effort`（协议 3.2）是 `--model` / `--effort`，排在 prompt 之前；值已由 `resolve` 限定在
-    /// `ClaudeModels` 里，不会以 `-` 开头。`name`（只在新建时给，见 `sessionName`）也排在 prompt 之前，
-    /// 写成一个 `--name=…`：名字来自用户的话，可能以 `-` 开头，分成两个参数会被当成别的选项。
-    static func arguments(prompt: String, resuming sessionID: String?, injection: AgentToolsInjection?,
-                          streamingInput: Bool = false, model: String? = nil, effort: String? = nil,
-                          name: String? = nil) -> [String] {
+    /// prompt 不是位置参数：一律经 stdin 写一行 stream-json（见 `stdinPayload`，发图时图也在里面），
+    /// stdin 开着等控制协议的回答（`--permission-prompt-tool stdio`，见 `ClaudeControlRequest`），这一轮 `result` 后关掉。
+    /// `model` / `effort`（协议 3.2）的值已由 `resolve` 限定在 `ClaudeModels` 里，不会以 `-` 开头。
+    /// `name`（只在新建时给，见 `sessionName`）写成一个 `--name=…`：名字来自用户的话，可能以 `-` 开头，
+    /// 分成两个参数会被当成别的选项。
+    static func arguments(resuming sessionID: String?, injection: AgentToolsInjection?,
+                          model: String? = nil, effort: String? = nil, name: String? = nil) -> [String] {
         var arguments = ["-p"]
         if let sessionID { arguments += ["--resume", sessionID] }
         if let model { arguments += ["--model", model] }
         if let effort { arguments += ["--effort", effort] }
         if let name { arguments.append("--name=\(name)") }
-        if !streamingInput { arguments.append(prompt) }
         if let injection { arguments += injection.claudeArguments() }
-        if streamingInput { arguments += ["--input-format", "stream-json"] }
-        arguments += ["--output-format", "stream-json", "--verbose"]
+        arguments += ["--input-format", "stream-json", "--permission-prompt-tool", "stdio",
+                      "--output-format", "stream-json", "--verbose"]
         return arguments
     }
 
-    /// 发图时写进 stdin 的全部内容；不发图返回 nil（stdin 照旧继承，prompt 仍是位置参数）。
-    /// 图在这里一次读进内存：读不到要在起进程之前就报错，而不是让 claude 收到半条消息。
-    static func streamingInput(prompt: String, images: [URL]) throws -> Data? {
-        guard !images.isEmpty else { return nil }
+    /// 这一轮写进 stdin 的 user 消息。图在这里一次读进内存：读不到要在起进程之前就报错，而不是让 claude 收到半条消息。
+    static func stdinMessage(prompt: String, images: [URL]) throws -> Data {
         let loaded = try images.map { url -> (data: Data, contentType: String) in
             guard let data = try? Data(contentsOf: url) else { throw ConnectorError("读不到要发送的图片") }
             return (data, mediaType(for: url))
@@ -978,14 +1113,14 @@ public actor ClaudeConnector: TaskConnector {
         return try stdinPayload(prompt: prompt, images: loaded)
     }
 
-    /// `--input-format stream-json` 的一条用户消息：一行 JSON 加 `\n`，写完即关 stdin。
-    /// 内容块是 Anthropic Messages 的形状：图在前（base64），文字在后；没有字就不放 text 块。
+    /// `--input-format stream-json` 的一条用户消息：一行 JSON 加 `\n`。
+    /// 内容块是 Anthropic Messages 的形状：图在前（base64），文字在后；有图没字就不放 text 块。
     static func stdinPayload(prompt: String, images: [(data: Data, contentType: String)]) throws -> Data {
         var content: [[String: Any]] = images.map {
             ["type": "image",
              "source": ["type": "base64", "media_type": $0.contentType, "data": $0.data.base64EncodedString()]]
         }
-        if !prompt.trimmed.isEmpty { content.append(["type": "text", "text": prompt]) }
+        if !prompt.trimmed.isEmpty || content.isEmpty { content.append(["type": "text", "text": prompt]) }
         let line: [String: Any] = ["type": "user", "message": ["role": "user", "content": content]]
         // 不带 `.prettyPrinted`，输出里不会有换行：整条消息就是一行。键排序让输出稳定可比；
         // 不转义 `/`：base64 里满是斜杠，转义会让几 MB 的数据平白再胀一截。
@@ -1019,9 +1154,10 @@ public actor ClaudeConnector: TaskConnector {
     /// 剩下的输出在后台接着读，用来把任务推进到结束——命令回执是"已接受"，不是"已完成"，
     /// 一轮可能跑几分钟，不能让客户端的请求挂在那里。
     ///
-    /// `stdin` 非 nil（发图）时接一根管道，进程起来后在后台线程写完并关闭；nil 时照旧继承本进程的 stdin。
+    /// stdin 是一根管道：起来后先写 `stdin`（这一轮的 user 消息），之后留着写控制协议的回答，
+    /// 读到 `result`（或进程退出）时关掉。
     private func run(arguments: [String], workingDirectory: String,
-                     environment extra: [String: String] = [:], stdin: Data? = nil) async throws -> String {
+                     environment extra: [String: String] = [:], stdin: Data) async throws -> String {
         guard let executable = binary() else {
             throw ConnectorError("本机没找到 claude 可执行文件")
         }
@@ -1038,45 +1174,47 @@ public actor ClaudeConnector: TaskConnector {
         let output = Pipe()
         process.standardOutput = output
         process.standardError = Pipe()
-        let input = stdin.map { _ in Pipe() }
-        if let input { process.standardInput = input }
+        let input = Pipe()
+        process.standardInput = input
+        let channel = ClaudeControlChannel(handle: input.fileHandleForWriting)
 
         let sessionID = OneShotContinuation<String>()
         let reader = StreamJSONReader(handle: output.fileHandleForReading)
         reader.onSessionID = { sessionID.resume(returning: $0) }
+        reader.onControl = { [weak self] line, id in
+            Task { await self?.handleControl(line, sessionID: id, stdin: channel, workingDirectory: workingDirectory) }
+        }
+        // 一轮结束：关 stdin（EOF），claude 才会退出。
+        reader.onResult = { channel.close() }
         reader.onFinished = { [weak self] result in
             Task { await self?.finish(result) }
         }
         process.terminationHandler = { _ in
             // 一行 init 都没吐出来就退了：别让调用方一直等到超时。
             sessionID.resume(throwing: Self.exitedWithoutSessionID)
+            channel.close()
             reader.finish()
         }
 
         do {
             try process.run()
         } catch {
+            channel.close()
             throw ConnectorError("起不了 claude：\(error.localizedDescription)")
         }
         reader.start()
-        if let input, let stdin { Self.write(stdin, to: input.fileHandleForWriting) }
+        channel.send(stdin)
 
-        let id = try await awaitSessionID(sessionID)
-        ownProcesses[id] = process
-        return id
-    }
-
-    /// 把整段 stdin 写进管道再关闭（关闭 = EOF，claude 才开始这一轮）。
-    ///
-    /// 几 MB 的 base64 远超管道缓冲，写入会阻塞到 claude 读走为止，所以放到后台线程，不占 actor；
-    /// stdout 由 `StreamJSONReader` 独立读取，两头不会互相等死。管道关掉 SIGPIPE：claude 没读完就退出时
-    /// 写入只是失败（进程退出那条路径会报错），不能把整个 app 带走。
-    private static func write(_ data: Data, to handle: FileHandle) {
-        _ = fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1)
-        DispatchQueue.global(qos: .userInitiated).async {
-            try? handle.write(contentsOf: data)
-            try? handle.close()
+        let id: String
+        do {
+            id = try await awaitSessionID(sessionID)
+        } catch {
+            channel.close()
+            throw error
         }
+        ownProcesses[id] = process
+        controls[id] = channel
+        return id
     }
 
     /// 等 session id，带硬超时。两条路径抢的是同一个 `OneShotContinuation`，
@@ -1094,6 +1232,14 @@ public actor ClaudeConnector: TaskConnector {
     private func finish(_ result: StreamJSONReader.Result) async {
         guard let sessionID = result.sessionID, sessions[sessionID] != nil else { return }
         ownProcesses.removeValue(forKey: sessionID)
+        if let stdin = controls.removeValue(forKey: sessionID) {
+            stdin.close()
+            // 进程没了，挂在它 stdin 上的审批送不到了。
+            for (key, hold) in holds where hold.isOn(stdin) {
+                holds.removeValue(forKey: key)
+                questionHolds.removeValue(forKey: key)
+            }
+        }
         let next = queued[sessionID]?.first
         if next != nil { queued[sessionID]?.removeFirst() }
         if queued[sessionID]?.isEmpty == true { queued.removeValue(forKey: sessionID) }

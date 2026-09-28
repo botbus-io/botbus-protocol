@@ -289,7 +289,7 @@ PendingQuestion（2.14）：`id` string（同一请求内唯一，作 `approve.a
 
 手机可以给一个项目（`(agentId, projectPath)`，worktree 里的会话按主仓库算）开「自动批准」：之后 Agent 替手机跑的轮次——`startTask`、`followUp` 起的那一轮，包括在桌面会话上续聊——里遇到审批（`kind` 为 `command` / `fileChange` / `permission`）直接按「只这一次允许」放行，不建 `pendingRequest`、不推 `TASK_APPROVAL`；提问（`kind = input`：Claude 的 AskUserQuestion、Codex 的 requestUserInput）照旧交给手机。电脑上自己跑的轮次不受影响，照旧由电脑处理；共用 Codex 桌面时，也只放行手机那一轮里的审批。
 
-开关没有单独的命令：随下一条 `startTask` / `followUp` 的 `autoApprove` 一起发，之后沿用，状态从 `Project.autoApprove` / `Task.autoApprove` 读回。设置由 Agent 按项目路径持久化在本机（重启后仍在），对这台电脑上所有报了 `canAutoApprove` 的 agent 一起生效；只在这台电脑上，与别的电脑上同名路径无关。Codex 放行命令与改文件时回 `accept`，`permissions` 请求授出它要的那些、范围 `turn`；Claude Code 的 `PermissionRequest` hook 回 `allow`。
+开关没有单独的命令：随下一条 `startTask` / `followUp` 的 `autoApprove` 一起发，之后沿用，状态从 `Project.autoApprove` / `Task.autoApprove` 读回。设置由 Agent 按项目路径持久化在本机（重启后仍在），对这台电脑上所有报了 `canAutoApprove` 的 agent 一起生效；只在这台电脑上，与别的电脑上同名路径无关。Codex 放行命令与改文件时回 `accept`，`permissions` 请求授出它要的那些、范围 `turn`；Claude Code 在 Agent 起的 `claude -p`（带 `--permission-prompt-tool stdio`）里经控制协议回 `allow`（手机那一轮的审批一律走这条，不靠 `PermissionRequest` hook：Claude Code 2.1.268 之前的 `-p` 不发它）。
 
 ### 命令：approve
 

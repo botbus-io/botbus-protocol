@@ -136,7 +136,8 @@ public struct ClaudeHookEvent: Sendable, Equatable {
 ///
 /// 实测（Claude Code 2.1.273，SDK 模式）：`PermissionRequest` hook 回 `allow` 并在 `updatedInput` 里
 /// 带上原入参加 `answers`（问题原文 → 选中的 label，多选用 ", " 连起来），就等于用户在电脑上选了；
-/// 与电脑上的提问框先答者生效。`-p` 模式下没有这个工具，只有桌面 app / 交互会话里会遇到。
+/// 与电脑上的提问框先答者生效。`-p` 只有带 permission host 时才有这个工具：本连接器起的 `claude -p` 带
+/// `--permission-prompt-tool stdio`，所以手机那一轮里它经控制协议（`ClaudeControlRequest`）到达，回答形状相同。
 public struct ClaudeAskedQuestions: Sendable, Equatable {
     public static let toolName = "AskUserQuestion"
     static let textLimit = 2000
@@ -205,6 +206,13 @@ public struct ClaudeAskedQuestions: Sendable, Equatable {
         return result
     }
 
+    /// 回答后的整份入参：原入参加 `answers`（`updatedInput` 整份替换入参）。
+    public func answeredInput(_ answers: [String: String]) -> Data {
+        var input = ((try? JSONSerialization.jsonObject(with: rawInput)) as? [String: Any]) ?? [:]
+        input["answers"] = answers
+        return (try? JSONSerialization.data(withJSONObject: input, options: [.sortedKeys])) ?? rawInput
+    }
+
     /// 同一句话回答所有问题：用户没点选项、直接打了字。
     public func claudeAnswers(text: String) -> [String: String] {
         Dictionary(texts.map { ($0, text) }, uniquingKeysWith: { first, _ in first })
@@ -218,13 +226,24 @@ public struct ClaudeAskedQuestions: Sendable, Equatable {
 /// 形状取自本机 Claude Code 2.1.273 的内建 schema。
 public enum ClaudeHookOutput {
     public static func permission(allow: Bool, reason: String) -> Data {
-        let decision: [String: Any] = allow
-            ? ["behavior": "allow"]
-            : ["behavior": "deny", "message": reason]
+        permission(allow ? .allow(updatedInput: nil) : .deny(message: reason))
+    }
+
+    public static func permission(_ decision: ClaudePermissionDecision) -> Data {
+        let body: [String: Any]
+        switch decision {
+        case .allow(nil):
+            body = ["behavior": "allow"]
+        case .allow(let updated?):
+            body = ["behavior": "allow",
+                    "updatedInput": ((try? JSONSerialization.jsonObject(with: updated)) as? [String: Any]) ?? [:]]
+        case .deny(let message):
+            body = ["behavior": "deny", "message": message]
+        }
         let payload: [String: Any] = [
             "hookSpecificOutput": [
                 "hookEventName": ClaudeHookEvent.Kind.permissionRequest.rawValue,
-                "decision": decision,
+                "decision": body,
             ],
         ]
         return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
@@ -232,14 +251,6 @@ public enum ClaudeHookOutput {
 
     /// 替用户回答 `AskUserQuestion`：`allow`，`updatedInput` = 原入参 + `answers`。
     public static func answer(_ asked: ClaudeAskedQuestions, answers: [String: String]) -> Data {
-        var input = ((try? JSONSerialization.jsonObject(with: asked.rawInput)) as? [String: Any]) ?? [:]
-        input["answers"] = answers
-        let payload: [String: Any] = [
-            "hookSpecificOutput": [
-                "hookEventName": ClaudeHookEvent.Kind.permissionRequest.rawValue,
-                "decision": ["behavior": "allow", "updatedInput": input] as [String: Any],
-            ],
-        ]
-        return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
+        permission(.allow(updatedInput: asked.answeredInput(answers)))
     }
 }

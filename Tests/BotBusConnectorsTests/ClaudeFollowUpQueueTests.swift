@@ -14,7 +14,8 @@ final class ClaudeFollowUpQueueTests: XCTestCase {
         return directory
     }
 
-    /// 假 `claude`：session id 固定（`--resume` 不分叉），每次调用在 `calls.log` 记 `start <prompt>` / `end <prompt>`。
+    /// 假 `claude`：session id 固定（`--resume` 不分叉），每次调用在 `calls.log` 记 `start <prompt>` / `end <prompt>`
+    /// （prompt 取自 stdin 第一行的 user 消息）。
     /// init 行晚 0.3 秒才吐，让第二条续聊正好落在"已起进程、还没拿到 id"的空当里；prompt 含 slow 时这一轮跑 1.5 秒。
     private func fakeClaude(in directory: URL) throws -> URL {
         let log = directory.appendingPathComponent("calls.log").path
@@ -25,9 +26,7 @@ final class ClaudeFollowUpQueueTests: XCTestCase {
           echo '  --effort <level>  Effort level (low, medium, high, max)'
           exit 0
         fi
-        prompt=""
-        prev=""
-        for a in "$@"; do [ "$prev" = "sess-q" ] && prompt="$a"; prev="$a"; done
+        prompt=$(head -n 1 | sed -n 's/.*"text":"\\([^"]*\\)".*/\\1/p')
         echo "start $prompt" >> "\(log)"
         sleep 0.3
         echo '{"type":"system","subtype":"init","session_id":"sess-q"}'

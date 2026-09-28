@@ -6,11 +6,10 @@ import BotBusProtocol
 
 /// 协议 3.2：Claude 的模型别名、`--model` / `--effort` 参数，以及从 transcript 认出用过的模型。
 final class ClaudeModelsTests: XCTestCase {
-    func testModelAndEffortGoBeforeThePrompt() {
-        XCTAssertEqual(ClaudeConnector.arguments(prompt: "接着改", resuming: "s1", injection: nil,
-                                                 model: "opus", effort: "high"),
-                       ["-p", "--resume", "s1", "--model", "opus", "--effort", "high", "接着改",
-                        "--output-format", "stream-json", "--verbose"])
+    func testModelAndEffortGoBeforeTheStreamFlags() {
+        XCTAssertEqual(ClaudeConnector.arguments(resuming: "s1", injection: nil, model: "opus", effort: "high"),
+                       ["-p", "--resume", "s1", "--model", "opus", "--effort", "high",
+                        "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--output-format", "stream-json", "--verbose"])
     }
 
     func testResolveKeepsChoicesAndDropsEffortForHaiku() throws {
@@ -34,8 +33,8 @@ final class ClaudeModelsTests: XCTestCase {
         let fresh = try ClaudeConnector.resolve(ModelSelection(model: "sonnet", effort: "high"), current: nil)
         XCTAssertEqual(fresh.model, "sonnet")
         XCTAssertEqual(fresh.effort, "high")
-        XCTAssertEqual(ClaudeConnector.arguments(prompt: "开始", resuming: nil, injection: nil, model: "sonnet").prefix(4),
-                       ["-p", "--model", "sonnet", "开始"])
+        XCTAssertEqual(ClaudeConnector.arguments(resuming: nil, injection: nil, model: "sonnet").prefix(4),
+                       ["-p", "--model", "sonnet", "--input-format"])
 
         session.chosenModel = "haiku"
         XCTAssertThrowsError(try ClaudeConnector.resolve(ModelSelection(effort: "high"), current: session))

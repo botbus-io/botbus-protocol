@@ -73,29 +73,28 @@ final class AgentToolsInjectionTests: XCTestCase {
 
     // MARK: - Claude 命令行
 
-    func testClaudeArgumentsWithoutInjectionAreUnchanged() {
-        XCTAssertEqual(ClaudeConnector.arguments(prompt: "做个页面", resuming: nil, injection: nil),
-                       ["-p", "做个页面", "--output-format", "stream-json", "--verbose"])
-        XCTAssertEqual(ClaudeConnector.arguments(prompt: "接着改", resuming: "s1", injection: nil),
-                       ["-p", "--resume", "s1", "接着改", "--output-format", "stream-json", "--verbose"])
+    func testClaudeArgumentsWithoutInjection() {
+        XCTAssertEqual(ClaudeConnector.arguments(resuming: nil, injection: nil),
+                       ["-p", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--output-format", "stream-json", "--verbose"])
+        XCTAssertEqual(ClaudeConnector.arguments(resuming: "s1", injection: nil),
+                       ["-p", "--resume", "s1", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--output-format", "stream-json", "--verbose"])
     }
 
-    /// `--mcp-config` / `--allowedTools` 是可变参数：必须排在 prompt 之后，并被下一个 `--flag` 收尾。
-    func testClaudeArgumentOrderKeepsVariadicFlagsAfterPromptAndTerminated() throws {
+    /// `--mcp-config` / `--allowedTools` 是可变参数：必须被下一个 `--flag` 收尾，否则会吞掉后面的参数。
+    /// prompt 不是位置参数（走 stdin），所以参数里不会出现它。
+    func testClaudeArgumentOrderKeepsVariadicFlagsTerminated() throws {
         let value = injection()
-        let arguments = ClaudeConnector.arguments(prompt: "做个页面", resuming: "s1", injection: value)
-        XCTAssertEqual(Array(arguments.prefix(4)), ["-p", "--resume", "s1", "做个页面"])
-        let prompt = try XCTUnwrap(arguments.firstIndex(of: "做个页面"))
+        let arguments = ClaudeConnector.arguments(resuming: "s1", injection: value)
+        XCTAssertEqual(Array(arguments.prefix(3)), ["-p", "--resume", "s1"])
+        XCTAssertEqual(Array(arguments[3..<(3 + value.claudeArguments().count)]), value.claudeArguments())
         let append = try XCTUnwrap(arguments.firstIndex(of: "--append-system-prompt"))
         let mcp = try XCTUnwrap(arguments.firstIndex(of: "--mcp-config"))
         let allowed = try XCTUnwrap(arguments.firstIndex(of: "--allowedTools"))
-        let output = try XCTUnwrap(arguments.firstIndex(of: "--output-format"))
-        XCTAssertLessThan(prompt, append)
         XCTAssertEqual(arguments[append + 1], value.instructions)
         XCTAssertEqual(arguments[mcp + 1], value.mcpConfigJSON())
         XCTAssertEqual(arguments[allowed + 1], "mcp__botbus")
-        XCTAssertEqual(output, allowed + 2, "--allowedTools 的值后面紧跟一个 --flag 收尾")
-        XCTAssertEqual(Array(arguments.suffix(3)), ["--output-format", "stream-json", "--verbose"])
+        XCTAssertEqual(arguments[allowed + 2], "--input-format", "--allowedTools 的值后面紧跟一个 --flag 收尾")
+        XCTAssertEqual(Array(arguments.suffix(7)), ["--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--output-format", "stream-json", "--verbose"])
     }
 
     func testClaudeEnvironmentMergesOverInherited() {
@@ -110,7 +109,7 @@ final class AgentToolsInjectionTests: XCTestCase {
 
     /// 假 `claude`：把参数（NUL 分隔）与三个环境变量写进文件，吐一行 init 与一行 result。
     /// 带 `--resume` 时报一个新的 session id，模拟桌面会话被分支。
-    /// 带 `--input-format`（发图）时把 stdin 读到 EOF 存进文件：连接器必须写完并关闭 stdin，否则这里一直卡着拿不到 init。
+    /// stdin 的第一行（这一轮的 user 消息）存进文件；连接器要等 `result` 才关 stdin，所以只读一行，不能读到 EOF。
     /// 末尾停一会儿再退：真的 claude 一轮要跑好几秒，连接器在进程退出时若还没读到 init 行就判它失败，
     /// 立刻退出的假进程会和 stdout 的读取抢跑。
     private func fakeClaude(in directory: URL) throws -> URL {
@@ -122,7 +121,7 @@ final class AgentToolsInjectionTests: XCTestCase {
         for a in "$@"; do printf '%s\\0' "$a"; done > "\(record)/$sid.args"
         printf '%s\\n%s\\n%s\\n' "$BOTBUS_TOOLS_URL" "$BOTBUS_TASK_TOKEN" "$BOTBUS_CLI" > "\(record)/$sid.env"
         printf '%s' "$HOME" > "\(record)/$sid.home"
-        for a in "$@"; do [ "$a" = "--input-format" ] && cat > "\(record)/$sid.stdin"; done
+        head -n 1 > "\(record)/$sid.stdin"
         echo '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
         echo '{"type":"result","subtype":"success","result":"done"}'
         sleep 0.5
@@ -136,6 +135,14 @@ final class AgentToolsInjectionTests: XCTestCase {
                           ConnectorProbe(available: true, status: .ok)
                       },
                   ]))
+    }
+
+    /// 假 claude 从 stdin 收到的那条 user 消息里的文字。
+    private func stdinText(_ directory: URL, _ sid: String) throws -> String? {
+        let line = try Data(contentsOf: directory.appendingPathComponent("\(sid).stdin"))
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: line) as? [String: Any])
+        let content = (object["message"] as? [String: Any])?["content"] as? [[String: Any]]
+        return content?.last?["text"] as? String
     }
 
     private func recorded(_ directory: URL, _ sid: String) throws -> (arguments: [String], environment: [String]) {
@@ -169,8 +176,8 @@ final class AgentToolsInjectionTests: XCTestCase {
         let bound = await registry.resolve(token, wait: 0)
         XCTAssertEqual(bound, "claude:sess-1")
         XCTAssertEqual(first.arguments, ClaudeConnector.arguments(
-            prompt: "做个落地页", resuming: nil,
-            injection: AgentToolsInjection(configuration: configuration, token: token), name: "做个落地页"))
+            resuming: nil, injection: AgentToolsInjection(configuration: configuration, token: token), name: "做个落地页"))
+        XCTAssertEqual(try stdinText(directory, "sess-1"), "做个落地页")
 
         // 等这一轮跑完再续聊：还在跑时的续聊会排队（见 ClaudeFollowUpQueueTests）。
         await assertEventually(timeout: 5) { await store.task(id: "claude:sess-1")?.status == .completed }
@@ -179,7 +186,8 @@ final class AgentToolsInjectionTests: XCTestCase {
         XCTAssertEqual(branched.taskId, "fork-1")
         let second = try recorded(directory, "fork-1")
         XCTAssertEqual(second.environment[1], token)
-        XCTAssertEqual(Array(second.arguments.prefix(4)), ["-p", "--resume", "sess-1", "改成深色"])
+        XCTAssertEqual(Array(second.arguments.prefix(3)), ["-p", "--resume", "sess-1"])
+        XCTAssertEqual(try stdinText(directory, "fork-1"), "改成深色")
         let rebound = await registry.resolve(token, wait: 0)
         XCTAssertEqual(rebound, "claude:fork-1")
         await connector.stop()
@@ -193,7 +201,8 @@ final class AgentToolsInjectionTests: XCTestCase {
                                         binary: { claude.path })
         _ = try await connector.start(projectPath: directory.path, prompt: "hi")
         let recorded = try recorded(directory, "sess-1")
-        XCTAssertEqual(recorded.arguments, ["-p", "--name=hi", "hi", "--output-format", "stream-json", "--verbose"])
+        XCTAssertEqual(recorded.arguments, ["-p", "--name=hi", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--output-format", "stream-json", "--verbose"])
+        XCTAssertEqual(try stdinText(directory, "sess-1"), "hi")
         XCTAssertEqual(recorded.environment[1], ProcessInfo.processInfo.environment["BOTBUS_TASK_TOKEN"] ?? "")
         // 空环境的 claude 找不到 HOME 下的登录态，只会回 "Not logged in"。
         let home = try String(contentsOf: directory.appendingPathComponent("sess-1.home"), encoding: .utf8)
@@ -219,8 +228,7 @@ final class AgentToolsInjectionTests: XCTestCase {
                                         binary: { claude.path })
         let outcome = try await connector.start(projectPath: directory.path, prompt: "修复手表同步")
         XCTAssertEqual(outcome.taskId, "sess-1")
-        XCTAssertEqual(try recorded(directory, "sess-1").arguments,
-                       ["-p", "修复手表同步", "--output-format", "stream-json", "--verbose"])
+        XCTAssertEqual(try recorded(directory, "sess-1").arguments, ["-p", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--output-format", "stream-json", "--verbose"])
 
         // 记住这个版本不认：第二次新建直接不带名字，只起一个进程。
         let attempts = directory.appendingPathComponent("attempts")
@@ -239,26 +247,6 @@ final class AgentToolsInjectionTests: XCTestCase {
     }
 
     // MARK: - Claude 发图（协议 2.9）
-
-    func testClaudeStreamingArgumentsDropPositionalPromptAndTerminateVariadicFlags() throws {
-        XCTAssertEqual(ClaudeConnector.arguments(prompt: "看图", resuming: nil, injection: nil, streamingInput: true),
-                       ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
-        let value = injection()
-        let arguments = ClaudeConnector.arguments(prompt: "看图", resuming: "s1", injection: value, streamingInput: true)
-        XCTAssertFalse(arguments.contains("看图"), "prompt 走 stdin，不再是位置参数")
-        XCTAssertEqual(Array(arguments.prefix(3)), ["-p", "--resume", "s1"])
-        XCTAssertEqual(Array(arguments[3..<(3 + value.claudeArguments().count)]), value.claudeArguments())
-        let allowed = try XCTUnwrap(arguments.firstIndex(of: "--allowedTools"))
-        XCTAssertEqual(arguments[allowed + 2], "--input-format", "--allowedTools 的值后面紧跟一个 --flag 收尾")
-        XCTAssertEqual(Array(arguments.suffix(5)),
-                       ["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
-        // 不发图：与以前逐项相等。
-        XCTAssertEqual(ClaudeConnector.arguments(prompt: "做个页面", resuming: "s1", injection: value, streamingInput: false),
-                       ClaudeConnector.arguments(prompt: "做个页面", resuming: "s1", injection: value))
-        XCTAssertEqual(ClaudeConnector.arguments(prompt: "做个页面", resuming: "s1", injection: value),
-                       ["-p", "--resume", "s1", "做个页面"] + value.claudeArguments()
-                       + ["--output-format", "stream-json", "--verbose"])
-    }
 
     func testClaudeStdinPayloadIsOneUserLineWithImagesThenText() throws {
         let data = try ClaudeConnector.stdinPayload(prompt: "这是什么", images: [
@@ -281,7 +269,13 @@ final class AgentToolsInjectionTests: XCTestCase {
         let imageOnly = try ClaudeConnector.stdinPayload(prompt: "", images: [(data: Data([1]), contentType: "image/gif")])
         let parsed = try XCTUnwrap(try JSONSerialization.jsonObject(with: imageOnly) as? [String: Any])
         let only = try XCTUnwrap((parsed["message"] as? [String: Any])?["content"] as? [[String: Any]])
-        XCTAssertEqual(only.map { $0["type"] as? String }, ["image"], "没有字就不放 text 块")
+        XCTAssertEqual(only.map { $0["type"] as? String }, ["image"], "有图没字就不放 text 块")
+
+        // 不发图：prompt 同样经 stdin，只有一个 text 块。
+        let textOnly = try ClaudeConnector.stdinPayload(prompt: "做个页面", images: [])
+        let text = try XCTUnwrap(try JSONSerialization.jsonObject(with: textOnly) as? [String: Any])
+        XCTAssertEqual((text["message"] as? [String: Any])?["content"] as? [[String: String]],
+                       [["type": "text", "text": "做个页面"]])
     }
 
     func testClaudeImageMediaTypeFollowsExtension() {
@@ -292,10 +286,10 @@ final class AgentToolsInjectionTests: XCTestCase {
         }
     }
 
-    func testClaudeStartWithImagesWritesPayloadToStdinAndCloses() async throws {
+    func testClaudeStartWithImagesWritesPayloadAsOneStdinLine() async throws {
         let directory = try tempDirectory()
         let claude = try fakeClaude(in: directory)
-        // 一张大图：几 MB 的 stdin 远超管道缓冲，写入若卡在 actor 上或忘了关闭，这里会超时。
+        // 一张大图：几 MB 的 stdin 远超管道缓冲，写入若卡在 actor 上，这里会超时。
         let big = directory.appendingPathComponent("big.png")
         try Data((0..<3_000_000).map { UInt8(truncatingIfNeeded: $0 &* 31) }).write(to: big)
         let small = directory.appendingPathComponent("small.jpg")
@@ -307,8 +301,7 @@ final class AgentToolsInjectionTests: XCTestCase {
         let outcome = try await connector.start(projectPath: directory.path, prompt: "看图", images: [big, small])
         XCTAssertEqual(outcome.taskId, "sess-1")
         let recorded = try recorded(directory, "sess-1")
-        XCTAssertEqual(recorded.arguments, ClaudeConnector.arguments(prompt: "看图", resuming: nil, injection: nil,
-                                                                     streamingInput: true, name: "看图"))
+        XCTAssertEqual(recorded.arguments, ClaudeConnector.arguments(resuming: nil, injection: nil, name: "看图"))
         let stdin = try Data(contentsOf: directory.appendingPathComponent("sess-1.stdin"))
         let expected = try ClaudeConnector.stdinPayload(prompt: "看图", images: [
             (data: try Data(contentsOf: big), contentType: "image/png"),

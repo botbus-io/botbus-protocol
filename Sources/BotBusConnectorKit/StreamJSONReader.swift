@@ -7,6 +7,9 @@ import Foundation
 /// - `{"type":"assistant","message":{"content":[{"type":"text","text":…}]}}` —— 留最后一段文本；
 /// - `{"type":"result",…}` —— 一轮结束，`is_error`/`subtype` 说明成没成。
 ///
+/// 另外 `--permission-prompt-tool stdio` 时 claude 经 stdout 发 `control_request`（要不要放行一个工具）
+/// 与 `control_cancel_request`，原样交给 `onControl`，回答由调用方写进 stdin。
+///
 /// 其余类型（工具调用、增量）一律忽略：任务的状态由 hooks 说了算，这里只补 hooks 给不了的
 /// session id 与结尾文本。**解析全程容错**——多一种没见过的行不该让整轮白跑。
 public final class StreamJSONReader: @unchecked Sendable {
@@ -28,6 +31,8 @@ public final class StreamJSONReader: @unchecked Sendable {
 
     private var sessionIDCallback: (@Sendable (String) -> Void)?
     private var finishedCallback: (@Sendable (Result) -> Void)?
+    private var controlCallback: (@Sendable (_ line: Data, _ sessionID: String?) -> Void)?
+    private var resultCallback: (@Sendable () -> Void)?
 
     public init(handle: FileHandle) {
         self.handle = handle
@@ -42,6 +47,20 @@ public final class StreamJSONReader: @unchecked Sendable {
     public var onFinished: (@Sendable (Result) -> Void)? {
         get { lock.withLock { finishedCallback } }
         set { lock.withLock { finishedCallback = newValue } }
+    }
+
+    /// `control_request` / `control_cancel_request` 整行原样交出，连同 init 报的 session id（还没见到 init 是 nil）。
+    /// 必须在 `start()` 之前设好。
+    public var onControl: (@Sendable (_ line: Data, _ sessionID: String?) -> Void)? {
+        get { lock.withLock { controlCallback } }
+        set { lock.withLock { controlCallback = newValue } }
+    }
+
+    /// 读到 `result` 行：这一轮结束了。stream-json 输入时 claude 读到 stdin 的 EOF 才退出，
+    /// 调用方在这里关 stdin。必须在 `start()` 之前设好。
+    public var onResult: (@Sendable () -> Void)? {
+        get { lock.withLock { resultCallback } }
+        set { lock.withLock { resultCallback = newValue } }
     }
 
     public func start() {
@@ -78,6 +97,8 @@ public final class StreamJSONReader: @unchecked Sendable {
         var lines: [Data] = []
         var newSessionID: String?
         var sessionIDCallback: (@Sendable (String) -> Void)?
+        var controls: [(line: Data, sessionID: String?)] = []
+        var sawResultLine = false
 
         lock.lock()
         buffer.append(chunk)
@@ -107,13 +128,21 @@ public final class StreamJSONReader: @unchecked Sendable {
                 if isError || subtype != "success" { failed = true }
                 // `result` 行自带最终文本时用它，比累计的最后一段更准。
                 if let text = object["result"] as? String, !text.isEmpty { lastText = text }
+                sawResultLine = true
+            case "control_request", "control_cancel_request":
+                controls.append((Data(line), sessionID))
             default:
                 break
             }
         }
+        let controlCallback = controls.isEmpty ? nil : self.controlCallback
+        let resultCallback = sawResultLine ? self.resultCallback : nil
         lock.unlock()
 
+        // 回调都在锁外：调用方可能回头读属性。顺序与行序一致：先有 id，再有审批，最后收尾。
         if let newSessionID { sessionIDCallback?(newSessionID) }
+        for control in controls { controlCallback?(control.line, control.sessionID) }
+        resultCallback?()
     }
 
     /// `{"message":{"content":[{"type":"text","text":…}]}}` 里的文本，拼起来。

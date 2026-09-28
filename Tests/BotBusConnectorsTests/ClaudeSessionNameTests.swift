@@ -16,12 +16,12 @@ final class ClaudeSessionNameTests: XCTestCase {
         XCTAssertEqual(ClaudeConnector.sessionName(for: "修复\u{1B}]0;x\u{07}同步"), "修复 ]0;x 同步")
     }
 
-    func testNameIsOneArgumentBeforeThePrompt() {
-        XCTAssertEqual(ClaudeConnector.arguments(prompt: "修复手表同步", resuming: nil, injection: nil, name: "修复手表同步"),
-                       ["-p", "--name=修复手表同步", "修复手表同步", "--output-format", "stream-json", "--verbose"],
+    func testNameIsOneArgument() {
+        XCTAssertEqual(ClaudeConnector.arguments(resuming: nil, injection: nil, name: "修复手表同步"),
+                       ["-p", "--name=修复手表同步", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--output-format", "stream-json", "--verbose"],
                        "写成 --name=…：名字以 - 开头也不会被当成别的选项")
-        XCTAssertEqual(ClaudeConnector.arguments(prompt: "接着改", resuming: "s1", injection: nil),
-                       ["-p", "--resume", "s1", "接着改", "--output-format", "stream-json", "--verbose"],
+        XCTAssertEqual(ClaudeConnector.arguments(resuming: "s1", injection: nil),
+                       ["-p", "--resume", "s1", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--output-format", "stream-json", "--verbose"],
                        "续聊不改名")
     }
 }
