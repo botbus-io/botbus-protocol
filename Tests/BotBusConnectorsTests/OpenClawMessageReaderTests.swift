@@ -88,11 +88,10 @@ final class OpenClawMessageReaderTests: XCTestCase {
         XCTAssertTrue(entries.allSatisfy { $0.pathCandidates.isEmpty })
     }
 
-    func testLongTextIsTruncated() {
-        let long = String(repeating: "a", count: TaskMessages.maxMessageLength + 50)
+    func testLongTextIsPreserved() {
+        let long = String(repeating: "a", count: 5000)
         let messages = OpenClawMessageReader.entries(from: history([["role": "user", "content": .string(long), "timestamp": .int(base)]])).map(\.message)
-        XCTAssertEqual(messages.first?.text.count, TaskMessages.maxMessageLength + 1)
-        XCTAssertTrue(messages.first?.text.hasSuffix("…") ?? false)
+        XCTAssertEqual(messages.first?.text.count, 5000, "user/agent 消息不截断")
     }
 
     func testLimitAndHasMore() async throws {

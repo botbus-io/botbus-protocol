@@ -124,7 +124,9 @@ struct AcpTranscript: Hashable, Sendable {
     var entries: [TranscriptEntry] {
         items.map { item in
             TranscriptEntry(
-                message: Message(id: item.id, role: item.role, text: truncateMessage(item.text), createdAt: item.createdAt),
+                message: Message(id: item.id, role: item.role,
+                                text: item.role == .tool ? truncateMessage(item.text, limit: maxToolTextLength) : item.text.trimmed,
+                                createdAt: item.createdAt),
                 images: item.images.compactMap { ImageSource(base64: $0.base64, contentType: $0.mimeType) })
         }
     }

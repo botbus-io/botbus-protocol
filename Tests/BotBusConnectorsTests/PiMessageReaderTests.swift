@@ -84,13 +84,13 @@ final class PiMessageReaderTests: XCTestCase {
         XCTAssertTrue(hasMore)
     }
 
-    func testLongTextIsTruncated() async throws {
+    func testLongTextIsPreserved() async throws {
         try fixture.write(id: "s", lines: [
             PiFixture.header(id: "s", cwd: "/p/demo"),
-            PiFixture.user("u", parent: nil, String(repeating: "字", count: 1500)),
+            PiFixture.user("u", parent: nil, String(repeating: "字", count: 5000)),
         ], modifiedAt: Date())
         let (messages, _) = try await reader().messages(taskId: "pi:s", limit: 40)
-        XCTAssertEqual(messages.first?.text.count, TaskMessages.maxMessageLength + 1, "截断后带省略号")
+        XCTAssertEqual(messages.first?.text.count, 5000, "user/agent 消息不截断")
     }
 
     func testUserImagesAreCollected() async throws {

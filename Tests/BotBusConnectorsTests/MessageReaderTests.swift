@@ -48,15 +48,14 @@ final class MessageReaderTests: XCTestCase {
         XCTAssertNil(CodexMessageReader.entry(from: row)?.message)
     }
 
-    func testMessageTextIsTruncatedWithEllipsis() {
-        let long = String(repeating: "长", count: TaskMessages.maxMessageLength + 50)
+    func testLongMessageTextIsPreserved() {
+        let long = String(repeating: "长", count: 5000)
         let row: [String: SQLiteValue] = ["item_id": .text("i1"), "item_type": .text("agentMessage"),
                                           "item_json": .text(String(data: try! JSONSerialization.data(
                                               withJSONObject: ["text": long]), encoding: .utf8)!),
                                           "created_at_ms": .integer(0)]
         let message = CodexMessageReader.entry(from: row)?.message
-        XCTAssertEqual(message?.text.count, TaskMessages.maxMessageLength + 1, "截断后多一个省略号")
-        XCTAssertEqual(message?.text.hasSuffix("…"), true)
+        XCTAssertEqual(message?.text.count, 5000, "user/agent 消息不截断")
     }
 
     // MARK: - Codex：图片
@@ -121,12 +120,12 @@ final class MessageReaderTests: XCTestCase {
         XCTAssertEqual(entry.images, [.data(TestImage.png, contentType: "image/png")])
     }
 
-    func testCodexImageGenerationPromptIsTruncatedLikeOtherText() throws {
-        let long = String(repeating: "猫", count: TaskMessages.maxMessageLength + 10)
+    func testCodexImageGenerationPromptIsPreserved() throws {
+        let long = String(repeating: "猫", count: 5000)
         let entry = try XCTUnwrap(CodexMessageReader.entry(from: codexRow("imageGeneration", """
             {"savedPath":"/tmp/gen.png","revisedPrompt":"\(long)"}
             """)))
-        XCTAssertEqual(entry.message.text.count, TaskMessages.maxMessageLength + 1)
+        XCTAssertEqual(entry.message.text.count, 5000, "user/agent 消息不截断")
     }
 
     func testCodexTextOnlyAndBrokenImagesHaveNoImages() throws {
@@ -211,6 +210,42 @@ final class MessageReaderTests: XCTestCase {
         // 真话本身带尖括号不受影响。
         XCTAssertEqual(try XCTUnwrap(message(#"{"type":"user","uuid":"u7","message":{"content":[{"type":"text","text":"<div> 这个标签改一下"}]}}"#)).text,
                        "<div> 这个标签改一下")
+    }
+
+    /// 桌面 app（2.1.260 起）把工具调用之间的过程说明写成签名标着 `narration` 的 thinking 块，
+    /// 界面上当正文显示；普通思考照旧不进对话。
+    func testClaudeShowsNarrationThinkingAsAgentText() throws {
+        // 与实测签名同构：字段 1 是版本，字段 2 里嵌字段 1（其中字段 8 是块类型）与 12 字节的随机数。
+        func signature(_ kind: String) -> String {
+            let tag = Array(kind.utf8)
+            let header: [UInt8] = [0x08, 0x12, 0x18, 0x02, 0x38, 0x01, 0x42, UInt8(tag.count)] + tag
+            let body: [UInt8] = [0x0A, UInt8(header.count)] + header + [0x12, 0x0C] + Array(repeating: 0xAB, count: 12)
+            return Data([0x08, 0x04, 0x12, UInt8(body.count)] + body).base64EncodedString()
+        }
+        func line(_ text: String, signature: String) -> String {
+            #"{"type":"assistant","uuid":"n1","message":{"model":"claude-opus-5-5","content":[{"type":"thinking","thinking":"\#(text)","signature":"\#(signature)"}]}}"#
+        }
+        func object(_ line: String) throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+        }
+
+        let narration = line(#"先确认模型列表从哪来。\n\n"#, signature: signature("narration"))
+        let entries = ClaudeMessageReader.entries(from: Substring(narration), ordinal: 0)
+        XCTAssertEqual(entries.map(\.message.id), ["n1"])
+        XCTAssertEqual(entries.first?.message.role, .agent)
+        XCTAssertEqual(entries.first?.message.text, "先确认模型列表从哪来。")
+        XCTAssertEqual(ClaudeConnector.assistantText(try object(narration)), "先确认模型列表从哪来。",
+                       "最后一条消息与对话记录一致")
+
+        let thinking = line("我在想要不要先读测试", signature: signature("thinking"))
+        XCTAssertEqual(ClaudeMessageReader.entries(from: Substring(thinking), ordinal: 0), [])
+        XCTAssertNil(ClaudeConnector.assistantText(try object(thinking)))
+        // 没有文字的 narration 块（请求没要思考文字）、老版本的签名、坏签名都按普通思考处理。
+        XCTAssertEqual(ClaudeMessageReader.entries(from: Substring(line("", signature: signature("narration"))), ordinal: 0), [])
+        XCTAssertEqual(ClaudeMessageReader.entries(from: Substring(line("旧签名", signature: "EqoBCkgIARABGAIiQL")), ordinal: 0), [])
+        XCTAssertEqual(ClaudeMessageReader.entries(from: Substring(line("坏签名", signature: "不是 base64")), ordinal: 0), [])
+        let truncated = String(signature("narration").dropLast(8))
+        XCTAssertEqual(ClaudeMessageReader.entries(from: Substring(line("截断", signature: truncated)), ordinal: 0), [])
     }
 
     /// 正文与工具调用混在一行时拆开：正文一条 `.agent`（用 uuid），每个 tool_use 各一行 `.tool`（`uuid#n`）。
@@ -339,7 +374,7 @@ final class MessageReaderTests: XCTestCase {
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: home) }
 
-        let long = String(repeating: "长", count: TaskMessages.maxMessageLength + 10)
+        let long = String(repeating: "长", count: 5000)
         let lines = (0..<6).flatMap { i in [
             #"{"type":"user","uuid":"u\#(i)","message":{"content":"看 in/\#(i).png"}}"#,
             #"{"type":"assistant","uuid":"a\#(i)","message":{"content":[{"type":"text","text":"\#(long) 存到 `out/\#(i).png`"}]}}"#,
@@ -380,12 +415,12 @@ final class MessageReaderTests: XCTestCase {
 
     // MARK: - 文件路径候选（协议 2.9 的 Message.files）
 
-    /// 路径从截断前的原文里认：超过 1000 字的回复末尾的路径也要在。只有 agent 的有，用户消息与工具行没有。
-    func testCodexAgentMessagesCarryPathCandidatesFromUntruncatedText() throws {
-        let long = String(repeating: "长", count: TaskMessages.maxMessageLength + 50) + " 已保存到 `out/a.png`"
+    /// 路径从原文里认。只有 agent 的有，用户消息与工具行没有。
+    func testCodexAgentMessagesCarryPathCandidates() throws {
+        let long = String(repeating: "长", count: 5000) + " 已保存到 `out/a.png`"
         let agentJSON = String(data: try JSONSerialization.data(withJSONObject: ["text": long]), encoding: .utf8)!
         let agent = try XCTUnwrap(CodexMessageReader.entry(from: codexRow("agentMessage", agentJSON)))
-        XCTAssertFalse(agent.message.text.contains("out/a.png"), "前提：正文已被截断")
+        XCTAssertTrue(agent.message.text.contains("out/a.png"), "全文保留")
         XCTAssertEqual(agent.pathCandidates, ["out/a.png"])
 
         let user = try XCTUnwrap(CodexMessageReader.entry(from: codexRow(

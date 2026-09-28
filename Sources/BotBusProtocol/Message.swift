@@ -103,7 +103,6 @@ public struct TaskMessages: Codable, Hashable, Sendable {
     public static let maxMessages = 40
     public static let maxToolMessages = 160
     public static let maxEntries = maxMessages + maxToolMessages
-    public static let maxMessageLength = 1000
     /// 单条消息最多带几张图（协议 2.9）。
     public static let maxAttachmentsPerMessage = 4
 }

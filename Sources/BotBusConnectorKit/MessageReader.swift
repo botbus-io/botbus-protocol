@@ -37,7 +37,7 @@ public func nativeTaskId(_ taskId: String, kind: ConnectorKind) throws -> String
     return native
 }
 
-public func truncateMessage(_ text: String, limit: Int = TaskMessages.maxMessageLength) -> String {
+public func truncateMessage(_ text: String, limit: Int) -> String {
     let trimmed = text.trimmed
     return trimmed.count <= limit ? trimmed : String(trimmed.prefix(limit)) + "…"
 }
@@ -79,23 +79,25 @@ public enum TranscriptWindow {
     }
 }
 
-/// 工具行的正文上限：它只是一行摘要（长命令、长参数），一次拉取最多一百多行，按对话的 1000 字给太占体积。
+/// 工具行的正文上限：它只是一行摘要（长命令、长参数），一次拉取最多一百多行，不截会很占体积。
 public let maxToolTextLength = 200
 
-/// 五家读取器共用的收尾：截断正文（工具行按 `maxToolTextLength`），再判空，组成一条 entry。
+/// 五家读取器共用的收尾：工具行截断到 `maxToolTextLength`，用户与 Agent 的消息保留全文（只 trim），
+/// 再判空，组成一条 entry。
 ///
-/// 判空必须在截断（顺带 trim）之后，不然只有空白的正文会变成空气泡；
+/// 判空必须在 trim 之后，不然只有空白的正文会变成空气泡；
 /// 但有图就要留——2.9 起纯图片消息（`text == ""`）也是一条对话。
 ///
-/// Agent 回复里的文件路径（`pathCandidates`）从**截断前**的原文里认：长回复末尾的"已保存到 `out/a.png`"
-/// 不能因为正文只给手机看前 1000 字就丢了。只认 `.agent`：用户消息里的路径不是 Agent 产出的，
+/// Agent 回复里的文件路径（`pathCandidates`）从原文里认。只认 `.agent`：用户消息里的路径不是 Agent 产出的，
 /// 工具行只有文件名摘要。放在这里是为了五家读取器一处生效，不用各自记得调用。
 ///
 /// `extractPaths: false` 给"整份解析再截尾"的读取器（Claude、Pi）用：先不认路径，截出窗口后只给窗口里的回复补
 /// ——几千条的会话不必每次拉取都把每条回复过一遍正则。其余读取器在 SQL / Gateway 那一步就只取了窗口。
 public func transcriptEntry(id: String, role: Message.Role, text raw: String?, images: [ImageSource] = [],
                      createdAt: String, extractPaths: Bool = true) -> TranscriptEntry? {
-    let text = truncateMessage(raw ?? "", limit: role == .tool ? maxToolTextLength : TaskMessages.maxMessageLength)
+    let text = role == .tool
+        ? truncateMessage(raw ?? "", limit: maxToolTextLength)
+        : (raw ?? "").trimmed
     guard !text.isEmpty || !images.isEmpty else { return nil }
     let paths = role == .agent && extractPaths ? TranscriptFileRefs.candidates(in: raw ?? "") : []
     return TranscriptEntry(message: Message(id: id, role: role, text: text, createdAt: createdAt), images: images,

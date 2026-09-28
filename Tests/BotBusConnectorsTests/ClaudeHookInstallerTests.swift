@@ -101,7 +101,7 @@ final class ClaudeHookInstallerTests: XCTestCase {
         let matchers = try XCTUnwrap(hooks["PermissionRequest"] as? [[String: Any]])
         let entry = try XCTUnwrap((matchers[0]["hooks"] as? [[String: Any]])?.first)
         XCTAssertEqual(entry["timeout"] as? Int, ClaudeHookInstaller.permissionTimeoutSeconds)
-        XCTAssertGreaterThan(ClaudeHookInstaller.permissionTimeoutSeconds, 120, "必须比脚本的 --max-time 更宽")
+        XCTAssertGreaterThan(ClaudeHookInstaller.permissionTimeoutSeconds, 1800, "必须比脚本的 --max-time 更宽")
 
         // 其余事件不该带 timeout（用默认值就好）。
         let stop = try XCTUnwrap(hooks["Stop"] as? [[String: Any]])

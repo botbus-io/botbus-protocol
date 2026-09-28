@@ -160,25 +160,59 @@ final class CodexConnectorTests: XCTestCase {
         rig.process.deliver(object: ["method": "thread/started",
                                      "params": ["thread": ["id": "new-desktop-task",
                                                            "cwd": "/tmp/my-project",
-                                                           "preview": "桌面新会话"]]])
+                                                           "preview": "桌面新会话",
+                                                           "model": "gpt-6-sol",
+                                                           "reasoningEffort": "high"]]])
         rig.process.deliver(object: ["method": "turn/started",
                                      "params": ["threadId": "new-desktop-task", "turn": ["id": "turn"]]])
         await assertEventually { await self.task(rig, "codex:new-desktop-task")?.status == .running }
         let record = try await requireTask(rig, "codex:new-desktop-task")
         XCTAssertEqual(record.projectPath, "/tmp/my-project")
         XCTAssertEqual(record.title, "桌面新会话")
-        XCTAssertEqual(rig.process.requests(method: "thread/read").count, 0)
+        XCTAssertEqual(record.model, "gpt-6-sol")
+        XCTAssertEqual(record.effort, "high")
+        XCTAssertEqual(rig.process.requests(method: "thread/read").count, 1, "新一轮开始时刷新桌面模型")
         await teardown(rig)
     }
 
     func testSharedDesktopReadsMetadataWhenAttachingMidTurn() async throws {
         let rig = await makeRig(sharedDesktop: true)
+        rig.responder.on("thread/read") { params in
+            ["thread": ["id": params["threadId"] as? String ?? "",
+                        "cwd": "/tmp/desktop", "preview": "桌面上开的那个线程",
+                        "model": "gpt-6-astra", "reasoningEffort": "xhigh"]]
+        }
         rig.process.deliver(object: ["method": "turn/started",
                                      "params": ["threadId": "existing-desktop-task", "turn": ["id": "turn"]]])
         await assertEventually { await self.task(rig, "codex:existing-desktop-task")?.projectPath == "/tmp/desktop" }
         let record = try await requireTask(rig, "codex:existing-desktop-task")
         XCTAssertEqual(record.title, "桌面上开的那个线程")
-        XCTAssertEqual(rig.process.requests(method: "thread/read").count, 1)
+        XCTAssertEqual(record.model, "gpt-6-astra")
+        XCTAssertEqual(record.effort, "xhigh")
+        XCTAssertEqual(rig.process.requests(method: "thread/read").count, 2, "接入与新一轮各读一次")
+        await teardown(rig)
+    }
+
+    func testSharedDesktopRefreshesModelWhenDesktopChangesItBetweenTurns() async throws {
+        let rig = await makeRig(sharedDesktop: true)
+        let current = Locked((model: "gpt-6-sol", effort: "high"))
+        rig.responder.on("thread/read") { params in
+            let model = current.current
+            return ["thread": ["id": params["threadId"] as? String ?? "",
+                               "cwd": "/tmp/desktop", "model": model.model,
+                               "reasoningEffort": model.effort]]
+        }
+        rig.process.deliver(object: ["method": "thread/started",
+                                     "params": ["thread": ["id": "switching-desktop-task", "cwd": "/tmp/desktop",
+                                                           "model": "gpt-6-sol", "reasoningEffort": "high"]]])
+        await assertEventually { await self.task(rig, "codex:switching-desktop-task")?.model == "gpt-6-sol" }
+
+        current.withLock { $0 = (model: "gpt-6-astra", effort: "xhigh") }
+        rig.process.deliver(object: ["method": "turn/started",
+                                     "params": ["threadId": "switching-desktop-task", "turn": ["id": "next-turn"]]])
+        await assertEventually { await self.task(rig, "codex:switching-desktop-task")?.model == "gpt-6-astra" }
+        let record = try await requireTask(rig, "codex:switching-desktop-task")
+        XCTAssertEqual(record.effort, "xhigh")
         await teardown(rig)
     }
 

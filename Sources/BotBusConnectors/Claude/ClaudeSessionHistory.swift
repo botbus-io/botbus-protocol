@@ -24,7 +24,7 @@ enum ClaudeSessionHistory {
         var title: String?
         var titleSource: ClaudeConnector.TitleSource
         var lastMessage: String?
-        /// 最后一条 assistant 消息用的模型（`ClaudeModels` 的别名），认不出时是 nil。
+        /// 最后一条 assistant 消息用的完整模型名（`claude-opus-5-5`），认不出别名的不算，都认不出时是 nil。
         var model: String? = nil
         var startedAt: Date
         var updatedAt: Date
@@ -120,7 +120,7 @@ enum ClaudeSessionHistory {
             case "assistant":
                 if let text = ClaudeConnector.assistantText(object) { lastAssistant = text }
                 if let name = (object["message"] as? [String: Any])?["model"] as? String,
-                   let alias = ClaudeModels.optionId(forTranscriptModel: name) { model = alias }
+                   ClaudeModels.optionId(forTranscriptModel: name) != nil { model = name }
             default:
                 break
             }

@@ -60,7 +60,7 @@ public struct ClaudeMessageReader: MessageReader {
     /// Claude Code 自己注入、被记成 user 行的整块。用户没说过这些话，不该出现在对话记录里。
     static let injectedTags = ["system-reminder", "task-notification"]
 
-    /// transcript 的一行 → 0…n 条：正文（文字与用户的图）一条，每个 `tool_use` 各一行 `.tool` 摘要；
+    /// transcript 的一行 → 0…n 条：正文（文字、过程说明与用户的图）一条，每个 `tool_use` 各一行 `.tool` 摘要；
     /// 思考、`tool_result` 与元数据行直接丢掉。Claude Code 通常一个内容块写一行，混着写时正文在前。
     ///
     /// `isMeta` 是 Claude Code 自己写进去的 user 行（贴图的 `[Image: …]` 占位、skill 的基目录说明），
@@ -109,6 +109,8 @@ public struct ClaudeMessageReader: MessageReader {
                     let stripped = stripInjectedBlocks(text).trimmed
                     if !stripped.isEmpty { texts.append(stripped) }
                 }
+            case "thinking":
+                if let text = narrationText(block) { texts.append(text) }
             case "tool_use":
                 if let name = block["name"] as? String {
                     tools.append(Self.toolSummary(name: name, input: block["input"] as? [String: Any]))
@@ -143,6 +145,31 @@ public struct ClaudeMessageReader: MessageReader {
         return "调用 \(name)"
     }
 
+    /// 过程说明块的正文；普通思考、没有文字的块是 nil。
+    ///
+    /// 桌面 app（2.1.260 起）在工具调用之间给用户看的那几句话不是 `text` 块，而是服务端写的
+    /// thinking 块，只有签名里标着 `narration`；桌面上当正文显示，手机不显示就像丢了消息。
+    /// transcript 里没有别的标记，只能照 Claude Code 自己的做法解签名（见 `signatureBlockKind`）。
+    static func narrationText(_ block: [String: Any]) -> String? {
+        guard block["type"] as? String == "thinking",
+              let text = (block["thinking"] as? String)?.trimmed, !text.isEmpty,
+              let signature = block["signature"] as? String,
+              signatureBlockKind(signature) == "narration" else { return nil }
+        return text
+    }
+
+    /// thinking 签名里的块类型：base64 解出 protobuf，取字段 2 → 字段 1 → 字段 8 的字符串
+    /// （Claude Code 2.1.281 的 `narration_block_indexes` 同样这样认）。任一层解不开都是 nil——
+    /// 老版本签名、截断的、坏的，一律按普通思考处理。
+    static func signatureBlockKind(_ signature: String) -> String? {
+        let padded = signature + String(repeating: "=", count: (4 - signature.count % 4) % 4)
+        guard let data = Data(base64Encoded: padded),
+              let envelope = ProtobufFields.bytes(field: 2, in: [UInt8](data)),
+              let header = ProtobufFields.bytes(field: 1, in: envelope),
+              let kind = ProtobufFields.bytes(field: 8, in: header) else { return nil }
+        return String(bytes: kind, encoding: .utf8)
+    }
+
     /// 去掉 `<system-reminder>…</system-reminder>` 这类注入块。
     /// 开标签没有对应的闭标签时删到末尾——注入块总是贴在正文后面。
     static func stripInjectedBlocks(_ text: String) -> String {
@@ -154,5 +181,46 @@ public struct ClaudeMessageReader: MessageReader {
             }
         }
         return result
+    }
+}
+
+/// 只够读 thinking 签名的 protobuf：按字段号取长度前缀的字节（同号多次出现取最后一次，与 protobuf 语义一致）。
+/// 必须整段都能解开，否则 nil——解到一半的结构不可信。
+private enum ProtobufFields {
+    static func bytes(field number: UInt64, in buffer: [UInt8]) -> [UInt8]? {
+        var index = 0
+        var found: [UInt8]?
+        while index < buffer.count {
+            guard let key = varint(buffer, &index) else { return nil }
+            switch key & 7 {
+            case 0:
+                guard varint(buffer, &index) != nil else { return nil }
+            case 1:
+                index += 8
+            case 5:
+                index += 4
+            case 2:
+                guard let length = varint(buffer, &index), length <= UInt64(buffer.count - index) else { return nil }
+                let end = index + Int(length)
+                if key >> 3 == number { found = Array(buffer[index..<end]) }
+                index = end
+            default:
+                return nil
+            }
+        }
+        return index == buffer.count ? found : nil
+    }
+
+    private static func varint(_ buffer: [UInt8], _ index: inout Int) -> UInt64? {
+        var value: UInt64 = 0
+        var shift: UInt64 = 0
+        while index < buffer.count, shift < 64 {
+            let byte = buffer[index]
+            index += 1
+            value |= UInt64(byte & 0x7F) << shift
+            if byte & 0x80 == 0 { return value }
+            shift += 7
+        }
+        return nil
     }
 }

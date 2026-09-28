@@ -546,6 +546,13 @@ public actor CodexConnector: TaskConnector {
 
         switch notification {
         case .turnStarted(_, let turnId):
+            if sharedDesktop, threads[threadId]?.origin == .desktop,
+               let response = try? await server.request("thread/read", params: [
+                   "threadId": .string(threadId), "includeTurns": .bool(false),
+               ]) {
+                // 桌面端可以在同一线程的两轮之间换模型；实时所有权期间观察者不能覆盖任务。
+                applyModel(from: response, to: threadId)
+            }
             mutate(threadId) {
                 $0.currentTurnId = turnId.isEmpty ? nil : turnId
                 $0.hasFinalAnswer = false
@@ -911,13 +918,17 @@ public actor CodexConnector: TaskConnector {
         if let resumeResponse { applyModel(from: resumeResponse, to: threadId) }
     }
 
-    /// `thread/start` / `thread/resume` 的应答里带着线程眼下的 `model` 与 `reasoningEffort`（null = 按模型默认）。
+    /// `thread/start` / `thread/resume` 的应答在顶层带 `model` / `reasoningEffort`；
+    /// `thread/read` 和 `thread/started` 则放在 `thread` 里。共享桌面接入时两种形状都要读。
     private func applyModel(from response: JSONValue, to threadId: String) {
-        let model = response["model"]?.stringValue.flatMap { ModelOption.isValidId($0) ? $0 : nil }
-        let effort = response["reasoningEffort"]?.stringValue.flatMap { ModelOption.isValidEffort($0) ? $0 : nil }
+        let model = (response["model"] ?? response.path("thread", "model"))?.stringValue
+            .flatMap { ModelOption.isValidId($0) ? $0 : nil }
+        let rawEffort = response["reasoningEffort"] ?? response.path("thread", "reasoningEffort")
+        let effort = rawEffort?.stringValue
+            .flatMap { ModelOption.isValidEffort($0) ? $0 : nil }
         mutate(threadId) {
             if let model { $0.model = model }
-            $0.effort = effort
+            if rawEffort != nil { $0.effort = effort }
         }
     }
 

@@ -223,7 +223,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 | status | `ok` \| `degraded` \| `error` | |
 | taskCount | integer | ≥ 0 |
 | lastError | string? | 截断 200 字 |
-| models | [ModelOption]? | 3.2 起。手机续聊时能换的模型，电脑排好序（默认的在前），1–24 个、按 `id` 不重复；省略 = 不能从手机换模型，手机不画入口。Codex 取 app-server 的 `model/list`（去掉 hidden，每代子进程握手完问一次），Claude Code 报 `--model` 认的别名 `fable` / `opus` / `sonnet` / `haiku`（Haiku 不报强度）；其余 agent 省略 |
+| models | [ModelOption]? | 3.2 起。手机续聊时能换的模型，电脑排好序（默认的在前），1–24 个、按 `id` 不重复；省略 = 不能从手机换模型，手机不画入口。Codex 取 app-server 的 `model/list`（去掉 hidden，每代子进程握手完问一次），Claude Code 报 `--model` 认的别名 `fable` / `opus` / `sonnet` / `haiku`，强度从本机 `claude --help` 读取（Haiku 不报强度；CLI 不可用或未列出强度时省略 models），`displayName` 带别名当前指向的版本（「Opus 5.5」：取 transcript 里见过的完整模型名，只往高处抬；没见过的只显示系列名）；其余 agent 省略 |
 | canStartTask | boolean? | 2.13 起。**只写 `false`**：这个 agent 不能从手机新建任务（ACP agent 没有启动命令、反向连接也没声明 `newSession`；3.1 起一档的 `dsh` 在电脑上找不到可执行文件、只看得见会话时也写）；能新建时整个键省略（不写 `true`）。手机的新建任务选择器不列 `false` 的 agent |
 
 ModelOption（3.2）：`id` string（原样回到 `followUp.model`，会成为 agent 命令行的参数值，所以限定 1–64 个 `[A-Za-z0-9._:/-]` 且不以 `-` 开头），`displayName` string（截断 40 字），`efforts` [string]?（能选的强度，从低到高，1–8 个不重复；每个 1–16 个 `[a-z0-9-]`、不以 `-` 开头；省略 = 这个模型不能调强度），`defaultEffort` string?（不指定时 agent 用哪一档，必须是 `efforts` 里的一个）。强度是 agent 自己的词，协议不定闭集：目前见到的是 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`，客户端认得的翻成本地文案，不认得的原样显示。
@@ -308,7 +308,7 @@ PendingQuestion（2.14）：`id` string（同一请求内唯一，作 `approve.a
 而一份记录动辄几十 KB——常驻其中等于给手表的每一次长轮询都加上这份体积。
 
 Message：`id` string（同一条消息重复拉取时必须稳定，客户端据此去重）；`role` `user` \| `agent` \| `tool`
-（`tool` 是工具调用的一行摘要：执行了什么命令、改了哪个文件）；`text` string（截断 1000，`maxMessageLength` 只管这个字段）；`createdAt` string；
+（`tool` 是工具调用的一行摘要：执行了什么命令、改了哪个文件）；`text` string（user/agent 全文不截断，tool 截到 200 字）；`createdAt` string；
 `attachments` [MessageAttachment]?（2.9 起，消息里的图：用户发的图，或 Agent 生成的图（如 Codex `imageGeneration`），最多 4 张，`maxAttachmentsPerMessage`）；
 `files` [MessageFileRef]?（2.9 起，Agent 回复里提到的本机文件，最多 4 个，只出现在 `role = agent`）。
 2.9 起只要有 `attachments` 或 `files`，`text` 可以是空串——只发图不带文字的用户消息就是这样。例外：图还在 Mac 上排队上传时，Mac 先发一份空 `text`、不带 `attachments` 的同 id 消息，传完补发一份带图的；客户端对这种消息画「图片」占位，不画空气泡。图永远拿不到（文件已删、解不出）的空消息 Mac 不发。
@@ -323,7 +323,7 @@ MessageFileRef（协议 2.9）：`path` string（Mac 上的绝对路径，`fetch
 
 TaskMessages：`taskId` string；`agentId` string（由 Relay 按发来这一帧的连接盖章，负载里冒充别人不生效）；
 `messages` [Message]（**按时间升序**）：最近至多 40 条**对话**（`role` 为 `user` / `agent`，`maxMessages`），外加夹在它们之间、以及最旧那条对话之前紧挨着的工具行（`role = tool`）——工具行不占对话名额，另有 160 行的上限（`maxToolMessages`，超了丢最旧的），所以数组总长不超过 200（`maxEntries`）；`hasMore` boolean（更早的对话被截掉了）；`fetchedAt` string。
-Mac 把工具行的 `text` 截到 200 字（它只是一行摘要）；协议层面仍只校验 `maxMessageLength`。
+Mac 把工具行的 `text` 截到 200 字（它只是一行摘要）；user/agent 消息的 `text` 保留全文，不设上限。
 总长上限从 40 放宽到 200 时没有抬协议版本，但旧 Relay 的 schema 会拒收超过 40 条的整份结果，所以先部署 Relay 再发 Mac。
 客户端把连续两条以上的工具行折成一组（`ToolCallGroup`），默认收起、点开逐条展开。
 
@@ -332,7 +332,8 @@ Relay 只保留**最近一份**，且只留 5 分钟；过期后在读路径上�
 
 数据来源（2.5 新增的三个来源：Hermes 读 `~/.hermes/state.db` 的 `messages`、Pi 读会话 JSONL 的当前分支、OpenClaw 经本机 Gateway 的 `chat.history`；3.1 的 DeepSeek Harness 依次取 BotBus 自己的 ACP 进程、`dsh web` 的 follow 快照、`~/.dsh/sessions` 里的 zstd JSONL，`reasoning` 不显示；同样排除思考过程）：Codex 读 `~/.codex/thread_history_*.sqlite` 的 `thread_items`（`reasoning` **不算**对话，
 它在真实库里是最多的一类，混进来会把一问一答淹掉）；Claude 读 `~/.claude/projects/<目录>/<sessionId>.jsonl`
-——transcript 的文件名就是 session id，所以不依赖 hook 负载里的 `transcript_path`。
+——transcript 的文件名就是 session id，所以不依赖 hook 负载里的 `transcript_path`。思考块同样不算，唯一例外是签名里标着 `narration` 的
+（桌面 app 在工具调用之间给用户看的过程说明，桌面上当正文显示），按 agent 正文算。
 两者都不经过连接器：看记录在连接器没跑的时候也必须能用。
 
 ### 命令：fetchMessages、fetchFile

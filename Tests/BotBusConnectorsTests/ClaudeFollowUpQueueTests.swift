@@ -21,6 +21,10 @@ final class ClaudeFollowUpQueueTests: XCTestCase {
         let url = directory.appendingPathComponent("claude")
         let script = """
         #!/bin/sh
+        if [ "$1" = "--help" ]; then
+          echo '  --effort <level>  Effort level (low, medium, high, max)'
+          exit 0
+        fi
         prompt=""
         prev=""
         for a in "$@"; do [ "$prev" = "sess-q" ] && prompt="$a"; prev="$a"; done

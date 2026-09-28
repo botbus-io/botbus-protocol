@@ -55,13 +55,53 @@ final class ClaudeModelsTests: XCTestCase {
             #"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#,
         ]
         try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
-        XCTAssertEqual(ClaudeModels.lastModel(inTranscriptAt: url.path), "sonnet", "跳过 <synthetic>，取最后一条真的")
+        XCTAssertEqual(ClaudeModels.lastModel(inTranscriptAt: url.path), "claude-sonnet-5", "跳过 <synthetic>，取最后一条真的")
     }
 
-    func testClaudeReportsItsAliasesOnConnectorInfo() {
+    func testTranscriptModelNamesCarryVersions() {
+        XCTAssertEqual(ClaudeModels.version(forTranscriptModel: "claude-opus-5-5"), [5, 5])
+        XCTAssertEqual(ClaudeModels.version(forTranscriptModel: "claude-sonnet-5[1m]"), [5])
+        XCTAssertEqual(ClaudeModels.version(forTranscriptModel: "claude-haiku-4-5-20251001"), [4, 5], "日期不算版本")
+        XCTAssertEqual(ClaudeModels.version(forTranscriptModel: "claude-3-5-sonnet-20241022"), [3, 5])
+        XCTAssertEqual(ClaudeModels.version(forTranscriptModel: "claude-opus-4-1@20250805"), [4, 1])
+        XCTAssertEqual(ClaudeModels.optionId(forTranscriptModel: "claude-3-5-sonnet-20241022"), "sonnet")
+        XCTAssertNil(ClaudeModels.version(forTranscriptModel: "claude-opus"))
+    }
+
+    func testDisplayNamesShowTheNewestVersionSeen() {
+        // 初始列表没有版本号。
+        XCTAssertEqual(ClaudeModels.options.map(\.displayName), ["Fable", "Opus", "Sonnet", "Haiku"])
+
+        var versions: [String: [Int]] = [:]
+        XCTAssertTrue(ClaudeModels.note(transcriptModel: "claude-opus-5-5", in: &versions))
+        XCTAssertTrue(ClaudeModels.note(transcriptModel: "claude-sonnet-5", in: &versions))
+        XCTAssertFalse(ClaudeModels.note(transcriptModel: "claude-opus-4-6", in: &versions), "老会话不把版本拉低")
+        XCTAssertFalse(ClaudeModels.note(transcriptModel: "claude-opus-5-5", in: &versions), "同版本不重复触发")
+        XCTAssertTrue(ClaudeModels.note(transcriptModel: "claude-opus-6", in: &versions))
+        XCTAssertTrue(ClaudeModels.note(transcriptModel: "claude-sonnet-5-1[1m]", in: &versions))
+        XCTAssertFalse(ClaudeModels.note(transcriptModel: "<synthetic>", in: &versions))
+        XCTAssertEqual(ClaudeModels.options(versions: versions).map(\.displayName),
+                       ["Fable", "Opus 6", "Sonnet 5.1", "Haiku"])
+    }
+
+    func testClaudeReportsOnlyEffortsSupportedByInstalledCLI() throws {
+        let binary = FileManager.default.temporaryDirectory.appendingPathComponent("claude-help-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: binary) }
+        try "#!/bin/sh\nprintf '%s\\n' '  --effort <level>  Effort level (low, medium, high, max)'\n"
+            .write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: binary.path)
+        let store = TaskStore(identity: AgentIdentity(agentId: "agent-1", name: "本机", appVersion: "1.0"))
+        _ = ClaudeConnector(store: store, binary: { binary.path })
+        XCTAssertEqual(store.connectors.models(for: .claude)?.map(\.id), ["fable", "opus", "sonnet", "haiku"])
+        XCTAssertEqual(store.connectors.models(for: .claude)?.first?.efforts, ["low", "medium", "high", "max"])
+        XCTAssertNil(store.connectors.models(for: .claude)?.last?.efforts)
+        XCTAssertThrowsError(try ClaudeConnector.resolve(ModelSelection(effort: "xhigh"), current: nil,
+                                                       options: try XCTUnwrap(store.connectors.models(for: .claude))))
+    }
+
+    func testClaudeWithoutCLIHasNoModelPicker() {
         let store = TaskStore(identity: AgentIdentity(agentId: "agent-1", name: "本机", appVersion: "1.0"))
         _ = ClaudeConnector(store: store, binary: { nil })
-        XCTAssertEqual(store.connectors.models(for: .claude)?.map(\.id), ["fable", "opus", "sonnet", "haiku"])
-        XCTAssertNil(store.connectors.models(for: .claude)?.last?.efforts)
+        XCTAssertNil(store.connectors.models(for: .claude))
     }
 }

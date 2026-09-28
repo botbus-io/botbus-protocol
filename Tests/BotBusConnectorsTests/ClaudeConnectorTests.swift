@@ -15,10 +15,20 @@ final class ClaudeConnectorTests: XCTestCase {
                   ]))
     }
 
-    private func makeConnector(store: TaskStore, titleRetryDelays: [TimeInterval] = [0],
+    private func makeConnector(store: TaskStore, binary: String? = nil, titleRetryDelays: [TimeInterval] = [0],
                                turnEndCheckInterval: TimeInterval = 3600) -> ClaudeConnector {
         ClaudeConnector(store: store, paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
-                        binary: { nil }, titleRetryDelays: titleRetryDelays, turnEndCheckInterval: turnEndCheckInterval)
+                        binary: { binary }, titleRetryDelays: titleRetryDelays, turnEndCheckInterval: turnEndCheckInterval)
+    }
+
+    /// 只会回答 `--help` 的假 `claude`：连接器从这里读强度，读到了才报模型列表。
+    private func fakeClaudeWithHelp() throws -> String {
+        let binary = FileManager.default.temporaryDirectory.appendingPathComponent("claude-help-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: binary) }
+        try "#!/bin/sh\nprintf '%s\\n' '  --effort <level>  Effort level (low, medium, high, xhigh, max)'\n"
+            .write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: binary.path)
+        return binary.path
     }
 
     private static let timestampFormatter: ISO8601DateFormatter = {
@@ -373,6 +383,23 @@ final class ClaudeConnectorTests: XCTestCase {
         await connector.waitForTitleRefreshes()
         record = try await requireTask(store, "s1")
         XCTAssertEqual(record.title, "新名字")
+    }
+
+    /// 别名升级到新模型后，Stop 时从 transcript 认出版本，手机上的模型列表跟着换显示名。
+    func testStopPicksUpANewerModelVersionForTheModelList() async throws {
+        let store = makeStore()
+        let connector = makeConnector(store: store, binary: try fakeClaudeWithHelp())
+        XCTAssertEqual(store.connectors.models(for: .claude)?.first { $0.id == "opus" }?.displayName, "Opus")
+        let url = try transcript([["type": "assistant",
+                                   "message": ["model": "claude-opus-6", "content": [["type": "text", "text": "好了"]]]]])
+        await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/tmp/proj",
+                               "transcript_path": url.path, "prompt": "看看"])
+        await send(connector, ["hook_event_name": "Stop", "session_id": "s1", "cwd": "/tmp/proj",
+                               "transcript_path": url.path, "last_assistant_message": "好了"])
+        await connector.waitForTitleRefreshes()
+        XCTAssertEqual(store.connectors.models(for: .claude)?.first { $0.id == "opus" }?.displayName, "Opus 6")
+        let record = try await requireTask(store, "s1")
+        XCTAssertEqual(record.model, "opus", "任务上记的仍是别名")
     }
 
     /// 命令行与 `claude -p` 会话没有 custom-title，只有 Claude Code 生成的 ai-title；两者都在时桌面标题优先。

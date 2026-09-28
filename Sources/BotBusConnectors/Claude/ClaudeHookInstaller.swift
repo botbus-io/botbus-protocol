@@ -20,9 +20,9 @@ public enum ClaudeHookInstaller {
         .sessionStart, .userPromptSubmit, .permissionRequest, .notification, .stop, .stopFailure, .sessionEnd,
     ]
 
-    /// `PermissionRequest` 这条要等手机上点头，给 Claude Code 的超时必须比脚本的 `--max-time 120` 宽一点，
-    /// 否则 Claude Code 先放弃、脚本的回答就没人收了。
-    public static let permissionTimeoutSeconds = 130
+    /// `PermissionRequest` 这条要等手机上点头，给 Claude Code 的超时必须比脚本的 `--max-time` 宽一点，
+    /// 否则 Claude Code 先放弃、脚本的回答就没人收了。30 分钟 + 10 秒余量。
+    public static let permissionTimeoutSeconds = 1810
 
     // MARK: - 纯函数：合并与撤回
 
@@ -205,9 +205,9 @@ public enum ClaudeHookInstaller {
     [ -n "$PORT" ] || exit 0
 
     PAYLOAD=$(cat)
-    # 只有"等人点头"那条值得久等；其余 3 秒足够，超了就当 Agent 不在。
+    # 只有"等人点头"那条值得久等（30 分钟）；其余 3 秒足够，超了就当 Agent 不在。
     case "$PAYLOAD" in
-      *'"\(ClaudeHookEvent.Kind.permissionRequest.rawValue)"'*) TIMEOUT=120 ;;
+      *'"\(ClaudeHookEvent.Kind.permissionRequest.rawValue)"'*) TIMEOUT=1800 ;;
       *) TIMEOUT=3 ;;
     esac
 

@@ -17,9 +17,10 @@ import os
 /// 所以出口一律走 `OneShotContinuation`；超时也不用 TaskGroup 的"先到者胜"——那种写法输的那条分支
 /// 会一直挂着，而这里超时必须是真的硬上限，由同一个盒子兜住。
 public actor LocalHookServer {
-    /// 挂起响应的默认硬上限。对齐 spec 6.3：hook 脚本那边 `curl --max-time 120`，
+    /// 挂起响应的默认硬上限。对齐 hook 脚本那边的 `curl --max-time`，
     /// Agent 不能比它晚放手，否则脚本先超时、我们的响应就没人收了。
-    public static let defaultHoldTimeout: TimeInterval = 120
+    /// 30 分钟：手机用户不一定立刻能回应，给够时间。
+    public static let defaultHoldTimeout: TimeInterval = 1800
     /// hooks 实例的端口文件名（hook 脚本写死了读它）。
     public static let portFileName = "agent.json"
     public static let defaultMaxBodyBytes = 1 << 20

@@ -98,6 +98,8 @@ public actor ClaudeConnector: TaskConnector {
     private let store: TaskStore
     private let paths: ClaudePaths
     private let binary: @Sendable () -> String?
+    /// 本机 `claude --help` 认的强度；nil = CLI 不可用，不报 models。
+    private let supportedEfforts: [String]?
     private let now: @Sendable () -> Date
     private let tools: @Sendable () -> AgentToolsConfiguration?
     private let registry: TaskContextRegistry
@@ -142,6 +144,11 @@ public actor ClaudeConnector: TaskConnector {
     /// 盯收尾标记的循环；没有要盯的会话时自己退出。
     private var turnEndCheck: Task<Void, Never>?
     private let turnEndCheckInterval: TimeInterval
+    /// 各别名见过的最新版本，撑起手机上「Opus 5.5」里的版本号（见 `ClaudeModels`）。
+    /// 初始为空——启动时补历史会话就会从 transcript 里填上常用模型的版本。
+    private var modelVersions: [String: [Int]] = [:]
+    /// 模型列表改过、还没随快照发出去（任务事件不带连接器信息）。
+    private var modelsChanged = false
 
     /// - Parameters:
     ///   - tools: 每次起子进程时现取；nil 或不可用 = 不注入 agent 工具。
@@ -159,12 +166,19 @@ public actor ClaudeConnector: TaskConnector {
         self.store = store
         self.paths = paths
         self.binary = binary
+        self.supportedEfforts = ClaudeModels.efforts(forBinary: binary())
         self.now = now
         self.tools = tools
         self.registry = registry
         self.titleRetryDelays = titleRetryDelays ?? Self.titleRetryDelays
         self.turnEndCheckInterval = turnEndCheckInterval ?? Self.turnEndCheckInterval
-        store.connectors.setModels(ClaudeModels.options, for: .claude)
+        store.connectors.setModels(supportedEfforts.map { ClaudeModels.options(versions: [:], efforts: $0) },
+                                   for: .claude)
+    }
+
+    /// 报给手机的模型列表：版本号来自见过的 transcript，强度来自本机 CLI。
+    private var modelOptions: [ModelOption]? {
+        supportedEfforts.map { ClaudeModels.options(versions: modelVersions, efforts: $0) }
     }
 
     /// 停连接器：放掉所有挂起的审批（让 Claude Code 回落到自己的弹窗，而不是干等 120 秒），
@@ -181,6 +195,13 @@ public actor ClaudeConnector: TaskConnector {
         titleRefreshes.removeAll()
         turnEndCheck?.cancel()
         turnEndCheck = nil
+    }
+
+    /// 见到一个完整模型名：版本比记着的新就更新手机上的模型列表，下一次 `publish` 补发快照。
+    private func noteModel(_ name: String) {
+        guard ClaudeModels.note(transcriptModel: name, in: &modelVersions), let modelOptions,
+              store.connectors.setModels(modelOptions, for: .claude) else { return }
+        modelsChanged = true
     }
 
     // MARK: - Hook 入口
@@ -229,7 +250,9 @@ public actor ClaudeConnector: TaskConnector {
                 return .now(.noContent)
             }
         case .stop:
-            let model = event.transcriptPath.flatMap { ClaudeModels.lastModel(inTranscriptAt: $0) }
+            let name = event.transcriptPath.flatMap { ClaudeModels.lastModel(inTranscriptAt: $0) }
+            if let name { noteModel(name) }
+            let model = name.flatMap { ClaudeModels.optionId(forTranscriptModel: $0) }
             apply(event) { session, event in
                 session.status = .completed
                 session.pendingRequest = nil
@@ -314,6 +337,15 @@ public actor ClaudeConnector: TaskConnector {
         if let asked = event.askedQuestions {
             questionHolds[requestID] = QuestionHold(sessionID: event.sessionID, asked: asked)
         }
+
+        // hold 超时后只收掉 holds 里的条目（让 PermissionRequest 路径直接报错），
+        // 但保留 questionHolds 和 pendingRequest：卡片不消失，
+        // 用户迟到的回答能走 followUp 送进去。
+        Task {
+            try? await Task.sleep(for: .seconds(LocalHookServer.defaultHoldTimeout + 1))
+            self.holds.removeValue(forKey: requestID)
+        }
+
         return .hold(hold)
     }
 
@@ -372,7 +404,7 @@ public actor ClaudeConnector: TaskConnector {
         return blocks.compactMap { $0["text"] as? String }.joined(separator: "\n")
     }
 
-    /// transcript 一行里的 assistant 文本；不是 assistant 或没有文字就是 nil。
+    /// transcript 一行里的 assistant 文本（含过程说明）；不是 assistant 或没有文字就是 nil。
     /// 两种常见形状：{type:"assistant", message:{content:[{type:"text",text:…}]}} 与扁平的 {role:…,content:…}
     static func assistantText(_ object: [String: Any]) -> String? {
         let role = (object["type"] as? String) ?? (object["role"] as? String)
@@ -380,7 +412,9 @@ public actor ClaudeConnector: TaskConnector {
         let content = (object["message"] as? [String: Any])?["content"] ?? object["content"]
         if let text = content as? String, !text.trimmed.isEmpty { return text.trimmed }
         guard let blocks = content as? [[String: Any]] else { return nil }
-        let text = blocks.compactMap { $0["text"] as? String }.joined(separator: "\n").trimmed
+        // 过程说明（narration 思考块）桌面上当正文显示，与对话记录一致也算。
+        let text = blocks.compactMap { $0["text"] as? String ?? ClaudeMessageReader.narrationText($0) }
+            .joined(separator: "\n").trimmed
         return text.isEmpty ? nil : text
     }
 
@@ -405,13 +439,15 @@ public actor ClaudeConnector: TaskConnector {
 
     private func adopt(_ entry: ClaudeSessionHistory.Entry, now current: Date) {
         let startedAt = ProtocolJSON.timestamp(entry.startedAt)
+        if let name = entry.model { noteModel(name) }
+        let model = entry.model.flatMap { ClaudeModels.optionId(forTranscriptModel: $0) }
         if var session = sessions[entry.sessionID] {
             if let title = entry.title, entry.titleSource.replaces(session.titleSource) {
                 session.title = title
                 session.titleSource = entry.titleSource
             }
             if session.lastMessage == nil { session.lastMessage = entry.lastMessage }
-            if session.model == nil { session.model = entry.model }
+            if session.model == nil { session.model = model }
             if startedAt < session.startedAt { session.startedAt = startedAt }
             sessions[entry.sessionID] = session
             return
@@ -424,7 +460,7 @@ public actor ClaudeConnector: TaskConnector {
         // transcript 里看不出最后一轮是否正常结束；按 Stop 的映射记成已完成，超过 24 小时没动静按协议记 idle。
         session.status = current.timeIntervalSince(entry.updatedAt) > SessionFormatting.idleAfter ? .idle : .completed
         session.lastMessage = entry.lastMessage
-        session.model = entry.model
+        session.model = model
         session.startedAt = startedAt
         session.updatedAt = ProtocolJSON.timestamp(entry.updatedAt)
         sessions[entry.sessionID] = session
@@ -624,6 +660,10 @@ public actor ClaudeConnector: TaskConnector {
             await store.upsert(record(session), notify: notify)
         }
         await store.reconcile(source: .claude, tasks: [], projects: projects())
+        if modelsChanged {
+            modelsChanged = false
+            _ = await store.broadcastSnapshot()
+        }
     }
 
     private func record(_ session: Session) -> TaskRecord {
@@ -674,7 +714,7 @@ public actor ClaudeConnector: TaskConnector {
     public func start(projectPath: String, prompt: String, images: [URL],
                       selection: ModelSelection) async throws -> ConnectorOutcome {
         // 先查模型、再读图：不对就别起进程，也别签 token。
-        let chosen = try Self.resolve(selection, current: nil)
+        let chosen = try Self.resolve(selection, current: nil, options: modelOptions ?? [])
         let input = try Self.streamingInput(prompt: prompt, images: images)
         let injection = await AgentToolsInjection.make(tools(), registry: registry)
         let executable = binary().map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
@@ -717,7 +757,7 @@ public actor ClaudeConnector: TaskConnector {
         let sessionID = try nativeID(taskId)
         var chosen = (model: sessions[sessionID]?.chosenModel, effort: sessions[sessionID]?.chosenEffort)
         if !selection.isEmpty {
-            chosen = try Self.resolve(selection, current: sessions[sessionID])
+            chosen = try Self.resolve(selection, current: sessions[sessionID], options: modelOptions ?? [])
             sessions[sessionID]?.chosenModel = chosen.model
             sessions[sessionID]?.chosenEffort = chosen.effort
         }
@@ -801,7 +841,21 @@ public actor ClaudeConnector: TaskConnector {
                 reply = ClaudeHookOutput.answer(asked, answers: mapped)
             }
             guard await answerQuestion(requestId, sessionID: sessionID, with: reply) else {
-                throw ConnectorError("这个问题已经过期，请在电脑上回答")
+                // hook 已超时，Claude Code 回落到了电脑上的提问框。
+                // 把选好的答案当续聊消息发过去：Claude 从历史里能看到问了什么。
+                if decision != .deny {
+                    let text = asked.claudeAnswers(answers ?? [:]).values.joined(separator: "\n")
+                    if !text.isEmpty {
+                        return try await followUp(taskId: taskId, prompt: text, images: [])
+                    }
+                }
+                // 跳过的话没什么好发，把卡片收掉就行。
+                if var session = sessions[sessionID], session.pendingRequest?.id == requestId {
+                    session.pendingRequest = nil
+                    sessions[sessionID] = session
+                    await publish()
+                }
+                return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
             }
             return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
         }
@@ -810,7 +864,10 @@ public actor ClaudeConnector: TaskConnector {
             throw ConnectorError("这条审批已经过期，请在电脑上处理")
         }
         let allow = decision == .allow
-        hold.answer(.json(ClaudeHookOutput.permission(allow: allow, reason: allow ? "已在手机上允许" : "已在手机上拒绝")))
+        guard hold.answer(.json(ClaudeHookOutput.permission(allow: allow, reason: allow ? "已在手机上允许" : "已在手机上拒绝"))) else {
+            // hold 对象还在字典里但已超时（清理任务还差零点几秒）：回答送不出去了。
+            throw ConnectorError("这条审批已经过期，请在电脑上处理")
+        }
         apply(ClaudeHookEvent.synthetic(kind: .userPromptSubmit, sessionID: sessionID,
                                         cwd: sessions[sessionID]?.projectPath ?? "")) { session, _ in
             session.pendingRequest = nil
@@ -860,13 +917,14 @@ public actor ClaudeConnector: TaskConnector {
 
     /// 手机这次选的与会话上已经记着的合起来，得出之后每轮的 `--model` / `--effort`。
     /// 模型不认识、强度不在该模型的档位里都直接报错；换到不能调强度的模型（Haiku）时强度清掉。
-    static func resolve(_ selection: ModelSelection, current session: Session?) throws -> (model: String?, effort: String?) {
-        if let model = selection.model, ClaudeModels.option(model) == nil {
+    static func resolve(_ selection: ModelSelection, current session: Session?,
+                        options: [ModelOption] = ClaudeModels.options) throws -> (model: String?, effort: String?) {
+        if let model = selection.model, ClaudeModels.option(model, in: options) == nil {
             throw ConnectorError("Claude Code 没有「\(model)」这个模型")
         }
         let model = selection.model ?? session?.chosenModel
-        let effective = ClaudeModels.option(model ?? session?.model)
-        let allowed = effective.map { $0.efforts ?? [] } ?? ClaudeModels.efforts
+        let effective = ClaudeModels.option(model ?? session?.model, in: options)
+        let allowed = effective.map { $0.efforts ?? [] } ?? (options.first?.efforts ?? [])
         if let effort = selection.effort, !allowed.contains(effort) {
             throw ConnectorError(allowed.isEmpty ? "这个模型不能调思考强度" : "Claude Code 没有「\(effort)」这档思考强度")
         }
@@ -1068,4 +1126,3 @@ private extension ClaudeHookEvent {
         return ClaudeHookEvent(object: object)!
     }
 }
-
