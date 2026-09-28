@@ -60,8 +60,11 @@ final class WorktreeTests: XCTestCase {
         // 目录根本不存在也认得出来：Claude app 的 worktree 常被删掉，而且这条路不读盘。
         XCTAssertEqual(resolver.projectRoot(for: "/Users/me/Projects/app/.claude/worktrees/dark-mode-4f2a9c"),
                        "/Users/me/Projects/app")
+        // worktree 里的子目录归到主仓库里的同一个子目录，和手机选的子目录项目对得上。
         XCTAssertEqual(resolver.projectRoot(for: "/Users/me/Projects/app/.claude/worktrees/dark-mode-4f2a9c/web/"),
-                       "/Users/me/Projects/app")
+                       "/Users/me/Projects/app/web")
+        XCTAssertEqual(resolver.projectRoot(for: "/Users/me/Projects/app/.claude/worktrees/dark-mode-4f2a9c/web/api"),
+                       "/Users/me/Projects/app/web/api")
         // `.claude/worktrees` 本身不是 worktree；普通目录原样。
         XCTAssertNil(resolver.projectRoot(for: "/Users/me/Projects/app/.claude/worktrees"))
         XCTAssertNil(resolver.projectRoot(for: "/Users/me/Projects/app"))
@@ -73,10 +76,10 @@ final class WorktreeTests: XCTestCase {
         let resolver = WorktreeResolver()
         XCTAssertEqual(resolver.projectRoot(for: path), "/Users/me/Projects/app")
 
-        // worktree 里的子目录往上找到同一个 `.git`。
-        let sub = sandbox.appendingPathComponent("codex/worktrees/a1b2/app/relay", isDirectory: true)
+        // worktree 里的子目录往上找到同一个 `.git`，归到主仓库里的同一个子目录。
+        let sub = sandbox.appendingPathComponent("codex/worktrees/a1b2/app/relay/src", isDirectory: true)
         try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
-        XCTAssertEqual(resolver.projectRoot(for: sub.path), "/Users/me/Projects/app")
+        XCTAssertEqual(resolver.projectRoot(for: sub.path), "/Users/me/Projects/app/relay/src")
     }
 
     func testRelativeGitdirIsResolvedAgainstTheWorktree() throws {

@@ -1,6 +1,6 @@
 # BotBus 协议
 
-版本 **3.2**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
+版本 **3.4**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
 
 Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，Kotlin 实现（Android）是 `Protocol.kt`，密封层在同目录的 `Sealing.kt` / `SealedTypes.kt`。在 app 仓库里它们分别位于 `Packages/BotBusProtocol`、`relay/src/protocol.ts` 与 `android/core/src/main/kotlin/io/botbus/core/`；公开仓库 `botbus-io/botbus-protocol` 由 app 仓库自动同步，前两者在那里是 `Sources/BotBusProtocol` 与 `src/protocol.ts`。三端都必须通过 `protocol-fixtures/` 下全部样本的往返测试，且拒绝 `invalid/` 下的样本：顶层是线上的密封形状，`plain/` 是密文里的明文结构（见文末「Fixture 与类型对应」）。Swift 中 `Task` 命名为 `TaskRecord`。
 
@@ -38,7 +38,7 @@ Relay 另设防御性上限：合并后 `tasks` 最多保留 400 条（按 updat
 
 ### Command 一览
 
-`id` string（客户端生成 UUID）；`createdAt` string；`agentId` string（必填，指明目标电脑，Relay 据此路由）；`kind` `startTask` \| `followUp` \| `approve` \| `interrupt` \| `setConnectorEnabled` \| `fetchMessages` \| `fetchFile` \| `fetchChanges` \| `remoteControl`；与 kind 同名的 payload 字段必须存在（两端解码时校验）；其余 payload 字段应省略，接收方以 kind 为准并忽略多余载荷。
+`id` string（客户端生成 UUID）；`createdAt` string；`agentId` string（必填，指明目标电脑，Relay 据此路由）；`kind` `startTask` \| `followUp` \| `approve` \| `interrupt` \| `setConnectorEnabled` \| `fetchMessages` \| `fetchFile` \| `fetchChanges` \| `remoteControl` \| `mergeWorktree`；与 kind 同名的 payload 字段必须存在（两端解码时校验）；其余 payload 字段应省略，接收方以 kind 为准并忽略多余载荷。
 
 每种命令的载荷在它所属的章里定义：
 
@@ -48,7 +48,7 @@ Relay 另设防御性上限：合并后 `tasks` 最多保留 400 条（按 updat
 | `approve` | 三、审批与提问 |
 | `setConnectorEnabled` | 一、电脑与连接器 |
 | `fetchMessages`、`fetchFile` | 四、对话与附件 |
-| `fetchChanges` | 五、产物与文件 |
+| `fetchChanges`、`mergeWorktree` | 五、产物与文件 |
 | `remoteControl` | 六、屏幕共享与远程操作 |
 
 ### Event 一览
@@ -146,7 +146,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 - **app 太旧**：Relay 按调用方角色比最低版本——`/agent/*` 与带 `X-Agent-Id` 的请求是电脑（`MIN_AGENT_PROTOCOL`），其余是手机与手表（`MIN_CLIENT_PROTOCOL`，手表沿用手机凭据，同一条线）。低于最低线时在任何鉴权与副作用之前回 **412** `{error:"upgrade required", minProtocol, protocol}`，另带 `X-Min-Protocol-Version: <最低版本>`。客户端**只认 412 这个状态码**，头与响应体只供日志；412 不清凭据，按最长退避继续重试（Relay 回滚或降线后自己恢复），界面提示「请更新 BotBus」。不用 426，是因为它已经表示「缺 `Upgrade: websocket`」，WebSocket 握手失败后的探测请求正好会拿到它。
 - **Relay 太旧**：本端要求 Relay 至少是 `ProtocolVersion.minimumRelay`。只在**成功**响应（2xx、101、304）上判 Relay 的版本头——Cloudflare 边缘或代理自己回的 502 也不带这个头，拿它判会把一次抖动说成要升级。低于最低线时同样不清凭据、按最长退避重试，界面提示「请升级 Relay」。
 
-目前 `MIN_CLIENT_PROTOCOL` 是 **3.1**，`MIN_AGENT_PROTOCOL` 与 `minimumRelay` 是 **3.0**：端到端加密换掉了整个线上形状，2.x 的 app 既发不出 Relay 认得的帧，也解不开 Relay 合并的快照，所以 Relay 3.0 上线即对 2.x 回 412。3.1 的 `dsh` 是旧手机与手表接不住的新枚举（整份快照拒收），所以 `MIN_CLIENT_PROTOCOL` 抬到了 3.1；抬线一部署就生效，所以当时先部署只改了版本号的 Relay，等 3.1 的 iOS 上了 TestFlight 再抬线，**然后**才发 3.1 的 Mac——Mac 一发版，装了 DeepSeek Harness 的电脑就会上报 `dsh`。`MIN_AGENT_PROTOCOL` 与 `minimumRelay` 不动：旧 Mac 不上报 `dsh`，Relay 只见密文。3.2 的模型与思考强度都是旧端能忽略的可选字段（3.1 的手机不认 `models` 就不画入口，旧 Mac 忽略 `followUp.model`），三条线都不动。以下是 2.x 期间的记录：`minimumRelay` 曾是 2.15。2.15 只是电脑一侧的新能力，旧手机与旧 Mac 都不受影响，不抬 app 最低线；但新版 Mac 要解 `/agent/devices` 里的 `clients`、要用电脑凭据移除手机，旧 Relay 两样都不行。2.14 的 `questions` / `answers` 都是旧端能忽略的可选字段（旧手机只看得到 `question` 纯文字，照旧打字回答），不抬 app 最低线；但旧 Relay 会把它们剥掉，新版 app 要求 Relay 2.14。2.13 的 `acp` 是旧端接不住的新枚举值：旧手机与手表见到 `source = acp` 的任务会整条拒收、解不开整份快照，按下面的规则应把 `MIN_CLIENT_PROTOCOL` 抬到 2.13；但抬线一部署就立刻生效，而新版 iOS 还没上 TestFlight，现在抬会把所有现有装机 412 掉，所以和 2.9 一样先保持 2.7——**新版 Mac 发布时必须同时把 `MIN_CLIENT_PROTOCOL` 抬到 2.13**（新版 iOS 先上 TestFlight，再发 Mac 并抬线）：Mac 一发版，装了 ACP agent 的用户就会上报 `acp`。`MIN_AGENT_PROTOCOL` 不用抬——旧 Mac 不上报 ACP agent，手机也就不会给它发带 `connectorId` 的命令。旧 Relay 会拒收 `acp` 来源、剥掉 `connectorId` / `canStartTask`，所以新版 app 要求 Relay 2.13。2.12 的 `remoteControl` 只由新手机发出（旧 Mac 解不开这条命令，手机等不到结果），所以不抬 app 最低线；但旧 Relay 的 kind 枚举会拒收整条命令，新版 app 要求 Relay 2.12。2.11 的 `fetchChanges` 只由新手机发出（旧 Mac 解不开这条命令，手机等不到结果，60 秒后显示「未收到确认」），`CommandResult.artifactId` 旧端忽略即可，所以同样不抬 app 最低线；但旧 Relay 会拒收这条命令、剥掉新字段，新版 app 要求 Relay 2.11。2.10 只新增旧 app 可以忽略的可选字段，不抬高这两条 app 最低线；新版 app 要求 Relay 2.10，以免旧 schema 剥掉系统授权提示。2.9 的 app 依赖 Relay 2.9 的上传端点（`PUT /client/uploads`、`GET /agent/uploads`）与不剥附件字段的 schema，所以 `minimumRelay` 抬到了 2.9（Relay 先部署，不影响现有用户）。2.9 同时新增了旧端接不住的枚举值——`ArtifactKind.video`（旧手机与手表解快照会整条拒收）与命令 `fetchFile`（旧 Mac 解命令会拒收）——按下面的规则应把两条最低线都抬到 2.9；但为了不在新版 Mac / iOS 发布前挡住现有装机，暂时保持 2.7，待新版 Mac 与 iOS 发布后再把 `MIN_AGENT_PROTOCOL`、`MIN_CLIENT_PROTOCOL` 抬到 2.9。在此期间，新 Mac 分享的视频会让旧手机与手表解不开快照（已知风险）；`fetchFile` 只由新手机发出，旧 Mac 解不开这条命令。什么时候抬线：
+目前 `MIN_CLIENT_PROTOCOL` 是 **3.1**，`MIN_AGENT_PROTOCOL` 与 `minimumRelay` 是 **3.0**：端到端加密换掉了整个线上形状，2.x 的 app 既发不出 Relay 认得的帧，也解不开 Relay 合并的快照，所以 Relay 3.0 上线即对 2.x 回 412。3.1 的 `dsh` 是旧手机与手表接不住的新枚举（整份快照拒收），所以 `MIN_CLIENT_PROTOCOL` 抬到了 3.1；抬线一部署就生效，所以当时先部署只改了版本号的 Relay，等 3.1 的 iOS 上了 TestFlight 再抬线，**然后**才发 3.1 的 Mac——Mac 一发版，装了 DeepSeek Harness 的电脑就会上报 `dsh`。`MIN_AGENT_PROTOCOL` 与 `minimumRelay` 不动：旧 Mac 不上报 `dsh`，Relay 只见密文。3.2 的模型与思考强度都是旧端能忽略的可选字段（3.1 的手机不认 `models` 就不画入口，旧 Mac 忽略 `followUp.model`），三条线都不动。3.3 的项目级自动批准也只是旧端能忽略的可选字段（旧 Mac 不报 `canAutoApprove`，手机就不画开关），三条线都不动。3.4 的 worktree 字段与 `mergeWorktree` 同样都在密文里（命令种类也在密文里，Relay 不解析），三条线都不动；旧 Mac 不报 `worktrees` / `mergeTarget`，手机就不给开关与合并按钮。以下是 2.x 期间的记录：`minimumRelay` 曾是 2.15。2.15 只是电脑一侧的新能力，旧手机与旧 Mac 都不受影响，不抬 app 最低线；但新版 Mac 要解 `/agent/devices` 里的 `clients`、要用电脑凭据移除手机，旧 Relay 两样都不行。2.14 的 `questions` / `answers` 都是旧端能忽略的可选字段（旧手机只看得到 `question` 纯文字，照旧打字回答），不抬 app 最低线；但旧 Relay 会把它们剥掉，新版 app 要求 Relay 2.14。2.13 的 `acp` 是旧端接不住的新枚举值：旧手机与手表见到 `source = acp` 的任务会整条拒收、解不开整份快照，按下面的规则应把 `MIN_CLIENT_PROTOCOL` 抬到 2.13；但抬线一部署就立刻生效，而新版 iOS 还没上 TestFlight，现在抬会把所有现有装机 412 掉，所以和 2.9 一样先保持 2.7——**新版 Mac 发布时必须同时把 `MIN_CLIENT_PROTOCOL` 抬到 2.13**（新版 iOS 先上 TestFlight，再发 Mac 并抬线）：Mac 一发版，装了 ACP agent 的用户就会上报 `acp`。`MIN_AGENT_PROTOCOL` 不用抬——旧 Mac 不上报 ACP agent，手机也就不会给它发带 `connectorId` 的命令。旧 Relay 会拒收 `acp` 来源、剥掉 `connectorId` / `canStartTask`，所以新版 app 要求 Relay 2.13。2.12 的 `remoteControl` 只由新手机发出（旧 Mac 解不开这条命令，手机等不到结果），所以不抬 app 最低线；但旧 Relay 的 kind 枚举会拒收整条命令，新版 app 要求 Relay 2.12。2.11 的 `fetchChanges` 只由新手机发出（旧 Mac 解不开这条命令，手机等不到结果，60 秒后显示「未收到确认」），`CommandResult.artifactId` 旧端忽略即可，所以同样不抬 app 最低线；但旧 Relay 会拒收这条命令、剥掉新字段，新版 app 要求 Relay 2.11。2.10 只新增旧 app 可以忽略的可选字段，不抬高这两条 app 最低线；新版 app 要求 Relay 2.10，以免旧 schema 剥掉系统授权提示。2.9 的 app 依赖 Relay 2.9 的上传端点（`PUT /client/uploads`、`GET /agent/uploads`）与不剥附件字段的 schema，所以 `minimumRelay` 抬到了 2.9（Relay 先部署，不影响现有用户）。2.9 同时新增了旧端接不住的枚举值——`ArtifactKind.video`（旧手机与手表解快照会整条拒收）与命令 `fetchFile`（旧 Mac 解命令会拒收）——按下面的规则应把两条最低线都抬到 2.9；但为了不在新版 Mac / iOS 发布前挡住现有装机，暂时保持 2.7，待新版 Mac 与 iOS 发布后再把 `MIN_AGENT_PROTOCOL`、`MIN_CLIENT_PROTOCOL` 抬到 2.9。在此期间，新 Mac 分享的视频会让旧手机与手表解不开快照（已知风险）；`fetchFile` 只由新手机发出，旧 Mac 解不开这条命令。什么时候抬线：
 
 - 做了旧 app 接不住的改动（新增枚举值、改字段语义、删字段）时，部署 Relay 的同时把对应角色的 `MIN_*_PROTOCOL` 抬到新版本；只加可选字段这类旧端能忽略的改动不用抬。
 - app 开始依赖 Relay 的新行为时，把 `ProtocolVersion.minimumRelay` 抬上去再发版（部署顺序仍是先 Relay 后 app，所以正常不会触发，它防的是自建或回滚的 Relay）。
@@ -210,6 +210,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 | appVersion | string | Agent 版本，截断 20 字 |
 | connectors | [ConnectorInfo] | 2.13 起最多 16 个（此前 8 个；3.1 起按一档 6 个 + ACP 最多 10 个算），按 `(kind, connectorId)` 去重：两个 `connectorId` 不同的 ACP agent 不算重复。空数组合法（刚被认领、还没连上过的电脑） |
 | projectsRoot | string? | 2.6 起。手机新建项目时 Agent 在这个目录（绝对路径）下建子文件夹；省略表示这台电脑不接受新建项目，手机不显示「新建项目」。Mac 默认是「文稿」里的 `BotBusProjects`，可在设置里改。这个目录本身算「不在项目中」 |
+| worktrees | true? | 3.4 起。电脑能从手机开 worktree 会话（`startTask.worktree`）、能 `mergeWorktree`；只写 true，不能时省略 |
 
 ### ConnectorInfo
 
@@ -261,7 +262,7 @@ Project：`agentId`、`path`、`name`、`lastUsedAt` string，`pinned` boolean�
 | updatedAt | string | |
 | artifacts | [Artifact]? | 2.3 起。最多 10 个，**新的在前**；没有产物时整个键省略（不写 `[]`）。由 Agent 的 `TaskStore` 附加，连接器与观察者不感知。旧 Relay 的 schema 会剥掉这个键，所以先部署 Relay 再发 Mac |
 | outsideProject | boolean? | 2.6 起。`true` = 这条会话不在任何项目里；在项目里时整个键省略（不写 `false`）。由 Agent 的 `TaskStore` 按本机规则判定：路径为空、`/`、`/tmp`（含 `/private/tmp`）、主目录本身、主目录下的 `Desktop` / `Downloads` / `Documents` 本身（子目录仍算项目），以及 Agent 的默认工作区（目前是 OpenClaw 的 workspace）。这些路径同时不进 `Snapshot.projects`。客户端把这类任务归进「不在项目中」，不要为它们的目录补出项目 |
-| worktreePath | string? | 2.7 起。会话真实的工作目录，只在它是某个仓库的 git worktree 时出现（此时 `projectPath` 是主仓库），否则整个键省略。由 Agent 的 `TaskStore` 解析，连接器与观察者不感知：`<仓库>/.claude/worktrees/<名字>`（Claude app）按路径归到 `<仓库>`；其余路径里有一层 `worktrees` 目录的，读 worktree 自己的 `.git` 文件（`gitdir: <仓库>/.git/worktrees/<名字>`）得出主仓库，认出的对应关系在 Agent 本机持久化；已删掉又没记过的，在见过的主仓库与项目里恰好只有一个同名目录时归过去（Codex 的 worktree 以仓库命名），同名的有多个时不猜；submodule、bare 仓库和不在 `worktrees` 目录下的手动 worktree 原样当项目。`Snapshot.projects` 里同样换成主仓库并去重。续聊仍在这个目录里跑；目录已被删掉时 `followUp` 回 `ok: false`，不退回主仓库 |
+| worktreePath | string? | 2.7 起。会话真实的工作目录，只在它是某个仓库的 git worktree 时出现（此时 `projectPath` 是主仓库），否则整个键省略。由 Agent 的 `TaskStore` 解析，连接器与观察者不感知：`<仓库>/.claude/worktrees/<名字>`（Claude app）按路径归到 `<仓库>`；其余路径里有一层 `worktrees` 目录的，读 worktree 自己的 `.git` 文件（`gitdir: <仓库>/.git/worktrees/<名字>`）得出主仓库，认出的对应关系在 Agent 本机持久化；已删掉又没记过的，在见过的主仓库与项目里恰好只有一个同名目录时归过去（Codex 的 worktree 以仓库命名），同名的有多个时不猜；工作目录是 worktree 里的子目录时，归到主仓库里的同一个子目录（`<worktree>/web` → `<仓库>/web`，3.4 起；之前一律归到 `<仓库>`），和普通会话按工作目录分项目同一口径；submodule、bare 仓库和不在 `worktrees` 目录下的手动 worktree 原样当项目。`Snapshot.projects` 里同样换成主仓库并去重。续聊仍在这个目录里跑；目录已被删掉时 `followUp` 回 `ok: false`，不退回主仓库 |
 | connectorId | string? | 2.13 起。是哪个 ACP agent，值取自清单或注册表里的 id：`[a-z0-9-]`，1–32 字符，不含冒号。只在 `source = acp` 时出现，且必须出现；其余来源带上它即整条拒绝 |
 | model | string? | 3.2 起。这条会话下一轮会用的模型，写法同 `ModelOption.id`；电脑知道时才有。Codex 取线程上记的（`thread/start` / `thread/resume` 的应答，只读观察读 `threads.model`），Claude 取手机选过的，其次 transcript 里最后一条 assistant 消息的模型换成的别名（`claude-opus-5-5` → `opus`），认不出时省略 |
 | autoApprove | boolean? | 3.3 起。**只写 `true`**：这条会话的 `projectPath` 开了自动批准（同 `Project.autoApprove`，任务所在项目不在 `projects` 里时手机也看得到）；没开或 `outsideProject` 时整个键省略。由 Agent 的 `TaskStore` 附加，连接器与观察者不感知 |
@@ -271,7 +272,7 @@ TaskStatus：`running` 有轮次进行中；`waitingApproval` 有 pendingRequest
 
 ### 命令：startTask、followUp、interrupt
 
-- startTask：`source` TaskSource，`projectPath` string，`prompt` string，`newProject` string?，`attachments` [MessageAttachment]?，`connectorId` string?（2.13 起，发给哪个 ACP agent：`source = acp` 时必填，其余来源必须省略，两者不符即整条拒绝），`model` string?，`effort` string?，`autoApprove` boolean?。2.6 起 `projectPath` 可为空串，表示「不在项目中」：Agent 在主目录下运行，OpenClaw 用它的默认工作区。`newProject`（2.6）是新项目的文件夹名：Agent 在自己的 `projectsRoot` 下建这个子文件夹再开始，`projectPath` 忽略（填空串）。名字只能是一层（去掉首尾空白后 1–80 字，不含 `/`、`\`、`:` 与控制字符，不以 `.` 开头）；同名目录已存在、名字不合法或 Agent 没有 `projectsRoot` 时回 `ok: false`，不复用已有目录。`attachments`（2.9 起）是手机发图开新任务，最多 4 张；带附件时 `prompt` 可为空串。`model` / `effort`（3.2 起，写法同 ModelOption）指定这条会话从第一轮起用的模型与思考强度，之后的续聊沿用，省略 = agent 默认；和 followUp 一样只有报了 `ConnectorInfo.models` 的 agent 收，其余带上它们回 `ok: false`（Agent 在建新项目文件夹、下载图之前就拒）。Codex 随第一轮 `turn/start` 发，Claude 在第一次 `claude -p` 就带 `--model` / `--effort` 并记在会话上。`autoApprove`（3.3 起）把这条会话所在项目（`newProject` 时是新建的文件夹）的自动批准设为开（`true`）或关（`false`），从第一轮起生效、之后沿用，省略 = 不动；只有报了 `ConnectorInfo.canAutoApprove` 的 agent 收，其余带上它回 `ok: false`，「不在项目中」（`projectPath` 为空串）带 `true` 也回 `ok: false`，都在建新项目文件夹、下载图之前就拒
+- startTask：`source` TaskSource，`projectPath` string，`prompt` string，`newProject` string?，`attachments` [MessageAttachment]?，`connectorId` string?（2.13 起，发给哪个 ACP agent：`source = acp` 时必填，其余来源必须省略，两者不符即整条拒绝），`model` string?，`effort` string?，`autoApprove` boolean?，`worktree` true?。2.6 起 `projectPath` 可为空串，表示「不在项目中」：Agent 在主目录下运行，OpenClaw 用它的默认工作区。`newProject`（2.6）是新项目的文件夹名：Agent 在自己的 `projectsRoot` 下建这个子文件夹再开始，`projectPath` 忽略（填空串）。名字只能是一层（去掉首尾空白后 1–80 字，不含 `/`、`\`、`:` 与控制字符，不以 `.` 开头）；同名目录已存在、名字不合法或 Agent 没有 `projectsRoot` 时回 `ok: false`，不复用已有目录。`attachments`（2.9 起）是手机发图开新任务，最多 4 张；带附件时 `prompt` 可为空串。`model` / `effort`（3.2 起，写法同 ModelOption）指定这条会话从第一轮起用的模型与思考强度，之后的续聊沿用，省略 = agent 默认；和 followUp 一样只有报了 `ConnectorInfo.models` 的 agent 收，其余带上它们回 `ok: false`（Agent 在建新项目文件夹、下载图之前就拒）。Codex 随第一轮 `turn/start` 发，Claude 在第一次 `claude -p` 就带 `--model` / `--effort` 并记在会话上。`autoApprove`（3.3 起）把这条会话所在项目（`newProject` 时是新建的文件夹）的自动批准设为开（`true`）或关（`false`），从第一轮起生效、之后沿用，省略 = 不动；只有报了 `ConnectorInfo.canAutoApprove` 的 agent 收，其余带上它回 `ok: false`，「不在项目中」（`projectPath` 为空串）带 `true` 也回 `ok: false`，都在建新项目文件夹、下载图之前就拒。`worktree` `true`?（3.4 起）：在项目所在仓库新开一个 git worktree 再开始。Mac 以 `projectPath` 所在检出的仓库为准，在主仓库的 `.claude/worktrees/<6 位十六进制>` 建 worktree、新分支 `botbus/<同名>`，起点是 `projectPath` 所在那份检出当前分支的最新提交（通常是主仓库；`projectPath` 本身在仓库的另一个 worktree 里时是那个 worktree 检出的分支），合并也落回这个分支（`WorkingChanges.mergeTarget`）；`projectPath` 是仓库子目录时 cwd 取 worktree 里的同一子目录；主仓库没忽略 `.claude/worktrees/` 时往 `info/exclude` 追加一行。不是 git 仓库、还没有提交、detached HEAD、`projectPath` 是没被跟踪（或被忽略）的子目录（新 worktree 里没有它）时照旧在 `projectPath` 里跑，不报错。只写 true，只和非空 `projectPath` 一起出现，与 `newProject` 同时出现或 `source = openclaw` 时整条拒绝。连接器启动失败时删掉刚建的 worktree 与分支。同时带 `autoApprove` 时设的是手机选的项目（`projectPath`），不是新建的 worktree
 - followUp：`taskId` string，`prompt` string，`attachments` [MessageAttachment]?，`model` string?，`effort` string?，`autoApprove` boolean?。2.7 起 worktree 里的会话在原 worktree 里续聊；worktree 已被删掉时回 `ok: false`。`attachments`（2.9 起）同上，追问带图。`model` / `effort`（3.2 起，写法同 ModelOption）从这一轮起换模型与思考强度，之后的续聊沿用，省略 = 不换；只有报了 `ConnectorInfo.models` 的 agent 收，其余 agent 带上它们回 `ok: false`。Codex 随 `turn/start` 的 `model` / `effort` 发（app-server 记在线程上）；回答挂着的提问、或共用桌面时插进正在跑的那一轮（`turn/steer` 不收模型）时不换，`Task.model` 照旧，手机的选择跟着快照退回。Claude 只收 `ClaudeModels` 的别名与该模型支持的档，Agent 记在会话上，之后每次 `claude -p --resume` 都带 `--model` / `--effort`（换到 Haiku 时不再带强度）；`--resume` 分支出新 session 时跟过去。不认识的模型、这个模型没有的档位回 `ok: false`。`autoApprove`（3.3 起）把这条会话 `projectPath` 的自动批准设为开或关，从这一轮起生效、之后沿用，省略 = 不动；规则同 startTask（`outsideProject` 的会话带 `true` 回 `ok: false`）。设置在这一轮开始之前落地，这一轮失败也不回滚
 - interrupt：`taskId` string
 
@@ -382,13 +383,14 @@ agent 回传给手机的一件产物（2.3 起），挂在 `Task.artifacts` 上�
 
 `fetchChanges` 的结果（2.11），**不走帧**：作为一份 JSON 产物上传，手机按 `CommandResult.artifactId` 经 `GET /client/artifacts/:agentId/:artifactId` 取。Relay 不解析它。
 
-`directory` string（Mac 上的工作目录，绝对路径）；`branch` string?（当前分支，detached HEAD 时省略）；`generatedAt` string；`files` [ChangedFile]（按路径的字节序排列，最多 300 个）；`totalFiles` integer（实际改动的文件数，大于 `files` 长度时说明被截了）。
+`directory` string（Mac 上的工作目录，绝对路径）；`branch` string?（当前分支，detached HEAD 时省略）；`generatedAt` string；`files` [ChangedFile]（按路径的字节序排列，最多 300 个）；`totalFiles` integer（实际改动的文件数，大于 `files` 长度时说明被截了）；`mergeTarget` string?（3.4 起。BotBus 从手机开的 worktree 会话才有，是建它时 `projectPath` 所在检出的分支（见 `startTask.worktree`）；这时范围是整个 worktree（项目是仓库子目录时也一样，`directory` 是 worktree 根目录——合并压的就是这些），从该分支与 worktree HEAD 的 merge-base 算起（agent 自己的提交也算）加上工作区与未跟踪文件。分支已被删掉时省略，也就不能合并）。
 
 ChangedFile：`path` string（相对 `directory`）；`oldPath` string?（改名前的路径）；`status` `modified` \| `added` \| `deleted` \| `renamed` \| `untracked` \| `conflicted`；`added` / `removed` integer?（增删行数，二进制文件省略）；`binary` boolean?（二进制文件，没有 diff）；`patch` string?（unified diff 正文：从第一个 `@@` 开始，不带 `diff --git`、`---`、`+++` 文件头；二进制、只改名或只改权限、或总量用完时省略）；`truncated` boolean?（`patch` 被截断，或因为总量用完被省略）。单个文件的 `patch` 最多 200,000 字节（在行边界截断），全部加起来最多 4,000,000 字节。未跟踪的文件由 Mac 自己读：软链接不跟随、超过 1 MB 或二进制的只列名字。
 
 ### 命令：fetchChanges
 
-- fetchChanges：`taskId` string（2.11 起。看任务所在目录里还没提交的改动：Mac 在任务的工作目录——worktree 会话是 `worktreePath`，其余是 `projectPath`——里跑只读的 git 命令，范围是 `git diff HEAD`（已暂存与未暂存）加未跟踪的文件，限定在这个目录之内；把结果编码成 WorkingChanges JSON，经 `PUT /agent/artifacts/:artifactId` 上传（`application/json`，不进 `Task.artifacts`），产物 id 放进 `CommandResult.artifactId`；目录里一个改动都没有时不上传，回 `ok: true` 且不带 `artifactId`——手机打开任务详情就会先问一次，据此决定显不显示入口，所以这一问要便宜。「不在项目中」的会话、不是 git 仓库的目录、等于或包含用户 home 与 `/Users` 等系统目录时回 `ok: false`。改动与上次相同、上次的产物也没过期时 Mac 可以直接回上次的 id。只读：不认领任务、不改任务状态）
+- fetchChanges：`taskId` string（2.11 起。看任务所在目录里还没提交的改动：Mac 在任务的工作目录——worktree 会话是 `worktreePath`，其余是 `projectPath`——里跑只读的 git 命令，范围是 `git diff HEAD`（已暂存与未暂存）加未跟踪的文件，限定在这个目录之内；把结果编码成 WorkingChanges JSON，经 `PUT /agent/artifacts/:artifactId` 上传（`application/json`，不进 `Task.artifacts`），产物 id 放进 `CommandResult.artifactId`；目录里一个改动都没有时不上传，回 `ok: true` 且不带 `artifactId`——手机打开任务详情就会先问一次，据此决定显不显示入口，所以这一问要便宜。「不在项目中」的会话、不是 git 仓库的目录、等于或包含用户 home 与 `/Users` 等系统目录时回 `ok: false`。改动与上次相同、上次的产物也没过期时 Mac 可以直接回上次的 id。只读：不认领任务、不改任务状态。3.4 起 BotBus 开的 worktree 会话（`WorkingChanges.mergeTarget` 会出现的那些）目录是整个 worktree 的根（不是会话所在的子目录），范围不是 `git diff HEAD`，而是「WorkingChanges」里说的与基准分支的 merge-base）
+- mergeWorktree：`taskId` string（3.4 起。只对报过 `mergeTarget` 的会话发。会话——或同一个 worktree 里的任何一条会话——在 `running` / `waitingApproval` / `waitingInput`、或还有针对它们的命令在执行时回 `ok: false`；已经合并并隐藏过的会话再收到（回执丢了、换了 id 重发）回 `ok: true`。Mac 先把 worktree 里没提交的改动（含未跟踪文件）`git add -A` 并提交到 worktree 分支（提交信息是会话标题，身份用仓库自己的 git 配置，不跑 hook），再用 `git merge-tree --write-tree` 与 `commit-tree` 在不碰任何工作目录的前提下算出一个 squash 提交（父提交是基准分支的最新提交），然后落到基准分支上：分支正被某个目录检出时在那里 `git merge --ff-only`（那个目录里未提交的改动与之重叠时 git 拒绝，回 `ok: false`），否则 `update-ref` 带旧值校验。有冲突、检出目录不干净、分支在这期间变了、git 低于 2.38 都回 `ok: false`，什么都不删。成功后删 worktree 与分支：先不带 `--force`；被拒时（worktree 里有检出的子模块时 git 一律拒绝不带 `--force` 的删除）再看一次状态，干净才带 `--force` 删。然后把这个 worktree 里的会话都记进 Agent 本机的隐藏集合（只读观察再报上来也不显示），发 `taskRemoved`；合并期间 worktree 里又冒出新文件、删不掉时，提交已经落在基准分支上，但回 `ok: false`、worktree 与会话都留着，再合并一次会把新文件也合进去；Codex 另外 `thread/archive`（回执之后才做、尽力而为），Claude 的 transcript 留在磁盘上）
 
 ## 六、屏幕共享与远程操作
 
@@ -528,8 +530,9 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - **
 - 版本 3.0 是端到端加密**（见「端到端加密」）：组密钥经电脑的配对二维码（或本人剪贴板上的配对链接）传给手机，Relay 从头到尾见不到；Relay 收发、存储的只剩密封形状——路由、合并、截断要用的 id 与时间是明文，任务、电脑、项目、对话、命令、结果、推送正文、产物字节、远程操作的画面与输入全部是密文。下面「Task」到「Event」各节描述的是**密文里面**的明文结构，它们在线上都包在信封里。三端与 Relay 同批升级，不做兼容层：两条最低线都抬到 3.0，2.x 的配对必须重新扫码。
 - 版本 3.1 加入一档来源 `dsh`（DeepSeek Harness）：`TaskSource` 与 `ConnectorKind` 新增 `dsh`，任务 id 为 `dsh:<sessionId>`，不带 `connectorId`；`AgentInfo.connectors` 上限仍是 16（一档 6 个 + ACP 最多 10 个）。Relay 只见密文、不解析这个枚举，只改版本号；但 3.0 的手机与手表见到 `dsh` 会拒收整份快照，所以发布顺序是 Relay → 新版 iOS / Android 上架 → `MIN_CLIENT_PROTOCOL` 抬到 3.1 → 发 Mac（见「版本握手」）。
-- 版本 3.3 加入**项目级自动批准**（见「项目级自动批准」）：`ConnectorInfo.canAutoApprove` 标出支持的 agent，`Project.autoApprove` / `Task.autoApprove` 报项目是否开着，`startTask` / `followUp` 的 `autoApprove` 设开或关、之后沿用。都是旧端能忽略的可选字段、都在密文里：Relay 只改版本号，两条最低线不动；旧 Mac 不报 `canAutoApprove`，手机也就不画这个开关。
 - 版本 3.2 加入**续聊时换模型与思考强度**：`ConnectorInfo.models` 报这个 agent 在手机上能选的模型（各带可选的强度与默认档），`Task.model` / `effort` 报这条会话下一轮会用的，`followUp.model` / `effort` 从这一轮起换掉、之后沿用，`startTask.model` / `effort` 让新会话从第一轮起就用选定的。都是旧端能忽略的可选字段，都在密文里：Relay 只改版本号，两条最低线不动；旧 Mac 不报 `models`，手机也就不给换模型的入口。
+- 版本 3.3 加入**项目级自动批准**（见「项目级自动批准」）：`ConnectorInfo.canAutoApprove` 标出支持的 agent，`Project.autoApprove` / `Task.autoApprove` 报项目是否开着，`startTask` / `followUp` 的 `autoApprove` 设开或关、之后沿用。都是旧端能忽略的可选字段、都在密文里：Relay 只改版本号，两条最低线不动；旧 Mac 不报 `canAutoApprove`，手机也就不画这个开关。
+- 版本 3.4 加入**手机开 worktree 会话与合并回检出分支**：`startTask.worktree`、`AgentInfo.worktrees`、`WorkingChanges.mergeTarget` 与命令 `mergeWorktree`。都在密文里：Relay 只改版本号，两条最低线不动。
 
 ## 附录 B：Fixture 与类型对应
 
@@ -605,6 +608,11 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | command-start-task-auto-approve.json | Command（3.3 startTask 打开项目的自动批准） |
 | command-start-task-acp.json | Command（2.13 startTask 发给某个 ACP agent，带 connectorId） |
 | command-set-connector-enabled-acp.json | Command（2.13 开关某个 ACP agent，带 connectorId） |
+| command-start-task-worktree.json | Command（3.4 startTask 带 `worktree: true`） |
+| command-start-task-worktree-auto-approve.json | Command（3.4 startTask 同时带 3.3 的 `autoApprove` 与 `worktree`） |
+| command-merge-worktree.json | Command（3.4 合并 worktree 会话回检出分支） |
+| agent-info-worktrees.json | AgentInfo（3.4 带 `worktrees: true`） |
+| working-changes-merge-target.json | WorkingChanges（3.4 带 `mergeTarget`） |
 | invalid/task-bad-status.json | 必须被拒绝：未知 status |
 | invalid/command-payload-mismatch.json | 必须被拒绝 |
 | invalid/command-missing-agent-id.json | 必须被拒绝：Command 缺少必填的 agentId |
@@ -621,3 +629,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | invalid/command-follow-up-bad-model.json | 必须被拒绝：followUp 的 `model` 以 `-` 开头（会被 agent 命令行当成选项） |
 | invalid/command-start-task-bad-effort.json | 必须被拒绝：startTask 的 `effort` 以 `-` 开头 |
 | invalid/connector-info-effort-not-listed.json | 必须被拒绝：ModelOption 的 `defaultEffort` 不在 `efforts` 里 |
+| invalid/command-start-task-worktree-new-project.json | 必须被拒绝：startTask 的 `worktree` 与 `newProject` 同时出现 |
+| invalid/command-start-task-worktree-openclaw.json | 必须被拒绝：`source = openclaw` 却带 `worktree` |
+| invalid/command-start-task-worktree-outside-project.json | 必须被拒绝：`projectPath` 为空串（不在项目中）却带 `worktree` |
+| invalid/agent-info-worktrees-false.json | 必须被拒绝：`worktrees` 只写 true，不能写 false |

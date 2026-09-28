@@ -430,6 +430,37 @@ final class ClaudeConnectorTests: XCTestCase {
         XCTAssertEqual(titled.title, "文档里那个字段名")
     }
 
+    // MARK: - 合并并结束（协议 3.4）
+
+    /// 手机合并并结束后：会话从连接器里拿掉，桌面 hook 再来也不重建、不挂审批（手机上已经看不到它，挂着只会让
+    /// Claude Code 干等 120 秒）；项目列表里也不再有它的目录。
+    func testDiscardForgetsTheSessionAndStopsHoldingItsHooks() async throws {
+        let store = makeStore()
+        let connector = makeConnector(store: store)
+        await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/tmp/merged", "prompt": "改"])
+        await send(connector, ["hook_event_name": "Stop", "session_id": "s1", "cwd": "/tmp/merged",
+                               "last_assistant_message": "好了"])
+        await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s2", "cwd": "/tmp/kept", "prompt": "看"])
+        _ = try await requireTask(store, "s1")
+
+        await store.hide(id: "claude:s1")
+        await connector.discard(taskId: "claude:s1")
+
+        let reply = await send(connector, [
+            "hook_event_name": "PermissionRequest", "session_id": "s1", "cwd": "/tmp/merged",
+            "tool_name": "Bash", "tool_use_id": "req-1", "tool_input": ["command": "ls"],
+        ])
+        guard case .now = reply else { return XCTFail("合并掉的会话不该再挂起审批") }
+        await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/tmp/merged", "prompt": "再改"])
+        let gone = await store.task(id: "claude:s1")
+        XCTAssertNil(gone)
+        let owner = await store.owner(of: "claude:s1")
+        XCTAssertEqual(owner, .observer)
+        let projects = await store.snapshot().projects.map(\.path)
+        XCTAssertEqual(projects, ["/tmp/kept"])
+        _ = try await requireTask(store, "s2")
+    }
+
     func testPermissionRequestHoldsResponseUntilApprove() async throws {
         let store = makeStore()
         let connector = makeConnector(store: store)

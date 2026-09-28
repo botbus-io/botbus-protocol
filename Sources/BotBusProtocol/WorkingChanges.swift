@@ -7,7 +7,8 @@ import Foundation
 /// 手机再按普通产物去取字节。它不进 `Task.artifacts`。
 ///
 /// 内容就是 `git diff HEAD` 加上未跟踪的文件：已暂存、未暂存、新建的都算，范围限定在任务的工作目录
-/// （worktree 会话是 worktree 目录）之内。
+/// （worktree 会话是 worktree 目录）之内。**例外**：`mergeTarget` 出现时（协议 3.4，BotBus 从手机开的
+/// worktree 会话），范围从该分支与 worktree HEAD 的 merge-base 算起（含 agent 自己的提交），不是 `git diff HEAD`。
 public struct WorkingChanges: Codable, Hashable, Sendable {
     /// Mac 上的工作目录（绝对路径），界面只显示最后一段。
     public var directory: String
@@ -17,14 +18,18 @@ public struct WorkingChanges: Codable, Hashable, Sendable {
     /// 按路径排序；超过 `maxFiles` 时只列前面这些，`totalFiles` 是实际个数。
     public var files: [ChangedFile]
     public var totalFiles: Int
+    /// 协议 3.4：可以把这些改动合并回去的分支（BotBus 开的 worktree 会话，建它时 `projectPath` 所在检出的分支）。
+    /// 只有这时范围才是整个 worktree、从基准分支与 worktree 的 merge-base 算起（含 agent 自己的提交）；其余会话省略。
+    public var mergeTarget: String?
 
     public init(directory: String, branch: String? = nil, generatedAt: String, files: [ChangedFile],
-                totalFiles: Int? = nil) {
+                totalFiles: Int? = nil, mergeTarget: String? = nil) {
         self.directory = directory
         self.branch = branch
         self.generatedAt = generatedAt
         self.files = files
         self.totalFiles = totalFiles ?? files.count
+        self.mergeTarget = mergeTarget
     }
 
     /// 最多列多少个文件。

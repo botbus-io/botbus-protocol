@@ -445,6 +445,25 @@ final class CodexConnectorTests: XCTestCase {
         await teardown(rig)
     }
 
+    // MARK: 合并并结束（协议 3.4）
+
+    func testDiscardArchivesTheThread() async throws {
+        let rig = await makeRig()
+        rig.responder.on("thread/archive") { _ in [:] }
+        _ = try await rig.connector.start(projectPath: "/tmp/project", prompt: "改完就合并")
+        await rig.connector.discard(taskId: "codex:thread-1")
+        let archive = try XCTUnwrap(params(rig, method: "thread/archive"))
+        XCTAssertEqual(archive["threadId"] as? String, "thread-1")
+        await teardown(rig)
+    }
+
+    func testDiscardIgnoresForeignTaskIds() async throws {
+        let rig = await makeRig()
+        await rig.connector.discard(taskId: "claude:session-1")
+        XCTAssertNil(params(rig, method: "thread/archive"))
+        await teardown(rig)
+    }
+
     // MARK: 审批
 
     func testApproveRepliesToPendingServerRequest() async throws {

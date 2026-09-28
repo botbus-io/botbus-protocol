@@ -55,6 +55,9 @@ const SCHEMA: Record<string, ZodType> = {
   "command-start-task-new-project.json": P.SealedCommand,
   "command-start-task-outside-project.json": P.SealedCommand,
   "command-start-task.json": P.SealedCommand,
+  "command-start-task-worktree.json": P.SealedCommand,
+  "command-start-task-worktree-auto-approve.json": P.SealedCommand,
+  "command-merge-worktree.json": P.SealedCommand,
   "event-command-result-changes.json": P.SealedEvent,
   "event-command-result-system-permission.json": P.SealedEvent,
   "event-command-result.json": P.SealedEvent,
@@ -118,6 +121,7 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "agent-info.json": P.AgentInfo,
   "agent-info-acp.json": P.AgentInfo,
   "agent-info-models.json": P.AgentInfo,
+  "agent-info-worktrees.json": P.AgentInfo,
   "connector-info-unavailable.json": P.ConnectorInfo,
   "snapshot.json": P.Snapshot,
   "snapshot-client.json": P.Snapshot,
@@ -157,6 +161,9 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "command-remote-control.json": P.Command,
   "command-start-task-acp.json": P.Command,
   "command-set-connector-enabled-acp.json": P.Command,
+  "command-start-task-worktree.json": P.Command,
+  "command-start-task-worktree-auto-approve.json": P.Command,
+  "command-merge-worktree.json": P.Command,
   "event-snapshot.json": P.Event,
   "event-task-updated.json": P.Event,
   "event-task-removed.json": P.Event,
@@ -173,6 +180,7 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "frame-relay-command.json": PlainRelayFrame,
   "frame-client-snapshot.json": PlainClientFrame,
   "working-changes.json": P.WorkingChanges,
+  "working-changes-merge-target.json": P.WorkingChanges,
 };
 
 /** invalid/ 下每个样本都必须被指定 schema 拒绝。 */
@@ -191,6 +199,10 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
   "command-start-task-acp-missing-connector-id.json": P.Command,
   "command-follow-up-bad-model.json": P.Command,
   "command-start-task-bad-effort.json": P.Command,
+  "command-start-task-worktree-new-project.json": P.Command,
+  "command-start-task-worktree-openclaw.json": P.Command,
+  "command-start-task-worktree-outside-project.json": P.Command,
+  "agent-info-worktrees-false.json": P.AgentInfo,
   "connector-info-effort-not-listed.json": P.ConnectorInfo,
   "event-system-permission-missing-dialog-text.json": P.Event,
   "pending-question-missing-options.json": P.Task,
@@ -202,15 +214,15 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
 describe("fixture 目录与对照表一一对应", () => {
   it("每个 valid fixture 都在 SCHEMA / PLAIN_SCHEMA 表里，且表里没有已删除的文件", () => {
     expect([...validFixtures.keys()].sort()).toEqual(Object.keys(SCHEMA).sort());
-    expect(validFixtures.size).toBe(71);
+    expect(validFixtures.size).toBe(74);
     expect([...plainFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_SCHEMA).sort());
-    expect(plainFixtures.size).toBe(58);
+    expect(plainFixtures.size).toBe(63);
   });
   it("每个 invalid fixture 都在 MUST_REJECT / PLAIN_MUST_REJECT 表里", () => {
     expect([...invalidFixtures.keys()].sort()).toEqual(Object.keys(MUST_REJECT).sort());
     expect(invalidFixtures.size).toBe(3);
     expect([...plainInvalidFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_MUST_REJECT).sort());
-    expect(plainInvalidFixtures.size).toBe(14);
+    expect(plainInvalidFixtures.size).toBe(18);
   });
 });
 

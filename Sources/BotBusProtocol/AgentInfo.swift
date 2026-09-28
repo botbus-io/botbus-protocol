@@ -223,9 +223,12 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
     public var connectors: [ConnectorInfo]
     /// 协议 2.6：手机上新建项目时，电脑在这个目录下建子文件夹（绝对路径）。nil = 这台电脑不接受新建项目。
     public var projectsRoot: String?
+    /// 协议 3.4：这台电脑能从手机开 worktree 会话（`startTask.worktree`）、能 `mergeWorktree`。只写 true，nil = 不能。
+    public var worktrees: Bool?
 
     public init(agentId: String, name: String, platform: AgentPlatform = .macos, online: Bool,
-                lastSeenAt: String, appVersion: String, connectors: [ConnectorInfo], projectsRoot: String? = nil) {
+                lastSeenAt: String, appVersion: String, connectors: [ConnectorInfo], projectsRoot: String? = nil,
+                worktrees: Bool? = nil) {
         self.agentId = agentId
         self.name = name
         self.platform = platform
@@ -234,10 +237,11 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         self.appVersion = appVersion
         self.connectors = connectors
         self.projectsRoot = projectsRoot
+        self.worktrees = worktrees
     }
 
     private enum CodingKeys: String, CodingKey {
-        case agentId, name, platform, online, lastSeenAt, appVersion, connectors, projectsRoot
+        case agentId, name, platform, online, lastSeenAt, appVersion, connectors, projectsRoot, worktrees
     }
 
     /// 校验集中在这里：Connector 最多 16 个且按 (kind, connectorId) 去重。数量下限没有——空数组合法。
@@ -251,6 +255,7 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         appVersion = try container.decode(String.self, forKey: .appVersion)
         connectors = try container.decode([ConnectorInfo].self, forKey: .connectors)
         projectsRoot = try container.decodeIfPresent(String.self, forKey: .projectsRoot)
+        worktrees = try container.decodeIfPresent(Bool.self, forKey: .worktrees)
 
         guard connectors.count <= Self.maxConnectors else {
             throw DecodingError.dataCorruptedError(
@@ -261,6 +266,10 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
             throw DecodingError.dataCorruptedError(
                 forKey: .connectors, in: container,
                 debugDescription: "connectors must be unique by (kind, connectorId)")
+        }
+        if worktrees == false {
+            throw DecodingError.dataCorruptedError(forKey: .worktrees, in: container,
+                                                   debugDescription: "worktrees is only written as true")
         }
     }
 }
