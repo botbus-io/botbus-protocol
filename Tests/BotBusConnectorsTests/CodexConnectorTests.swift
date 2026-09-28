@@ -1068,4 +1068,97 @@ final class CodexConnectorTests: XCTestCase {
         XCTAssertEqual(rig.process.requests(method: "turn/start").count, turnStartsBefore)
         await teardown(rig)
     }
+
+    // MARK: 项目级自动批准（协议 3.3）
+
+    func testAutoApprovedProjectAcceptsApprovalsInPhoneTurns() async throws {
+        let rig = await makeRig()
+        await rig.store.setAutoApprove(true, project: "/tmp/project")
+        _ = try await rig.connector.start(projectPath: "/tmp/project", prompt: "跑测试")
+        rig.process.deliver(object: ["method": "turn/started",
+                                     "params": ["threadId": "thread-1", "turn": ["id": "turn-1"]]])
+
+        rig.process.deliver(object: ["id": 5, "method": "item/commandExecution/requestApproval",
+                                     "params": ["threadId": "thread-1", "turnId": "turn-1", "itemId": "i1",
+                                                "command": "make test", "cwd": "/tmp/project"]])
+        await assertEventually { self.reply(rig, id: 5) != nil }
+        XCTAssertEqual((reply(rig, id: 5)?["result"] as? [String: Any])?["decision"] as? String, "accept")
+
+        // permissions：授出它要的那些，范围只这一轮。
+        rig.process.deliver(object: ["id": 6, "method": "item/permissions/requestApproval",
+                                     "params": ["threadId": "thread-1", "turnId": "turn-1",
+                                                "permissions": ["network": ["enabled": true], "fileSystem": NSNull()]]])
+        await assertEventually { self.reply(rig, id: 6) != nil }
+        let granted = try XCTUnwrap(reply(rig, id: 6)?["result"] as? [String: Any])
+        XCTAssertEqual(granted["scope"] as? String, "turn")
+        XCTAssertEqual((granted["permissions"] as? [String: Any])?.keys.sorted(), ["network"])
+
+        let record = try await requireTask(rig)
+        XCTAssertEqual(record.status, .running, "放行的审批不挂到任务上")
+        XCTAssertNil(record.pendingRequest)
+        XCTAssertEqual(record.autoApprove, true)
+        await teardown(rig)
+    }
+
+    func testUserInputIsNeverAutoApproved() async throws {
+        let rig = await makeRig()
+        await rig.store.setAutoApprove(true, project: "/tmp/project")
+        _ = try await rig.connector.start(projectPath: "/tmp/project", prompt: "问我点什么")
+        rig.process.deliver(object: ["id": 54, "method": "item/tool/requestUserInput",
+                                     "params": ["threadId": "thread-1", "turnId": "turn-1", "itemId": "i1",
+                                                "questions": [["id": "q1", "question": "生产还是预发？"]]]])
+        await assertEventually { await self.task(rig)?.status == .waitingInput }
+        XCTAssertNil(reply(rig, id: 54), "提问照旧交给手机")
+        await teardown(rig)
+    }
+
+    func testApprovalsInProjectsWithoutTheSettingStillWait() async throws {
+        let rig = await makeRig()
+        await rig.store.setAutoApprove(true, project: "/tmp/another")
+        _ = try await rig.connector.start(projectPath: "/tmp/project", prompt: "跑测试")
+        rig.process.deliver(object: ["id": 7, "method": "item/commandExecution/requestApproval",
+                                     "params": ["threadId": "thread-1", "turnId": "turn-1", "command": "pwd"]])
+        await assertEventually { await self.task(rig)?.status == .waitingApproval }
+        XCTAssertNil(reply(rig, id: 7))
+        await teardown(rig)
+    }
+
+    func testSharedDesktopAutoApprovesOnlyThePhoneTurn() async throws {
+        let rig = await makeRig(sharedDesktop: true)
+        rig.responder.on("turn/steer") { _ in [:] }
+        await rig.store.setAutoApprove(true, project: "/tmp/desktop")
+
+        // 桌面自己的一轮：照旧挂给人。
+        rig.process.deliver(object: ["method": "turn/started",
+                                     "params": ["threadId": "desktop-task", "turn": ["id": "desktop-turn"]]])
+        await assertEventually { await rig.connector.currentTurnId(threadId: "desktop-task") == "desktop-turn" }
+        rig.process.deliver(object: ["id": 82, "method": "item/commandExecution/requestApproval",
+                                     "params": ["threadId": "desktop-task", "turnId": "desktop-turn", "command": "pwd"]])
+        await assertEventually { await self.task(rig, "codex:desktop-task")?.pendingRequest?.id == "#82" }
+        XCTAssertNil(reply(rig, id: 82), "桌面轮次里的审批不自动放行")
+        rig.process.deliver(object: ["method": "serverRequest/resolved",
+                                     "params": ["threadId": "desktop-task", "requestId": 82]])
+        await assertEventually { await self.task(rig, "codex:desktop-task")?.pendingRequest == nil }
+
+        // 手机插进这一轮之后，剩下的部分算手机的轮次。
+        _ = try await rig.connector.followUp(taskId: "codex:desktop-task", prompt: "接着做")
+        rig.process.deliver(object: ["id": 83, "method": "item/commandExecution/requestApproval",
+                                     "params": ["threadId": "desktop-task", "turnId": "desktop-turn", "command": "ls"]])
+        await assertEventually { self.reply(rig, id: 83) != nil }
+        XCTAssertEqual((reply(rig, id: 83)?["result"] as? [String: Any])?["decision"] as? String, "accept")
+
+        // 这一轮结束，桌面再起的下一轮又归人管。
+        rig.process.deliver(object: ["method": "turn/completed",
+                                     "params": ["threadId": "desktop-task",
+                                                "turn": ["id": "desktop-turn", "status": "completed"]]])
+        await assertEventually { await rig.connector.currentTurnId(threadId: "desktop-task") == nil }
+        rig.process.deliver(object: ["method": "turn/started",
+                                     "params": ["threadId": "desktop-task", "turn": ["id": "desktop-turn-2"]]])
+        await assertEventually { await rig.connector.currentTurnId(threadId: "desktop-task") == "desktop-turn-2" }
+        rig.process.deliver(object: ["id": 84, "method": "item/commandExecution/requestApproval",
+                                     "params": ["threadId": "desktop-task", "turnId": "desktop-turn-2", "command": "pwd"]])
+        await assertEventually { await self.task(rig, "codex:desktop-task")?.pendingRequest?.id == "#84" }
+        XCTAssertNil(reply(rig, id: 84))
+        await teardown(rig)
+    }
 }

@@ -157,6 +157,8 @@ export const Task = z.object({
   /** 协议 3.2：下一轮会用的模型与思考强度，电脑知道时才有。 */
   model: ModelId.optional(),
   effort: ModelEffort.optional(),
+  /** 协议 3.3：所在项目开了自动批准；只写 true。 */
+  autoApprove: z.boolean().optional(),
 })
   // 跨字段校验，不是字段本身的规则：`connectorId` 只跟 `source = acp` 一起出现。
   // `.extend()` / `.pick()` 出来的 schema 不带它，会把这条悄悄绕过去。
@@ -277,6 +279,8 @@ export const ConnectorInfo = z.object({
     .max(MAX_MODELS)
     .refine((list) => new Set(list.map((m) => m.id)).size === list.length, { message: "models must be unique by id" })
     .optional(),
+  /** 协议 3.3：能不能给项目开自动批准；只写 true。 */
+  canAutoApprove: z.boolean().optional(),
 })
   // 跨字段校验，不是字段本身的规则：`connectorId` 只跟 `kind = acp` 一起出现。
   // `.extend()` / `.pick()` 出来的 schema 不带它，会把这条悄悄绕过去。
@@ -314,6 +318,8 @@ export const Project = z.object({
   name: z.string(),
   lastUsedAt: z.string(),
   pinned: z.boolean(),
+  /** 协议 3.3：这个项目开了自动批准；只写 true。 */
+  autoApprove: z.boolean().optional(),
 });
 
 export const CommandResult = z.object({
@@ -406,16 +412,22 @@ export const Command = z
         /** 协议 3.2：这条会话的模型与思考强度，之后的续聊沿用；省略 = agent 默认。 */
         model: ModelId.optional(),
         effort: ModelEffort.optional(),
+        /** 协议 3.3：把所在项目的自动批准设为开 / 关，之后沿用；省略 = 不动。 */
+        autoApprove: z.boolean().optional(),
       })
       .superRefine((s, ctx) => acpConnectorIdRule(s.source === "acp", s.connectorId, ctx))
       .optional(),
-    /** model / effort（3.2 起）：从这一轮起换模型与思考强度，之后的续聊沿用；省略 = 不换。 */
+    /**
+     * model / effort（3.2 起）：从这一轮起换模型与思考强度，之后的续聊沿用；省略 = 不换。
+     * autoApprove（3.3 起）：把所在项目的自动批准设为开 / 关，之后沿用；省略 = 不动。
+     */
     followUp: z.object({
       taskId: z.string(),
       prompt: z.string(),
       attachments: z.array(MessageAttachment).max(MAX_ATTACHMENTS_PER_MESSAGE).optional(),
       model: ModelId.optional(),
       effort: ModelEffort.optional(),
+      autoApprove: z.boolean().optional(),
     }).optional(),
     /** answers（2.14 起）：回答 PendingRequest.questions，键是问题 id，值是选中的 label 或自己打的字。 */
     approve: z

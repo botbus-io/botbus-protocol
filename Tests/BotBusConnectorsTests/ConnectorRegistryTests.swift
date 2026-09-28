@@ -29,6 +29,19 @@ final class ConnectorRegistryTests: XCTestCase {
         XCTAssertEqual(infos.map(\.taskCount), [0, 0])
     }
 
+    /// 协议 3.3：只有 Codex 与 Claude 报 `canAutoApprove`（只写 true），本机没装时也不报。
+    func testOnlyCodexAndClaudeReportAutoApprove() {
+        let registry = ConnectorRegistry(descriptors: [
+            descriptor(.codex, available: true),
+            descriptor(.claude, available: false),
+            descriptor(.hermes, available: true),
+            descriptor(.dsh, available: true),
+        ])
+        let infos = registry.connectors()
+        XCTAssertEqual(infos.map(\.canAutoApprove), [true, nil, nil, nil])
+        XCTAssertEqual(ConnectorKind.allCases.filter(\.supportsAutoApprove), [.codex, .claude])
+    }
+
     func testTaskCountsComeFromTheCaller() {
         let registry = ConnectorRegistry(descriptors: [descriptor(.codex, available: true), descriptor(.claude, available: false)])
         let infos = registry.connectors(taskCounts: [ConnectorRef(kind: .codex): 7])

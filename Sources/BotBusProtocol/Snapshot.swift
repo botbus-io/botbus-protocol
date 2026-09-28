@@ -8,16 +8,21 @@ public struct Project: Codable, Hashable, Sendable, Identifiable {
     public var name: String
     public var lastUsedAt: String
     public var pinned: Bool
+    /// 协议 3.3：这个项目开了「自动批准」——手机发起的轮次里，报了 `ConnectorInfo.canAutoApprove` 的 agent
+    /// 遇到审批直接放行，不再逐条问手机。只写 true，没开时整个键省略。由 Agent 的 TaskStore 附加，连接器与观察者不感知。
+    public var autoApprove: Bool?
 
-    public init(agentId: String, path: String, name: String, lastUsedAt: String, pinned: Bool) {
+    public init(agentId: String, path: String, name: String, lastUsedAt: String, pinned: Bool,
+                autoApprove: Bool? = nil) {
         self.agentId = agentId
         self.path = path
         self.name = name
         self.lastUsedAt = lastUsedAt
         self.pinned = pinned
+        self.autoApprove = autoApprove
     }
 
-    private enum CodingKeys: String, CodingKey { case agentId, path, name, lastUsedAt, pinned }
+    private enum CodingKeys: String, CodingKey { case agentId, path, name, lastUsedAt, pinned, autoApprove }
 }
 
 public struct CommandResult: Codable, Hashable, Sendable {

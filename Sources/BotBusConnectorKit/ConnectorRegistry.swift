@@ -255,7 +255,8 @@ public final class ConnectorRegistry: @unchecked Sendable {
                                  lastError: probe.lastError.map { Self.truncate($0, limit: Self.lastErrorLimit) },
                                  canStartTask: probe.canStartTask ? nil : false,
                                  // 本机没装时报了也选不了。
-                                 models: probe.available ? snapshot.4[descriptor.kind] : nil)
+                                 models: probe.available ? snapshot.4[descriptor.kind] : nil,
+                                 canAutoApprove: probe.available && descriptor.kind.supportsAutoApprove ? true : nil)
         }
         let acp = snapshot.2.map { entry in
             ConnectorInfo(kind: .acp, connectorId: entry.id,
@@ -293,6 +294,16 @@ public extension ConnectorKind {
         case .hermes, .pi, .openclaw, .dsh: false
         // ACP：能不能收图要跟 agent 握手后才知道，这里先放行，由连接器那道检查兜底。
         case .acp: true
+        }
+    }
+
+    /// 这个来源支不支持项目级自动批准（协议 3.3 的 `ConnectorInfo.canAutoApprove`）：Agent 替手机跑的轮次里
+    /// 遇到审批能不能直接放行。Codex（app-server 的审批请求）与 Claude Code（`PermissionRequest` hook）能；
+    /// 其余要么没有审批通道，要么审批带着自己的范围选项，不报。分发器据此拒掉带 `autoApprove` 的命令。
+    public var supportsAutoApprove: Bool {
+        switch self {
+        case .codex, .claude: true
+        case .hermes, .pi, .openclaw, .dsh, .acp: false
         }
     }
 }

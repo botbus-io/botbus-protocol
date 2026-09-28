@@ -44,6 +44,8 @@ const SCHEMA: Record<string, ZodType> = {
   "command-follow-up-with-attachments.json": P.SealedCommand,
   "command-follow-up-model.json": P.SealedCommand,
   "command-start-task-model.json": P.SealedCommand,
+  "command-follow-up-auto-approve.json": P.SealedCommand,
+  "command-start-task-auto-approve.json": P.SealedCommand,
   "command-follow-up.json": P.SealedCommand,
   "command-interrupt.json": P.SealedCommand,
   "command-remote-control.json": P.SealedCommand,
@@ -90,6 +92,7 @@ const SCHEMA: Record<string, ZodType> = {
   "relay-preview-session-response.json": P.PreviewSessionResponse,
   "snapshot-client.json": P.SealedSnapshot,
   "snapshot-dsh.json": P.SealedSnapshot,
+  "snapshot-auto-approve.json": P.SealedSnapshot,
   "snapshot-hermes-pi-openclaw.json": P.SealedSnapshot,
   "snapshot-multi-agent.json": P.SealedSnapshot,
   "snapshot.json": P.SealedSnapshot,
@@ -121,6 +124,7 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "snapshot-multi-agent.json": P.Snapshot,
   "snapshot-hermes-pi-openclaw.json": P.Snapshot,
   "snapshot-dsh.json": P.Snapshot,
+  "snapshot-auto-approve.json": P.Snapshot,
   "task-waiting-approval.json": P.Task,
   "task-waiting-approval-choices.json": P.Task,
   "task-waiting-input.json": P.Task,
@@ -140,6 +144,8 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "command-follow-up-with-attachments.json": P.Command,
   "command-follow-up-model.json": P.Command,
   "command-start-task-model.json": P.Command,
+  "command-follow-up-auto-approve.json": P.Command,
+  "command-start-task-auto-approve.json": P.Command,
   "command-approve.json": P.Command,
   "command-approve-deny.json": P.Command,
   "command-approve-answers.json": P.Command,
@@ -196,9 +202,9 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
 describe("fixture 目录与对照表一一对应", () => {
   it("每个 valid fixture 都在 SCHEMA / PLAIN_SCHEMA 表里，且表里没有已删除的文件", () => {
     expect([...validFixtures.keys()].sort()).toEqual(Object.keys(SCHEMA).sort());
-    expect(validFixtures.size).toBe(68);
+    expect(validFixtures.size).toBe(71);
     expect([...plainFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_SCHEMA).sort());
-    expect(plainFixtures.size).toBe(55);
+    expect(plainFixtures.size).toBe(58);
   });
   it("每个 invalid fixture 都在 MUST_REJECT / PLAIN_MUST_REJECT 表里", () => {
     expect([...invalidFixtures.keys()].sort()).toEqual(Object.keys(MUST_REJECT).sort());

@@ -9,7 +9,7 @@ import Foundation
 ///
 /// 没带版本头的一方按 `legacy` 算：版本头是 2.8 才有的，之前的实现一律视为 2.7。
 public enum ProtocolVersion {
-    public static let current = "3.2"
+    public static let current = "3.3"
     public static let legacy = "2.7"
     /// 本端（Mac、手机、手表）要求 Relay 至少是这个版本。依赖 Relay 新行为的改动发版前，把它抬上去。
     /// 2.10：旧 Relay 会剥掉 TaskRecord / CommandResult 的 systemPermission 字段。

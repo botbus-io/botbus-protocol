@@ -57,6 +57,7 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(Snapshot.self, "plain/snapshot-multi-agent.json"),
         roundTripCase(Snapshot.self, "plain/snapshot-hermes-pi-openclaw.json"),
         roundTripCase(Snapshot.self, "plain/snapshot-dsh.json"),
+        roundTripCase(Snapshot.self, "plain/snapshot-auto-approve.json"),
     ] }
 
     private static var taskCases: [FixtureCase] { [
@@ -85,6 +86,8 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(Command.self, "plain/command-follow-up-with-attachments.json"),
         roundTripCase(Command.self, "plain/command-follow-up-model.json"),
         roundTripCase(Command.self, "plain/command-start-task-model.json"),
+        roundTripCase(Command.self, "plain/command-follow-up-auto-approve.json"),
+        roundTripCase(Command.self, "plain/command-start-task-auto-approve.json"),
         roundTripCase(Command.self, "plain/command-approve.json"),
         roundTripCase(Command.self, "plain/command-approve-deny.json"),
         roundTripCase(Command.self, "plain/command-approve-answers.json"),
@@ -409,6 +412,22 @@ final class FixtureRoundTripTests: XCTestCase {
         XCTAssertFalse(ModelOption.isValidId(""))
         XCTAssertFalse(ModelOption.isValidEffort("High"))
         XCTAssertTrue(ModelOption.isValidEffort("xhigh"))
+    }
+
+    /// 协议 3.3：项目级自动批准。能力与状态都只写 true（没有时整键省略）；命令里 true / false 都有意义。
+    func testAutoApproveFields() throws {
+        let snapshot = try decodeFixture(Snapshot.self, "plain/snapshot-auto-approve.json")
+        XCTAssertEqual(snapshot.agents[0].connectors[0].canAutoApprove, true)
+        XCTAssertNil(snapshot.agents[0].connectors[1].canAutoApprove)
+        XCTAssertEqual(snapshot.projects[0].autoApprove, true)
+        XCTAssertNil(snapshot.projects[1].autoApprove)
+        XCTAssertEqual(snapshot.tasks[0].autoApprove, true)
+
+        let followUp = try XCTUnwrap(decodeFixture(Command.self, "plain/command-follow-up-auto-approve.json").followUp)
+        XCTAssertEqual(followUp.autoApprove, false, "false 是明确关掉，不是省略")
+        let start = try XCTUnwrap(decodeFixture(Command.self, "plain/command-start-task-auto-approve.json").startTask)
+        XCTAssertEqual(start.autoApprove, true)
+        XCTAssertNil(try XCTUnwrap(decodeFixture(Command.self, "plain/command-follow-up.json").followUp).autoApprove)
     }
 
     /// 旧版 Agent 只认 `RelayFrame`：hello 帧在它那里必须解码失败（被忽略），而不是被误读成命令。

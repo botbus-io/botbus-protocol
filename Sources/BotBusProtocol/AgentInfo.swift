@@ -75,10 +75,12 @@ public struct ConnectorInfo: Codable, Hashable, Sendable, Identifiable {
     /// 协议 3.2：手机续聊时能换的模型，电脑自己排好序（默认的那个在前）。省略 = 这个 agent 不能从手机换模型；
     /// 有它时不是空数组，最多 `ModelOption.maxModels` 个、按 `id` 不重复。
     public var models: [ModelOption]?
+    /// 协议 3.3：能不能给项目开「自动批准」（手机发起的轮次里审批不再逐条问）。只写 true，不能时整个键省略。
+    public var canAutoApprove: Bool?
 
     public init(kind: ConnectorKind, connectorId: String? = nil, displayName: String, available: Bool, enabled: Bool,
                 status: Status, taskCount: Int, lastError: String? = nil, canStartTask: Bool? = nil,
-                models: [ModelOption]? = nil) {
+                models: [ModelOption]? = nil, canAutoApprove: Bool? = nil) {
         self.kind = kind
         self.connectorId = connectorId
         self.displayName = displayName
@@ -89,10 +91,12 @@ public struct ConnectorInfo: Codable, Hashable, Sendable, Identifiable {
         self.lastError = lastError
         self.canStartTask = canStartTask
         self.models = models
+        self.canAutoApprove = canAutoApprove
     }
 
     private enum CodingKeys: String, CodingKey {
         case kind, connectorId, displayName, available, enabled, status, taskCount, lastError, canStartTask, models
+        case canAutoApprove
     }
 
     public init(from decoder: Decoder) throws {
@@ -107,6 +111,7 @@ public struct ConnectorInfo: Codable, Hashable, Sendable, Identifiable {
         lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
         canStartTask = try container.decodeIfPresent(Bool.self, forKey: .canStartTask)
         models = try container.decodeIfPresent([ModelOption].self, forKey: .models)
+        canAutoApprove = try container.decodeIfPresent(Bool.self, forKey: .canAutoApprove)
 
         if let models {
             guard !models.isEmpty, models.count <= ModelOption.maxModels,

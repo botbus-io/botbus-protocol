@@ -224,6 +224,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 | taskCount | integer | ≥ 0 |
 | lastError | string? | 截断 200 字 |
 | models | [ModelOption]? | 3.2 起。手机续聊时能换的模型，电脑排好序（默认的在前），1–24 个、按 `id` 不重复；省略 = 不能从手机换模型，手机不画入口。Codex 取 app-server 的 `model/list`（去掉 hidden，每代子进程握手完问一次），Claude Code 报 `--model` 认的别名 `fable` / `opus` / `sonnet` / `haiku`，强度从本机 `claude --help` 读取（Haiku 不报强度；CLI 不可用或未列出强度时省略 models），`displayName` 带别名当前指向的版本（「Opus 5.5」：取 transcript 里见过的完整模型名，只往高处抬；没见过的只显示系列名）；其余 agent 省略 |
+| canAutoApprove | boolean? | 3.3 起。**只写 `true`**：这个 agent 支持项目级自动批准（见「项目级自动批准」），不支持时整个键省略。目前 Codex 与 Claude Code 报；手机只对报了的 agent 画「审批」开关 |
 | canStartTask | boolean? | 2.13 起。**只写 `false`**：这个 agent 不能从手机新建任务（ACP agent 没有启动命令、反向连接也没声明 `newSession`；3.1 起一档的 `dsh` 在电脑上找不到可执行文件、只看得见会话时也写）；能新建时整个键省略（不写 `true`）。手机的新建任务选择器不列 `false` 的 agent |
 
 ModelOption（3.2）：`id` string（原样回到 `followUp.model`，会成为 agent 命令行的参数值，所以限定 1–64 个 `[A-Za-z0-9._:/-]` 且不以 `-` 开头），`displayName` string（截断 40 字），`efforts` [string]?（能选的强度，从低到高，1–8 个不重复；每个 1–16 个 `[a-z0-9-]`、不以 `-` 开头；省略 = 这个模型不能调强度），`defaultEffort` string?（不指定时 agent 用哪一档，必须是 `efforts` 里的一个）。强度是 agent 自己的词，协议不定闭集：目前见到的是 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`，客户端认得的翻成本地文案，不认得的原样显示。
@@ -232,7 +233,7 @@ ModelOption（3.2）：`id` string（原样回到 `followUp.model`，会成为 a
 
 ### Project
 
-Project：`agentId`、`path`、`name`、`lastUsedAt` string，`pinned` boolean。`agentId` 指明该项目路径所属的电脑——项目路径只在其所属电脑上有意义。`projects` 按 `lastUsedAt` 降序排列后再截断，使被丢弃的总是最久未用的；同值时按 `agentId`、`path` 次序稳定排序。
+Project：`agentId`、`path`、`name`、`lastUsedAt` string，`pinned` boolean，`autoApprove` boolean?（3.3 起，**只写 `true`**：这个项目开了自动批准，见「项目级自动批准」；没开时整个键省略）。`agentId` 指明该项目路径所属的电脑——项目路径只在其所属电脑上有意义。`projects` 按 `lastUsedAt` 降序排列后再截断，使被丢弃的总是最久未用的；同值时按 `agentId`、`path` 次序稳定排序。
 
 ### 命令：setConnectorEnabled
 
@@ -263,14 +264,15 @@ Project：`agentId`、`path`、`name`、`lastUsedAt` string，`pinned` boolean�
 | worktreePath | string? | 2.7 起。会话真实的工作目录，只在它是某个仓库的 git worktree 时出现（此时 `projectPath` 是主仓库），否则整个键省略。由 Agent 的 `TaskStore` 解析，连接器与观察者不感知：`<仓库>/.claude/worktrees/<名字>`（Claude app）按路径归到 `<仓库>`；其余路径里有一层 `worktrees` 目录的，读 worktree 自己的 `.git` 文件（`gitdir: <仓库>/.git/worktrees/<名字>`）得出主仓库，认出的对应关系在 Agent 本机持久化；已删掉又没记过的，在见过的主仓库与项目里恰好只有一个同名目录时归过去（Codex 的 worktree 以仓库命名），同名的有多个时不猜；submodule、bare 仓库和不在 `worktrees` 目录下的手动 worktree 原样当项目。`Snapshot.projects` 里同样换成主仓库并去重。续聊仍在这个目录里跑；目录已被删掉时 `followUp` 回 `ok: false`，不退回主仓库 |
 | connectorId | string? | 2.13 起。是哪个 ACP agent，值取自清单或注册表里的 id：`[a-z0-9-]`，1–32 字符，不含冒号。只在 `source = acp` 时出现，且必须出现；其余来源带上它即整条拒绝 |
 | model | string? | 3.2 起。这条会话下一轮会用的模型，写法同 `ModelOption.id`；电脑知道时才有。Codex 取线程上记的（`thread/start` / `thread/resume` 的应答，只读观察读 `threads.model`），Claude 取手机选过的，其次 transcript 里最后一条 assistant 消息的模型换成的别名（`claude-opus-5-5` → `opus`），认不出时省略 |
+| autoApprove | boolean? | 3.3 起。**只写 `true`**：这条会话的 `projectPath` 开了自动批准（同 `Project.autoApprove`，任务所在项目不在 `projects` 里时手机也看得到）；没开或 `outsideProject` 时整个键省略。由 Agent 的 `TaskStore` 附加，连接器与观察者不感知 |
 | effort | string? | 3.2 起。下一轮的思考强度，写法同 `ModelOption.efforts` 的值；省略 = 不知道或按模型默认（不是"不思考"）。Codex 取线程上的 `reasoningEffort`，Claude 只在手机选过时有 |
 
 TaskStatus：`running` 有轮次进行中；`waitingApproval` 有 pendingRequest 且 kind ≠ input；`waitingInput` agent 等用户回复；`completed` 最近一轮正常结束；`failed` 最近一轮出错；`interrupted` 被中断；`idle` 超过 24 小时无活动。
 
 ### 命令：startTask、followUp、interrupt
 
-- startTask：`source` TaskSource，`projectPath` string，`prompt` string，`newProject` string?，`attachments` [MessageAttachment]?，`connectorId` string?（2.13 起，发给哪个 ACP agent：`source = acp` 时必填，其余来源必须省略，两者不符即整条拒绝），`model` string?，`effort` string?。2.6 起 `projectPath` 可为空串，表示「不在项目中」：Agent 在主目录下运行，OpenClaw 用它的默认工作区。`newProject`（2.6）是新项目的文件夹名：Agent 在自己的 `projectsRoot` 下建这个子文件夹再开始，`projectPath` 忽略（填空串）。名字只能是一层（去掉首尾空白后 1–80 字，不含 `/`、`\`、`:` 与控制字符，不以 `.` 开头）；同名目录已存在、名字不合法或 Agent 没有 `projectsRoot` 时回 `ok: false`，不复用已有目录。`attachments`（2.9 起）是手机发图开新任务，最多 4 张；带附件时 `prompt` 可为空串。`model` / `effort`（3.2 起，写法同 ModelOption）指定这条会话从第一轮起用的模型与思考强度，之后的续聊沿用，省略 = agent 默认；和 followUp 一样只有报了 `ConnectorInfo.models` 的 agent 收，其余带上它们回 `ok: false`（Agent 在建新项目文件夹、下载图之前就拒）。Codex 随第一轮 `turn/start` 发，Claude 在第一次 `claude -p` 就带 `--model` / `--effort` 并记在会话上
-- followUp：`taskId` string，`prompt` string，`attachments` [MessageAttachment]?，`model` string?，`effort` string?。2.7 起 worktree 里的会话在原 worktree 里续聊；worktree 已被删掉时回 `ok: false`。`attachments`（2.9 起）同上，追问带图。`model` / `effort`（3.2 起，写法同 ModelOption）从这一轮起换模型与思考强度，之后的续聊沿用，省略 = 不换；只有报了 `ConnectorInfo.models` 的 agent 收，其余 agent 带上它们回 `ok: false`。Codex 随 `turn/start` 的 `model` / `effort` 发（app-server 记在线程上）；回答挂着的提问、或共用桌面时插进正在跑的那一轮（`turn/steer` 不收模型）时不换，`Task.model` 照旧，手机的选择跟着快照退回。Claude 只收 `ClaudeModels` 的别名与该模型支持的档，Agent 记在会话上，之后每次 `claude -p --resume` 都带 `--model` / `--effort`（换到 Haiku 时不再带强度）；`--resume` 分支出新 session 时跟过去。不认识的模型、这个模型没有的档位回 `ok: false`
+- startTask：`source` TaskSource，`projectPath` string，`prompt` string，`newProject` string?，`attachments` [MessageAttachment]?，`connectorId` string?（2.13 起，发给哪个 ACP agent：`source = acp` 时必填，其余来源必须省略，两者不符即整条拒绝），`model` string?，`effort` string?，`autoApprove` boolean?。2.6 起 `projectPath` 可为空串，表示「不在项目中」：Agent 在主目录下运行，OpenClaw 用它的默认工作区。`newProject`（2.6）是新项目的文件夹名：Agent 在自己的 `projectsRoot` 下建这个子文件夹再开始，`projectPath` 忽略（填空串）。名字只能是一层（去掉首尾空白后 1–80 字，不含 `/`、`\`、`:` 与控制字符，不以 `.` 开头）；同名目录已存在、名字不合法或 Agent 没有 `projectsRoot` 时回 `ok: false`，不复用已有目录。`attachments`（2.9 起）是手机发图开新任务，最多 4 张；带附件时 `prompt` 可为空串。`model` / `effort`（3.2 起，写法同 ModelOption）指定这条会话从第一轮起用的模型与思考强度，之后的续聊沿用，省略 = agent 默认；和 followUp 一样只有报了 `ConnectorInfo.models` 的 agent 收，其余带上它们回 `ok: false`（Agent 在建新项目文件夹、下载图之前就拒）。Codex 随第一轮 `turn/start` 发，Claude 在第一次 `claude -p` 就带 `--model` / `--effort` 并记在会话上。`autoApprove`（3.3 起）把这条会话所在项目（`newProject` 时是新建的文件夹）的自动批准设为开（`true`）或关（`false`），从第一轮起生效、之后沿用，省略 = 不动；只有报了 `ConnectorInfo.canAutoApprove` 的 agent 收，其余带上它回 `ok: false`，「不在项目中」（`projectPath` 为空串）带 `true` 也回 `ok: false`，都在建新项目文件夹、下载图之前就拒
+- followUp：`taskId` string，`prompt` string，`attachments` [MessageAttachment]?，`model` string?，`effort` string?，`autoApprove` boolean?。2.7 起 worktree 里的会话在原 worktree 里续聊；worktree 已被删掉时回 `ok: false`。`attachments`（2.9 起）同上，追问带图。`model` / `effort`（3.2 起，写法同 ModelOption）从这一轮起换模型与思考强度，之后的续聊沿用，省略 = 不换；只有报了 `ConnectorInfo.models` 的 agent 收，其余 agent 带上它们回 `ok: false`。Codex 随 `turn/start` 的 `model` / `effort` 发（app-server 记在线程上）；回答挂着的提问、或共用桌面时插进正在跑的那一轮（`turn/steer` 不收模型）时不换，`Task.model` 照旧，手机的选择跟着快照退回。Claude 只收 `ClaudeModels` 的别名与该模型支持的档，Agent 记在会话上，之后每次 `claude -p --resume` 都带 `--model` / `--effort`（换到 Haiku 时不再带强度）；`--resume` 分支出新 session 时跟过去。不认识的模型、这个模型没有的档位回 `ok: false`。`autoApprove`（3.3 起）把这条会话 `projectPath` 的自动批准设为开或关，从这一轮起生效、之后沿用，省略 = 不动；规则同 startTask（`outsideProject` 的会话带 `true` 回 `ok: false`）。设置在这一轮开始之前落地，这一轮失败也不回滚
 - interrupt：`taskId` string
 
 ## 三、审批与提问
@@ -282,6 +284,12 @@ PendingRequest：`id` string，`kind` `command` \| `fileChange` \| `permission` 
 PendingQuestion（2.14）：`id` string（同一请求内唯一，作 `approve.answers` 的键；Claude 是问题下标 `"0"`、`"1"`…，Codex 是它自己的问题 id），`question` string，`header` string?（短标签），`multiSelect` `true`?（单选时整个键省略），`options` [{`label` string, `description` string?}]（最多 16 个，可以为空——只能打字答的问题）。有 `questions` 时 `question` 仍是写好选项的纯文字，给不认新字段的旧客户端看。客户端在**每道题都有选项**时画点选，选好后发 `approve {decision: allow, answers}`，`deny` 表示跳过不答；也可以照旧 `followUp` 一段文字，Agent 把它当作所有问题的回答（带图的 `followUp` 此时被拒，免得图被丢掉）。Claude 的 AskUserQuestion 经 `PermissionRequest` hook 到达，Agent 把它记为 `waitingInput`（不再是要批准的 `permission`），回答写进 hook 的 `updatedInput.answers`（问题原文 → label，多选用 `, ` 连接），与电脑上的提问框先答者生效；`allow` 却没带任何认得的答案时回 `ok: false`，请求继续挂着。
 
 审批（kind = `command` / `fileChange` / `permission`）也可以带 `questions`：那是「允许」的几种范围，不是要回答的问题——OpenClaw 的 exec 审批带一道单选 `scope`（「只这一次」/「以后都允许」，后者写进它的白名单）；ACP 的 `session/request_permission` 把 agent 的 `allow_once` / `allow_always` 选项按这个顺序列出（拒绝类的不列，那是「拒绝」按钮；agent 一个允许选项都没给时不带 `questions`）。客户端照旧显示命令与「拒绝」/「批准」，选项默认选第一个（第一个总是最保守的一次性允许），「批准」带 `answers`，「拒绝」不带；`answers` 缺失或认不出时 Agent 按第一个选项处理，所以旧客户端点「批准」的效果和 2.13 之前完全一样。
+
+### 项目级自动批准（3.3）
+
+手机可以给一个项目（`(agentId, projectPath)`，worktree 里的会话按主仓库算）开「自动批准」：之后 Agent 替手机跑的轮次——`startTask`、`followUp` 起的那一轮，包括在桌面会话上续聊——里遇到审批（`kind` 为 `command` / `fileChange` / `permission`）直接按「只这一次允许」放行，不建 `pendingRequest`、不推 `TASK_APPROVAL`；提问（`kind = input`：Claude 的 AskUserQuestion、Codex 的 requestUserInput）照旧交给手机。电脑上自己跑的轮次不受影响，照旧由电脑处理；共用 Codex 桌面时，也只放行手机那一轮里的审批。
+
+开关没有单独的命令：随下一条 `startTask` / `followUp` 的 `autoApprove` 一起发，之后沿用，状态从 `Project.autoApprove` / `Task.autoApprove` 读回。设置由 Agent 按项目路径持久化在本机（重启后仍在），对这台电脑上所有报了 `canAutoApprove` 的 agent 一起生效；只在这台电脑上，与别的电脑上同名路径无关。Codex 放行命令与改文件时回 `accept`，`permissions` 请求授出它要的那些、范围 `turn`；Claude Code 的 `PermissionRequest` hook 回 `allow`。
 
 ### 命令：approve
 
@@ -520,6 +528,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - **
 - 版本 3.0 是端到端加密**（见「端到端加密」）：组密钥经电脑的配对二维码（或本人剪贴板上的配对链接）传给手机，Relay 从头到尾见不到；Relay 收发、存储的只剩密封形状——路由、合并、截断要用的 id 与时间是明文，任务、电脑、项目、对话、命令、结果、推送正文、产物字节、远程操作的画面与输入全部是密文。下面「Task」到「Event」各节描述的是**密文里面**的明文结构，它们在线上都包在信封里。三端与 Relay 同批升级，不做兼容层：两条最低线都抬到 3.0，2.x 的配对必须重新扫码。
 - 版本 3.1 加入一档来源 `dsh`（DeepSeek Harness）：`TaskSource` 与 `ConnectorKind` 新增 `dsh`，任务 id 为 `dsh:<sessionId>`，不带 `connectorId`；`AgentInfo.connectors` 上限仍是 16（一档 6 个 + ACP 最多 10 个）。Relay 只见密文、不解析这个枚举，只改版本号；但 3.0 的手机与手表见到 `dsh` 会拒收整份快照，所以发布顺序是 Relay → 新版 iOS / Android 上架 → `MIN_CLIENT_PROTOCOL` 抬到 3.1 → 发 Mac（见「版本握手」）。
+- 版本 3.3 加入**项目级自动批准**（见「项目级自动批准」）：`ConnectorInfo.canAutoApprove` 标出支持的 agent，`Project.autoApprove` / `Task.autoApprove` 报项目是否开着，`startTask` / `followUp` 的 `autoApprove` 设开或关、之后沿用。都是旧端能忽略的可选字段、都在密文里：Relay 只改版本号，两条最低线不动；旧 Mac 不报 `canAutoApprove`，手机也就不画这个开关。
 - 版本 3.2 加入**续聊时换模型与思考强度**：`ConnectorInfo.models` 报这个 agent 在手机上能选的模型（各带可选的强度与默认档），`Task.model` / `effort` 报这条会话下一轮会用的，`followUp.model` / `effort` 从这一轮起换掉、之后沿用，`startTask.model` / `effort` 让新会话从第一轮起就用选定的。都是旧端能忽略的可选字段，都在密文里：Relay 只改版本号，两条最低线不动；旧 Mac 不报 `models`，手机也就不给换模型的入口。
 
 ## 附录 B：Fixture 与类型对应
@@ -537,6 +546,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | snapshot-multi-agent.json | Snapshot（两台电脑的合并结果） |
 | snapshot-hermes-pi-openclaw.json | Snapshot（2.5 新增的三个来源） |
 | snapshot-dsh.json | Snapshot（3.1 的 `dsh` connector 与 `dsh:` 任务，不带 `connectorId`） |
+| snapshot-auto-approve.json | Snapshot（3.3 的 `canAutoApprove`，带与不带 `autoApprove` 的项目，带 `autoApprove` 的任务） |
 | agent-info.json | AgentInfo |
 | connector-info-unavailable.json | ConnectorInfo |
 | command-*.json | Command |
@@ -591,6 +601,8 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | task-with-model.json | Task（3.2 带 `model` / `effort`） |
 | command-follow-up-model.json | Command（3.2 followUp 换模型与强度） |
 | command-start-task-model.json | Command（3.2 startTask 指定模型与强度） |
+| command-follow-up-auto-approve.json | Command（3.3 followUp 关掉项目的自动批准） |
+| command-start-task-auto-approve.json | Command（3.3 startTask 打开项目的自动批准） |
 | command-start-task-acp.json | Command（2.13 startTask 发给某个 ACP agent，带 connectorId） |
 | command-set-connector-enabled-acp.json | Command（2.13 开关某个 ACP agent，带 connectorId） |
 | invalid/task-bad-status.json | 必须被拒绝：未知 status |

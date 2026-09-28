@@ -121,6 +121,9 @@ public struct TaskRecord: Codable, Hashable, Sendable, Identifiable {
     public var model: String?
     /// 协议 3.2：下一轮的思考强度，电脑知道时才有；省略不代表"不思考"，只是不知道（按模型默认）。
     public var effort: String?
+    /// 协议 3.3：这条会话所在的项目开了「自动批准」（同 `Project.autoApprove`）。只写 true，没开时整个键省略；
+    /// 由 Agent 的 TaskStore 按 `projectPath` 附加，连接器与观察者不感知。
+    public var autoApprove: Bool?
 
     /// 协议规定的单任务产物上限。
     public static let maxArtifacts = 10
@@ -130,7 +133,8 @@ public struct TaskRecord: Codable, Hashable, Sendable, Identifiable {
                 pendingRequest: PendingRequest? = nil, origin: TaskOrigin, controllable: Bool,
                 startedAt: String, updatedAt: String, artifacts: [Artifact]? = nil, outsideProject: Bool? = nil,
                 worktreePath: String? = nil, systemPermission: SystemPermissionNotice? = nil,
-                connectorId: String? = nil, model: String? = nil, effort: String? = nil) {
+                connectorId: String? = nil, model: String? = nil, effort: String? = nil,
+                autoApprove: Bool? = nil) {
         self.id = id
         self.agentId = agentId
         self.source = source
@@ -151,6 +155,7 @@ public struct TaskRecord: Codable, Hashable, Sendable, Identifiable {
         self.connectorId = connectorId
         self.model = model
         self.effort = effort
+        self.autoApprove = autoApprove
     }
 
     /// 会话实际的工作目录：在 worktree 里时是 worktree，否则就是项目路径。
@@ -164,7 +169,7 @@ public struct TaskRecord: Codable, Hashable, Sendable, Identifiable {
     private enum CodingKeys: String, CodingKey {
         case id, agentId, source, title, projectPath, projectName, status, lastMessage, pendingRequest, origin
         case controllable, startedAt, updatedAt, artifacts, outsideProject, worktreePath, systemPermission, connectorId
-        case model, effort
+        case model, effort, autoApprove
     }
 
     /// 字段照旧由合成的编码写出（nil 整键省略）；解码多一道校验：`connectorId` 只跟 `source = acp` 一起出现。
@@ -190,6 +195,7 @@ public struct TaskRecord: Codable, Hashable, Sendable, Identifiable {
         connectorId = try container.decodeIfPresent(String.self, forKey: .connectorId)
         model = try container.decodeIfPresent(String.self, forKey: .model)
         effort = try container.decodeIfPresent(String.self, forKey: .effort)
+        autoApprove = try container.decodeIfPresent(Bool.self, forKey: .autoApprove)
         if let model, !ModelOption.isValidId(model) {
             throw DecodingError.dataCorruptedError(forKey: .model, in: container, debugDescription: "invalid model id")
         }

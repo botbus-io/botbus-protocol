@@ -101,6 +101,9 @@ public actor CodexConnector: TaskConnector {
         /// 协议 3.2：线程下一轮的模型与思考强度（`thread/start` / `thread/resume` 的应答，或手机刚换过的）。
         var model: String? = nil
         var effort: String? = nil
+        /// 协议 3.3：共用桌面时，当前这一轮是不是手机起的（本连接器发了 `turn/start` / `turn/steer`，
+        /// 到 `turn/completed` 为止）。只有这样的轮次里的审批才按项目的自动批准放行；不进 `TaskRecord`。
+        var phoneTurn = false
     }
 
     /// 子进程现在什么情况。菜单栏要能看出 `codex app-server` 是活着、正在起、还是死了等着重启——
@@ -313,6 +316,8 @@ public actor CodexConnector: TaskConnector {
         await claim(threadId)
         await publish(threadId)
 
+        // 先记下再发：这一轮的第一条审批可能比 `turn/start` 的应答先到。
+        mutate(threadId) { $0.phoneTurn = true }
         do {
             _ = try await server.request("turn/start",
                                          params: Self.turnStartParams(threadId: threadId, text: text, images: images,
@@ -322,6 +327,7 @@ public actor CodexConnector: TaskConnector {
                 if let effort = selection.effort { $0.effort = effort }
             }
         } catch {
+            mutate(threadId) { $0.phoneTurn = false }
             // 轮次没起来就别霸着所有权，让只读观察接手这条线程。
             await release(threadId)
             throw error
@@ -390,17 +396,26 @@ public actor CodexConnector: TaskConnector {
         // 图与字一起进 `input`（localImage）：`turn/steer` 与 `turn/start` 收同一种 UserInput，
         // 所以共用桌面端时插进正在跑的那一轮也带得上图。
         let params = Self.turnStartParams(threadId: threadId, text: text, images: images, selection: selection)
-        if sharedDesktop, let activeTurn = threads[threadId]?.currentTurnId {
-            let input = params["input"] ?? .array([])
-            _ = try await server.request("turn/steer", params: [
-                "threadId": .string(threadId), "expectedTurnId": .string(activeTurn), "input": input,
-            ])
-        } else {
-            _ = try await server.request("turn/start", params: params)
-            mutate(threadId) {
-                if let model = selection.model { $0.model = model }
-                if let effort = selection.effort { $0.effort = effort }
+        // 协议 3.3：从这里到 `turn/completed` 都算手机的轮次（插进桌面那一轮时，剩下的部分也算）。先记下再发，
+        // 这一轮的第一条审批可能比应答先到；没发出去就撤回。
+        let wasPhoneTurn = threads[threadId]?.phoneTurn ?? false
+        mutate(threadId) { $0.phoneTurn = true }
+        do {
+            if sharedDesktop, let activeTurn = threads[threadId]?.currentTurnId {
+                let input = params["input"] ?? .array([])
+                _ = try await server.request("turn/steer", params: [
+                    "threadId": .string(threadId), "expectedTurnId": .string(activeTurn), "input": input,
+                ])
+            } else {
+                _ = try await server.request("turn/start", params: params)
+                mutate(threadId) {
+                    if let model = selection.model { $0.model = model }
+                    if let effort = selection.effort { $0.effort = effort }
+                }
             }
+        } catch {
+            mutate(threadId) { $0.phoneTurn = wasPhoneTurn }
+            throw error
         }
         mutate(threadId) { $0.status = .running }
         await publish(threadId)
@@ -562,6 +577,8 @@ public actor CodexConnector: TaskConnector {
             messageBuffers.removeValue(forKey: threadId)
             mutate(threadId) {
                 if turnId.isEmpty || $0.currentTurnId == turnId { $0.currentTurnId = nil }
+                // 往保守的方向收：任何一轮结束都不再算手机的轮次，下一轮要由手机重新起。
+                $0.phoneTurn = false
                 // 这一轮挂着的审批已经被 CodexAppServer 丢掉了，任务上也不能再留着。
                 $0.pendingKey = nil
                 $0.pendingRequest = nil
@@ -615,6 +632,7 @@ public actor CodexConnector: TaskConnector {
             await autoAnswer(request)
             return
         }
+        if kind != .input, await autoApprove(request, threadId: threadId) { return }
         let pending = Self.pendingRequest(from: request, kind: kind)
         if sharedDesktop { await claim(threadId) }
         mutate(threadId) {
@@ -625,6 +643,26 @@ public actor CodexConnector: TaskConnector {
         Self.log.info("挂起审批 \(request.method, privacy: .public) \(request.key, privacy: .public) kind=\(kind.rawValue, privacy: .public)")
         // upsert 之后 TaskStore 自己按状态跃迁产出 TASK_APPROVAL / TASK_INPUT。
         await publish(threadId)
+    }
+
+    /// 协议 3.3：手机驱动的轮次里、项目开着自动批准时，审批（不含 `requestUserInput`）直接按「只这一次允许」回掉，
+    /// 不挂 pendingRequest。返回 true = 已经回了。
+    ///
+    /// 「手机驱动」：不共用桌面时，BotBus 自己的 app-server 里只跑手机起的轮次（含重启后自动 resume 的），都算；
+    /// 共用桌面时只算 `phoneTurn` 标着的那一轮，桌面自己的轮次照旧交给人。
+    private func autoApprove(_ request: CodexServerRequest, threadId: String) async -> Bool {
+        guard !sharedDesktop || threads[threadId]?.phoneTurn == true,
+              await store.autoApproves(taskId: Self.protocolId(threadId),
+                                       workingDirectory: threads[threadId]?.projectPath),
+              let result = Self.approvalResult(for: request, decision: .accept) else { return false }
+        do {
+            try await server.respond(to: request.key, result: result)
+            Self.log.info("项目已开自动批准，放行 \(request.method, privacy: .public) \(request.key, privacy: .public)")
+        } catch {
+            // 回不出去多半是这一轮已经没了（进程退出、轮次结束），挂成卡片也没人能答，只记日志。
+            Self.log.error("自动批准 \(request.key, privacy: .public) 失败：\(Self.describe(error), privacy: .public)")
+        }
+        return true
     }
 
     /// 子进程没了：这一轮的服务端请求全没了，线程也不在任何一代进程里加载着。
@@ -640,6 +678,7 @@ public actor CodexConnector: TaskConnector {
                 $0.pendingRequest = nil
                 $0.currentTurnId = nil
                 $0.loadedGeneration = nil
+                $0.phoneTurn = false
             }
             await release(threadId, relinquishControl: false)
         }
@@ -883,7 +922,8 @@ public actor CodexConnector: TaskConnector {
             owned: existing?.owned ?? false,
             hasFinalAnswer: existing?.hasFinalAnswer ?? false,
             model: existing?.model,
-            effort: existing?.effort)
+            effort: existing?.effort,
+            phoneTurn: existing?.phoneTurn ?? false)
         evictIfNeeded(keeping: threadId)
     }
 

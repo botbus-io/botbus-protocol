@@ -45,6 +45,10 @@ public actor TaskStore {
     public static var defaultPhoneTasksURL: URL {
         LocalHookServer.defaultSupportDirectory.appendingPathComponent("phone-tasks.json")
     }
+    /// app 用的「开了自动批准的项目」持久化位置（协议 3.3），见 `AutoApproveArchive`。
+    public static var defaultAutoApproveURL: URL {
+        LocalHookServer.defaultSupportDirectory.appendingPathComponent("auto-approve.json")
+    }
 
     private static let log = Logger(subsystem: "io.botbus.agent", category: "taskstore")
 
@@ -109,11 +113,20 @@ public actor TaskStore {
     private let phoneTasksURL: URL?
     private var pendingPhoneTasksSave: Task<Void, Never>?
 
-    /// - Parameter artifactsURL: 产物持久化文件；nil = 只在内存里（测试默认）。app 传 `defaultArtifactsURL`。
+    /// 开了「自动批准」的项目路径（协议 3.3，盖章后的 `projectPath`：worktree 记主仓库）。和产物一样在
+    /// `stamped(_:)` 与 `mergedProjects()` 里打到外发的任务与项目上，连接器与观察者不感知；
+    /// 连接器遇到审批时经 `autoApproves(taskId:workingDirectory:)` 来问。改了立刻落盘，重启后仍在。
+    private var autoApproveProjects: Set<String> = []
+    private let autoApproveURL: URL?
+
+    /// - Parameters:
+    ///   - artifactsURL: 产物持久化文件；nil = 只在内存里（测试默认）。app 传 `defaultArtifactsURL`。
+    ///   - autoApproveURL: 自动批准的项目设置；nil = 只在内存里（测试默认）。app 传 `defaultAutoApproveURL`。
     public init(identity: AgentIdentity = AgentIdentity(),
                 connectors: ConnectorRegistry = ConnectorRegistry(),
                 artifactsURL: URL? = nil,
                 phoneTasksURL: URL? = nil,
+                autoApproveURL: URL? = nil,
                 artifactSaveDelay: TimeInterval = TaskStore.defaultArtifactSaveDelay,
                 outsideProjects: OutsideProjectRule = OutsideProjectRule(),
                 worktrees: WorktreeResolver = WorktreeResolver(),
@@ -126,6 +139,7 @@ public actor TaskStore {
         self.worktrees = worktrees
         self.artifactsURL = artifactsURL
         self.phoneTasksURL = phoneTasksURL
+        self.autoApproveURL = autoApproveURL
         self.artifactSaveDelay = artifactSaveDelay
         self.systemPermissionInspector = systemPermissionInspector
         self.systemPermissionInspectionTimeout = systemPermissionInspectionTimeout
@@ -138,6 +152,7 @@ public actor TaskStore {
             self.phoneStarted = PhoneTaskArchive.trimmed(PhoneTaskArchive.load(from: phoneTasksURL),
                                                          limit: Self.maxPhoneStartedTasks)
         }
+        if let autoApproveURL { self.autoApproveProjects = AutoApproveArchive.load(from: autoApproveURL) }
     }
 
     /// 配对完成后把 Relay 分配的 agentId 填进来，并给已存的任务与项目重新盖章。
@@ -190,6 +205,44 @@ public actor TaskStore {
         let events = [Event.snapshot(snapshot())]
         publish(events)
         return events
+    }
+
+    // MARK: - 自动批准（协议 3.3）
+
+    /// 某个工作目录归到哪个项目下记自动批准：worktree 归主仓库，与 `stamped(_:)` 同一套规则。
+    /// 「不在项目中」的目录（空路径、主目录等）返回 nil——它们开不了自动批准。
+    public func autoApproveProject(forWorkingDirectory path: String) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let project = worktrees.projectRoot(for: trimmed) ?? trimmed
+        return outsideProjects.contains(project) ? nil : project
+    }
+
+    /// 打开或关掉一个项目的自动批准（`project` 是盖章后的 `projectPath`）。先落盘再补一份全量快照——
+    /// 项目只随快照更新，任务上的 `autoApprove` 也一并带过去。值没变时什么都不做。
+    @discardableResult
+    public func setAutoApprove(_ enabled: Bool, project: String) -> [Event] {
+        guard !project.isEmpty, autoApproveProjects.contains(project) != enabled else { return [] }
+        if enabled { autoApproveProjects.insert(project) } else { autoApproveProjects.remove(project) }
+        if let autoApproveURL { AutoApproveArchive.save(autoApproveProjects, to: autoApproveURL) }
+        tasks = tasks.mapValues { stamped($0) }
+        let events = [Event.snapshot(snapshot())]
+        publish(events)
+        return events
+    }
+
+    /// 这个项目开着自动批准没有。Mac 菜单与测试用；连接器用 `autoApproves(taskId:workingDirectory:)`。
+    public func isAutoApproveEnabled(project: String) -> Bool { autoApproveProjects.contains(project) }
+
+    /// 连接器遇到审批时问：这个任务所在的项目开着自动批准没有。store 里有这个任务就看它盖过章的 `autoApprove`；
+    /// 还没有（新任务的第一轮，连接器还没 upsert）就按工作目录归到项目再查。
+    /// 只回答"项目开没开"，是不是手机驱动的轮次由连接器自己判断。
+    public func autoApproves(taskId: String, workingDirectory: String?) -> Bool {
+        if let task = tasks[taskId] { return task.autoApprove == true }
+        guard let workingDirectory, let project = autoApproveProject(forWorkingDirectory: workingDirectory) else {
+            return false
+        }
+        return autoApproveProjects.contains(project)
     }
 
     // MARK: - 事件流
@@ -668,6 +721,7 @@ public actor TaskStore {
 
     /// 归属一律以本机为准：连接器（以及将来的 app-server 推送）不该有能力把任务记到别的电脑名下。
     /// 产物也在这里合并：连接器带来的 `artifacts`（通常是 nil）一律被 store 自己记的那份顶掉。
+    /// 自动批准（协议 3.3）同理，按盖章后的 `projectPath` 查，只写 true 或 nil，「不在项目中」的永远 nil。
     /// `outsideProject` 同理，由本机规则决定，只写 true 或 nil（协议要求在项目里时省略这个键）。
     /// worktree（协议 2.7）也在这里：`projectPath` 换成主仓库，真实工作目录挪进 `worktreePath`。
     /// 工作目录取 `worktreePath ?? projectPath`，所以对盖过章的记录再盖一次结果不变。
@@ -680,14 +734,17 @@ public actor TaskStore {
         let projectName = root.map(Self.lastPathComponent) ?? task.projectName
         let worktreePath = root == nil ? nil : workingDirectory
         let outside: Bool? = outsideProjects.contains(projectPath) ? true : nil
+        let autoApprove: Bool? = outside == nil && autoApproveProjects.contains(projectPath) ? true : nil
         guard task.agentId != identity.agentId || task.artifacts != artifacts || task.outsideProject != outside
                 || task.projectPath != projectPath || task.projectName != projectName
-                || task.worktreePath != worktreePath || task.systemPermission != systemPermission else { return task }
+                || task.worktreePath != worktreePath || task.systemPermission != systemPermission
+                || task.autoApprove != autoApprove else { return task }
         var copy = task
         copy.agentId = identity.agentId
         copy.artifacts = artifacts
         copy.systemPermission = systemPermission
         copy.outsideProject = outside
+        copy.autoApprove = autoApprove
         copy.projectPath = projectPath
         copy.projectName = projectName
         copy.worktreePath = worktreePath
@@ -881,7 +938,12 @@ public actor TaskStore {
         let sorted = byIdentity.values.sorted {
             $0.lastUsedAt == $1.lastUsedAt ? $0.id < $1.id : $0.lastUsedAt > $1.lastUsedAt
         }
-        return Array(sorted.prefix(Self.maxProjects))
+        // 自动批准（协议 3.3）在这里统一打上：连接器报的项目不带它，按路径查本机设置。
+        return sorted.prefix(Self.maxProjects).map { project in
+            var copy = project
+            copy.autoApprove = autoApproveProjects.contains(project.path) ? true : nil
+            return copy
+        }
     }
 }
 

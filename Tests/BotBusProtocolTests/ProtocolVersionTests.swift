@@ -6,7 +6,7 @@ final class ProtocolVersionTests: XCTestCase {
     /// （2.15 的手机表与电脑移除手机、2.14 的 `questions`、2.13 的 `acp` 等更早的依赖一并由这条线盖住。）
     /// 3.1 只加了 `dsh` 枚举、3.2 只加了模型与思考强度的可选字段：Relay 只见密文、不解析它们，所以对 Relay 的要求仍是 3.0。
     func testSealedWireRequiresRelayThatSpeaksIt() {
-        XCTAssertEqual(ProtocolVersion.current, "3.2")
+        XCTAssertEqual(ProtocolVersion.current, "3.3")
         XCTAssertEqual(ProtocolVersion.minimumRelay, "3.0")
         XCTAssertEqual(ProtocolVersion.incompatibility(status: 200, relayVersion: "2.14"), .relayOutdated)
         XCTAssertEqual(ProtocolVersion.incompatibility(status: 200, relayVersion: "2.11"), .relayOutdated)

@@ -1,0 +1,28 @@
+{
+  "agents": [
+    {
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "online": true,
+      "lastSeenAt": "2026-09-28T08:30:00Z",
+      "sealed": "Aekmh4kP6vzlHzk7cKjMfww57UFoGNo0wnqkBNEoEUjKF_mzGTLkqcFCVPeX_fo5zzwfCw_BbHobDqs3JVnHYKnPBDgQTVc1L2R1SnimOHjqVycrAYnXLic_BvHflBOe8KHEO_M3p47g2NuOKpFTaeDnNmIEWA57qPHTZIAhlk5jE6Mn7nzSKU6eGdzvJoKRbWErQYyjI33iS7hN--QrfHc_lpTm7CRLCbYYI-Z23Kgtugu4kKj6VMMFt1z90whp8vSnpMQIREcG7JHd5WIMS5CaMMB93KurhV2DgFWETPg72AIYZs0OuqzO1dI2fupVJyllI_WyPBnQFTq2zwzKyA6IMd_MZFJIhnH_gUOrlHrPKa8M8dvwzuN3arW2whwtJAQDihFFuPrKdoP0rKRODtBGQ3YmVfMzgOPcesEXuYGG0Ub9S0vxyImX9ZBjztfy-V5Uf2Wk7JR_5zz9hppIqo1hPHV47eJMKHZXhCJpyPAS9m5eLT5-kIsZ4eZ3IctO2oAMVENlOjvoNnqYmq_Wr1u0iGi7vGm0ZaJsD2h1BqybCbZycg"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "claude:5b7e1c2a-3d4f-4a5b-8c6d-7e8f9a0b1c2d",
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "updatedAt": "2026-09-28T08:28:00Z",
+      "sealed": "AWS971RMwOHTPW4vjhI6Ek91_3t3UaUNkF_RdY8BIWXXCnTiGHqH0H-n481VNTyHHHHdrWeSoUT3T164WjBQkPcwA6XB1ZI9W7oyhghDg1tq2NpiU11sF_0TxBGyWl-4ITUWysxLzyznHCnRybaFy4Ur8J5uWPUhA_wSyn9-tGJgpEJRtzhJuXeh9_QWpj2le1RFr3HTc6NVENR9GnKFaQQ2-LrjciszZuWB6qk4rrUNv0nRCcxTeEQOtWMbARlIsc90dzBf2sAWshqvnM3aytsrAkd0xwkHUTsiEcAf_ZZoZMLOwSp7jcgPGmAkPBCTzLxvVbafsQGRb07Ig-nuUISQEVwxbWQB6gqyaEtLm5lZX1OIrrLV7WQbQCzkVIH4pinVvNW6FgD0purkST-zPFaE3253gvQewiCdmM1p5LgVnBqa1cTxzTdf3L3r8dQfKA5gUhZczcI54830Y6CGt0mt22Q6V1kjxs7wYVnqkYs8Uy_uAGxa234r2tYu9o9PIDWtqF5kng"
+    }
+  ],
+  "projects": [
+    {
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "sealed": "AUy9XH8cn7ZPQIC6hc92YIBT1Ns4cRsRZ9jQshmI-Xhh7BBJNDa_DbTxp7mnD06TJNvZokwm7M1s_HaX-gHKaWbWOMWpaMyrWve0Cgvf5jABw5bGD8_tGR1Yfg4AfXEwskaCvoON4W_z9l_RrsT2ixATGuno5HSTotWVe-iiCP5zTr78DJ9Qk3B0g5fgPxIdU-sUSj1Us6wB5g4yqywX_NgudKMvMCwRaqqDwkcvz5flZ67Pb_qn8H_LCasP62toQs5ycEwP55tw0tIL4DB7Aitbqw6Se6v8a3ZGB5NEPcGwULKGeFL8T_rft7fjhi0deupKY0pcBs9Kg5CtKwTgi29oXzgYMGA60HbfgtNGjiy4MLnI6JJJJhkQ5wkxnTyeBBSeotkpnGAGT97DG7JnPwCpKYWORayqp50J-oZOFKDtB8v0IOIvDu8cfEwuqxsa2A"
+    }
+  ],
+  "recentResults": [],
+  "recentMessages": [],
+  "seq": 9,
+  "generatedAt": "2026-09-28T08:30:00Z"
+}

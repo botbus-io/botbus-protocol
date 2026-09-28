@@ -292,6 +292,14 @@ public actor CommandDispatcher {
             if !selection.isEmpty, target != nil || store.connectors.models(for: kind) == nil {
                 throw DispatchFailure("这个 agent 不能从手机选模型")
             }
+            // 协议 3.3：自动批准只有报了 `canAutoApprove` 的 agent 收，「不在项目中」也开不了——同样在下载图、建目录之前拒。
+            if let autoApprove = payload.autoApprove {
+                guard kind.supportsAutoApprove else { throw DispatchFailure("这个 agent 不支持自动批准") }
+                if autoApprove, payload.newProject == nil,
+                   await store.autoApproveProject(forWorkingDirectory: payload.projectPath) == nil {
+                    throw DispatchFailure("不在项目中的会话不能开自动批准")
+                }
+            }
             // 先找连接器再下载：连接器停用、来源不收图时都不白下一趟图。下载也排在建新项目文件夹之前，
             // 图取不下来时不留空目录。
             let images = try await receiveImages(command, payload.attachments, kind: kind)
@@ -302,6 +310,11 @@ public actor CommandDispatcher {
             } else if kind != .openclaw, projectPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 // 协议 2.6：空目录 = 「不在项目中」。OpenClaw 自己会退回它的默认工作区，其余在主目录下跑。
                 projectPath = await store.homeDirectory
+            }
+            // 协议 3.3：设置在第一轮开始之前落地（落盘 + 快照），启动失败也不回滚。新项目作用在刚建的文件夹上。
+            if let autoApprove = payload.autoApprove,
+               let project = await store.autoApproveProject(forWorkingDirectory: projectPath) {
+                await store.setAutoApprove(autoApprove, project: project)
             }
             // startTask 还没有 id，所有权只能等连接器把 id 还回来才认领得上。
             let outcome: ConnectorOutcome
@@ -327,7 +340,24 @@ public actor CommandDispatcher {
                 throw DispatchFailure("这个会话所在的 worktree 已经删掉了，没法在原来的目录里续聊：\(worktree)",
                                       taskId: payload.taskId)
             }
+            // 协议 3.3：自动批准按任务盖过章的 `projectPath`（worktree 记主仓库）设。store 里没有这个任务时
+            // 不在这里报，由 `onTask` 给出「本机没有这个任务」。
+            var autoApproveProject: String?
+            if let autoApprove = payload.autoApprove, let task = await store.task(id: payload.taskId) {
+                guard ConnectorKind(task.source)?.supportsAutoApprove == true else {
+                    throw DispatchFailure("这个 agent 不支持自动批准", taskId: payload.taskId)
+                }
+                if task.outsideProject == true {
+                    if autoApprove { throw DispatchFailure("不在项目中的会话不能开自动批准", taskId: payload.taskId) }
+                } else {
+                    autoApproveProject = task.projectPath
+                }
+            }
             return try await onTask(payload.taskId) { connector in
+                // 连接器可用、任务在本机之后、这一轮开始之前落地；这一轮失败也不回滚。
+                if let autoApprove = payload.autoApprove, let project = autoApproveProject {
+                    await self.store.setAutoApprove(autoApprove, project: project)
+                }
                 // 下载放在 onTask 里：失败时由它交还所有权、带上 taskId。
                 let images = try await self.receiveImages(command, payload.attachments, kind: connector.kind)
                 return try await connector.followUp(taskId: payload.taskId, prompt: payload.prompt, images: images,

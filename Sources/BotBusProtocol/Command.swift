@@ -22,10 +22,13 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         public var model: String?
         /// 协议 3.2：这条会话的思考强度，之后沿用。省略 = 按模型默认。
         public var effort: String?
+        /// 协议 3.3：把这条会话所在项目的「自动批准」设为开（true）或关（false），从第一轮起生效、之后沿用。
+        /// 省略 = 不动。只有报了 `ConnectorInfo.canAutoApprove` 的 agent 收；「不在项目中」的会话不收。
+        public var autoApprove: Bool?
 
         public init(source: TaskSource, projectPath: String, prompt: String, newProject: String? = nil,
                     attachments: [MessageAttachment]? = nil, connectorId: String? = nil,
-                    model: String? = nil, effort: String? = nil) {
+                    model: String? = nil, effort: String? = nil, autoApprove: Bool? = nil) {
             self.source = source
             self.projectPath = projectPath
             self.prompt = prompt
@@ -34,10 +37,11 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
             self.connectorId = connectorId
             self.model = model
             self.effort = effort
+            self.autoApprove = autoApprove
         }
 
         private enum CodingKeys: String, CodingKey {
-            case source, projectPath, prompt, newProject, attachments, connectorId, model, effort
+            case source, projectPath, prompt, newProject, attachments, connectorId, model, effort, autoApprove
         }
 
         public init(from decoder: Decoder) throws {
@@ -50,6 +54,7 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
             connectorId = try container.decodeIfPresent(String.self, forKey: .connectorId)
             model = try container.decodeIfPresent(String.self, forKey: .model)
             effort = try container.decodeIfPresent(String.self, forKey: .effort)
+            autoApprove = try container.decodeIfPresent(Bool.self, forKey: .autoApprove)
             if let model, !ModelOption.isValidId(model) {
                 throw DecodingError.dataCorruptedError(forKey: .model, in: container, debugDescription: "invalid model id")
             }
@@ -89,17 +94,21 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         public var model: String?
         /// 协议 3.2：从这一轮起换成这档思考强度，之后沿用。省略 = 不换。
         public var effort: String?
+        /// 协议 3.3：把这条会话所在项目的「自动批准」设为开（true）或关（false），从这一轮起生效、之后沿用。
+        /// 省略 = 不动。规则同 `StartTask.autoApprove`。
+        public var autoApprove: Bool?
 
         public init(taskId: String, prompt: String, attachments: [MessageAttachment]? = nil,
-                    model: String? = nil, effort: String? = nil) {
+                    model: String? = nil, effort: String? = nil, autoApprove: Bool? = nil) {
             self.taskId = taskId
             self.prompt = prompt
             self.attachments = attachments
             self.model = model
             self.effort = effort
+            self.autoApprove = autoApprove
         }
 
-        private enum CodingKeys: String, CodingKey { case taskId, prompt, attachments, model, effort }
+        private enum CodingKeys: String, CodingKey { case taskId, prompt, attachments, model, effort, autoApprove }
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -108,6 +117,7 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
             attachments = try container.decodeIfPresent([MessageAttachment].self, forKey: .attachments)
             model = try container.decodeIfPresent(String.self, forKey: .model)
             effort = try container.decodeIfPresent(String.self, forKey: .effort)
+            autoApprove = try container.decodeIfPresent(Bool.self, forKey: .autoApprove)
             if let model, !ModelOption.isValidId(model) {
                 throw DecodingError.dataCorruptedError(forKey: .model, in: container, debugDescription: "invalid model id")
             }

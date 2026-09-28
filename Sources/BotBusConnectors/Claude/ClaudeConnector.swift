@@ -313,7 +313,16 @@ public actor ClaudeConnector: TaskConnector {
     ///
     /// `AskUserQuestion` 不是"批不批"而是"选哪个"：建成带 `questions` 的 `.input` 请求，任务记 `waitingInput`，
     /// 手机选好了经 `approve` 带 `answers` 回来，或者直接打字经 `followUp` 回来（见 `answerQuestion`）。
+    ///
+    /// 协议 3.3：本连接器替手机跑的那一轮（`isOwnTurn`）里，会话所在项目开着自动批准时，审批直接回 `allow`，
+    /// 不建 pendingRequest、不推通知；`AskUserQuestion` 照旧交给手机。电脑上自己跑的轮次不受影响。
     private func holdForApproval(_ event: ClaudeHookEvent) async -> LocalHookServer.Reply {
+        if event.askedQuestions == nil, isOwnTurn(event.sessionID),
+           await store.autoApproves(taskId: taskId(for: event.sessionID),
+                                    workingDirectory: sessions[event.sessionID]?.projectPath ?? event.cwd) {
+            Self.log.info("项目已开自动批准，放行 \(event.toolName ?? "权限请求", privacy: .public)")
+            return .now(.json(ClaudeHookOutput.permission(allow: true, reason: "项目已开自动批准")))
+        }
         let requestID = event.toolUseID ?? UUID().uuidString
         let summary = event.toolName ?? "请求权限"
         apply(event) { session, event in
