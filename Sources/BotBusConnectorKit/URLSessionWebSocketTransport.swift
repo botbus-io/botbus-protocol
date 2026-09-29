@@ -43,9 +43,10 @@ public final class URLSessionWebSocketTransport: WebSocketTransport {
             }
             throw WebSocketHandshakeFailed(status: status, underlying: error)
         }
-        let connection = URLSessionWebSocketConnection(task: task, session: session)
         // 101 上带着 Relay 的版本（协议 2.8）。旧 Relay 不带，按 2.7 算。
         let upgrade = task.response as? HTTPURLResponse
+        let connection = URLSessionWebSocketConnection(
+            task: task, session: session, relayProtocolVersion: upgrade?.value(forHTTPHeaderField: ProtocolVersion.header))
         if let problem = ProtocolVersion.incompatibility(
             status: upgrade?.statusCode ?? 101,
             relayVersion: upgrade?.value(forHTTPHeaderField: ProtocolVersion.header)) {
@@ -87,10 +88,12 @@ public final class URLSessionWebSocketTransport: WebSocketTransport {
 public actor URLSessionWebSocketConnection: WebSocketConnection {
     public let task: URLSessionWebSocketTask
     private let session: URLSession
+    public nonisolated let relayProtocolVersion: String?
 
-    public init(task: URLSessionWebSocketTask, session: URLSession) {
+    public init(task: URLSessionWebSocketTask, session: URLSession, relayProtocolVersion: String? = nil) {
         self.task = task
         self.session = session
+        self.relayProtocolVersion = relayProtocolVersion
     }
 
     public func send(text: String) async throws {
