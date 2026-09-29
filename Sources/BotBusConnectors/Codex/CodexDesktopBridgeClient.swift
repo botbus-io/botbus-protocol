@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import BotBusConnectorKit
 
 /// A virtual Codex process for the existing CodexAppServer parser. Its initialize exchange is

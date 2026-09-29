@@ -93,7 +93,9 @@ final class ClaudeControlChannel: @unchecked Sendable {
 
     init(handle: FileHandle) {
         self.handle = handle
+        #if canImport(Darwin)
         _ = fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1)
+        #endif
     }
 
     /// 已经关了返回 false：这一轮结束了，回答送不到。

@@ -3,6 +3,37 @@ import XCTest
 @testable import BotBusConnectorKit
 
 final class StreamJSONReaderTests: XCTestCase {
+    #if os(Linux)
+    /// 每一轮 `claude -p` 一个 reader：读完（或进程先退出）都得把读端关掉，Linux 的 Foundation 不会替你关。
+    func testFinishedReadersCloseTheirDescriptor() throws {
+        let count = { (try? FileManager.default.contentsOfDirectory(atPath: "/proc/self/fd").count) ?? -1 }
+        let before = count()
+        var pipes: [Pipe] = []
+        for index in 0..<200 {
+            let pipe = Pipe()
+            pipes.append(pipe)
+            let finished = expectation(description: "finished \(index)")
+            let reader = StreamJSONReader(handle: pipe.fileHandleForReading)
+            reader.onFinished = { _ in finished.fulfill() }
+            reader.start()
+            if index.isMultiple(of: 2) {
+                try pipe.fileHandleForWriting.write(contentsOf: Data(#"{"type":"result","subtype":"success"}"#.utf8 + [0x0A]))
+                try pipe.fileHandleForWriting.close()
+            } else {
+                // 进程退出先到（`terminationHandler` 调 `finish()`）。
+                reader.finish()
+                try pipe.fileHandleForWriting.close()
+            }
+            wait(for: [finished], timeout: 2)
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+        let after = count()
+        // 泄漏时每次 1 个（+200）；整套测试一起跑时别的用例的后台任务还在开关描述符，留 40 的余量。
+        XCTAssertLessThan(after - before, 40, "200 个 reader 之后多出了 \(after - before) 个描述符")
+        XCTAssertEqual(pipes.count, 200)
+    }
+    #endif
+
     func testClaudeStreamKeepsSessionAndFinalTextWhileIgnoringUnknownLines() throws {
         let pipe = Pipe()
         let finished = expectation(description: "stream finished")

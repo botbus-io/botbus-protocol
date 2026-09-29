@@ -191,4 +191,167 @@ final class ClaudeHookInstallerTests: XCTestCase {
         XCTAssertEqual(process.terminationStatus, 0, "Agent 不在时脚本也必须 exit 0")
         XCTAssertTrue(output.fileHandleForReading.readDataToEndOfFile().isEmpty, "没有意见时不该有输出")
     }
+
+    // MARK: - hook 密钥（v2 脚本）
+
+    /// v1 脚本的原文（加 hook 密钥之前装在用户机器上的那份），升级检测要认得出它、兼容模式要照收它。
+    private static let versionOneScript = """
+    #!/bin/sh
+    # WatchCrew 的 Claude Code hook。由 app 写入，可以整份删掉。
+    # 把 hook 负载原样转给本机 Agent，再把 Agent 的回答原样吐回给 Claude Code。
+    # 无论如何都 exit 0：这个脚本挂在 Claude Code 的主流程上，我们没资格让它失败。
+    set -u
+
+    PORT_FILE="$(dirname "$0")/agent.json"
+    [ -f "$PORT_FILE" ] || exit 0
+    PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\\([0-9]\\{1,\\}\\).*/\\1/p' "$PORT_FILE")
+    [ -n "$PORT" ] || exit 0
+
+    PAYLOAD=$(cat)
+    # 只有"等人点头"那条值得久等（30 分钟）；其余 3 秒足够，超了就当 Agent 不在。
+    case "$PAYLOAD" in
+      *'"PermissionRequest"'*) TIMEOUT=1800 ;;
+      *) TIMEOUT=3 ;;
+    esac
+
+    RESPONSE=$(printf '%s' "$PAYLOAD" | curl -sS --max-time "$TIMEOUT" \\
+      -H 'content-type: application/json' --data-binary @- \\
+      "http://127.0.0.1:$PORT/hooks/claude" 2>/dev/null) || exit 0
+    # 空回答 = 没有意见，Claude Code 回落到它自己的权限弹窗。
+    [ -n "$RESPONSE" ] && printf '%s' "$RESPONSE"
+    exit 0
+    """
+
+    func testScriptSendsSecretHeaderWithoutPuttingItOnTheCommandLine() {
+        let script = ClaudeHookInstaller.script
+        XCTAssertTrue(script.contains("脚本版本 \(ClaudeHookInstaller.scriptVersion)"))
+        XCTAssertTrue(script.contains(LocalHookServer.SharedSecret.defaultFileName), "读服务端写的密钥文件")
+        XCTAssertTrue(script.contains("--config \"$SECRET_FILE\""), "密钥经 curl --config 交过去，不进 argv")
+        XCTAssertTrue(script.contains("curl -sS -f "), "非 2xx 当作没意见，错误 body 不吐给 Claude Code")
+        XCTAssertFalse(script.contains("WatchCrew"))
+    }
+
+    /// 装过 v1 脚本、settings 已是全套的机器：只把脚本换成新版，settings 一个字节不动。
+    func testUpgradeRewritesAnOutdatedScriptOnly() throws {
+        try write(foreign)
+        try ClaudeHookInstaller.install(paths: paths, supportDirectory: support)
+        let settingsBefore = try Data(contentsOf: paths.settingsFile)
+        let scriptURL = ClaudeHookInstaller.scriptURL(in: support)
+        try Data(Self.versionOneScript.utf8).write(to: scriptURL)
+        XCTAssertFalse(ClaudeHookInstaller.isScriptCurrent(in: support))
+
+        XCTAssertTrue(try ClaudeHookInstaller.upgradeIfNeeded(paths: paths, supportDirectory: support))
+        XCTAssertTrue(ClaudeHookInstaller.isScriptCurrent(in: support))
+        XCTAssertEqual(try String(contentsOf: scriptURL, encoding: .utf8), ClaudeHookInstaller.script)
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: scriptURL.path))
+        XCTAssertEqual(try Data(contentsOf: paths.settingsFile), settingsBefore, "只换脚本，不重写 settings")
+        XCTAssertFalse(try ClaudeHookInstaller.upgradeIfNeeded(paths: paths, supportDirectory: support), "已是新版就不再动")
+    }
+
+    /// 没装过的用户，支持目录里就算躺着一个旧脚本也不替他装。
+    func testUpgradeLeavesUninstalledUsersAlone() throws {
+        try write(foreign)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        try Data(Self.versionOneScript.utf8).write(to: ClaudeHookInstaller.scriptURL(in: support))
+        XCTAssertFalse(try ClaudeHookInstaller.upgradeIfNeeded(paths: paths, supportDirectory: support))
+        XCTAssertFalse(ClaudeHookInstaller.isScriptCurrent(in: support))
+    }
+
+    /// 真跑一遍生成的脚本（sh + curl）打到真的 hook 服务器上：密钥对了才转发，
+    /// 不对或没有（Linux 必须带）时 Claude Code 收到的是空输出，handler 一次都没被调用。
+    func testGeneratedScriptRoundTripsThroughServerWithSecret() async throws {
+        try ClaudeHookInstaller.install(paths: paths, supportDirectory: support)
+        let seen = Locked<[String]>([])
+        let server = LocalHookServer(supportDirectory: support,
+                                     sharedSecret: .init(enforcement: .required)) { request in
+            seen.withLock { $0.append(request.header(LocalHookServer.SharedSecret.headerName) ?? "") }
+            return .now(.json(#"{"hookSpecificOutput":{"decision":{"behavior":"allow"}}}"#))
+        }
+        addTeardownBlock { await server.stop() }
+        try await server.start()
+        let active = await server.activeSecret
+        let secret = try XCTUnwrap(active)
+
+        let payload = #"{"hook_event_name":"Stop","session_id":"s1"}"#
+        let answered = try runScript(payload: payload)
+        XCTAssertEqual(answered.status, 0)
+        XCTAssertEqual(answered.output, #"{"hookSpecificOutput":{"decision":{"behavior":"allow"}}}"#)
+        XCTAssertEqual(seen.current, [secret], "脚本带上了服务端这一轮的密钥")
+
+        // 密钥文件被换成错的：403，脚本安静地什么都不输出。
+        let secretFile = try XCTUnwrap(server.secretFileURL)
+        try LocalHookServer.writePrivateFile(
+            Data("header = \"\(LocalHookServer.SharedSecret.headerName): \(String(repeating: "0", count: 64))\"\n".utf8),
+            to: secretFile)
+        let wrong = try runScript(payload: payload)
+        XCTAssertEqual(wrong.status, 0)
+        XCTAssertEqual(wrong.output, "", "被拒时不能把错误吐给 Claude Code")
+
+        // 密钥文件没了（等于老脚本不带头）：必须带的服务端照样拒。
+        try FileManager.default.removeItem(at: secretFile)
+        let missing = try runScript(payload: payload)
+        XCTAssertEqual(missing.status, 0)
+        XCTAssertEqual(missing.output, "")
+        XCTAssertEqual(seen.current.count, 1, "被拒的请求没到 handler")
+    }
+
+    /// macOS 兼容模式：没有密钥文件（老版本 Agent）时脚本不带头，服务端照收；
+    /// 同一个模式下 v1 老脚本（从不带头）也照收。
+    func testGeneratedScriptWorksWithoutSecretInCompatibilityMode() async throws {
+        try ClaudeHookInstaller.install(paths: paths, supportDirectory: support)
+        let seen = Locked<[String?]>([])
+        let server = LocalHookServer(supportDirectory: support,
+                                     sharedSecret: .init(enforcement: .whenPresent)) { request in
+            seen.withLock { $0.append(request.header(LocalHookServer.SharedSecret.headerName)) }
+            return .now(.json(#"{"ok":true}"#))
+        }
+        addTeardownBlock { await server.stop() }
+        try await server.start()
+        let secretFile = try XCTUnwrap(server.secretFileURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secretFile.path))
+
+        let withSecret = try runScript(payload: #"{"hook_event_name":"Stop"}"#)
+        XCTAssertEqual(withSecret.output, #"{"ok":true}"#)
+
+        try FileManager.default.removeItem(at: secretFile)
+        let without = try runScript(payload: #"{"hook_event_name":"Stop"}"#)
+        XCTAssertEqual(without.output, #"{"ok":true}"#)
+        XCTAssertEqual(seen.current.count, 2)
+        XCTAssertNotNil(seen.current[0])
+        XCTAssertNil(seen.current[1], "没有密钥文件就不带头")
+
+        // 还没升级的 v1 脚本：从不带头，兼容模式下照收；必须带的模式下 403 且输出为空（不会把错误当 hook 输出）。
+        try Data(Self.versionOneScript.utf8).write(to: ClaudeHookInstaller.scriptURL(in: support))
+        let legacy = try runScript(payload: #"{"hook_event_name":"Stop"}"#)
+        XCTAssertEqual(legacy.output, #"{"ok":true}"#)
+        XCTAssertEqual(seen.current.count, 3)
+
+        await server.stop()
+        let strict = LocalHookServer(supportDirectory: support, sharedSecret: .init(enforcement: .required)) { _ in
+            .now(.json(#"{"ok":true}"#))
+        }
+        addTeardownBlock { await strict.stop() }
+        try await strict.start()
+        let rejected = try runScript(payload: #"{"hook_event_name":"Stop"}"#)
+        XCTAssertEqual(rejected.status, 0)
+        XCTAssertEqual(rejected.output, "", "老脚本没有 curl -f，403 必须是空 body")
+    }
+
+    /// 跑支持目录里的脚本，stdin 喂 hook 负载，返回退出码与 stdout。
+    private func runScript(payload: String) throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [ClaudeHookInstaller.scriptURL(in: support).path]
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        try process.run()
+        input.fileHandleForWriting.write(Data(payload.utf8))
+        try input.fileHandleForWriting.close()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        try? output.fileHandleForReading.close()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
 }

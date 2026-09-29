@@ -162,6 +162,8 @@ public struct DshTranscriptDecoder: Sendable {
         do {
             try process.run()
         } catch {
+            try? stdout.fileHandleForReading.close()
+            try? stdout.fileHandleForWriting.close()
             throw ConnectorError("起不了 node：\(error.localizedDescription)")
         }
         let timer = DispatchWorkItem { if process.isRunning { process.terminate() } }
@@ -169,6 +171,8 @@ public struct DshTranscriptDecoder: Sendable {
         let data: Data = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let data = (try? stdout.fileHandleForReading.readToEnd()) ?? Data()
+                // 读完就关：Linux 的 Foundation 不会在 EOF 时替你关读端，每读一次会话记录就漏一个描述符。
+                try? stdout.fileHandleForReading.close()
                 process.waitUntilExit()
                 continuation.resume(returning: data)
             }

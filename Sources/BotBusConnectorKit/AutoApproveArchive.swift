@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 
 /// `~/Library/Application Support/BotBus/auto-approve.json` 的读写：开了「自动批准」（协议 3.3）的项目路径。
@@ -8,7 +10,7 @@ import BotBusProtocol
 /// 读取整段容错：文件不在、JSON 坏了都只是当作一个都没开——宁可多问一次，也不能让 Agent 起不来。
 public enum AutoApproveArchive {
     public static let currentVersion = 1
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "auto-approve")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "auto-approve")
 
     private struct File: Codable {
         var version: Int

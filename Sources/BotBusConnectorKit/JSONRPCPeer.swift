@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 
 public extension JSONValue {
     /// 单行 JSON（键排序、不转义 `/`），给按行分帧的 ACP 用。字符串里的换行会被转义，不会断行。
@@ -81,7 +83,7 @@ public actor JSONRPCPeer {
 
     /// 单行上限。`session/load` 重放带图的历史时一行可能很大，但不能无上限地攒。
     public static let maxLineBytes = 16 * 1024 * 1024
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "jsonrpc")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "jsonrpc")
 
     private let send: @Sendable (String) -> Void
     private var buffer = Data()

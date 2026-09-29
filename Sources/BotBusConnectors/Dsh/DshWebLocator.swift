@@ -1,4 +1,12 @@
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(WinSDK)
+import WinSDK
+#endif
 import Foundation
 import BotBusConnectorKit
 
@@ -94,18 +102,39 @@ public enum DshWebLocator {
 
 /// 用 libproc 与 sysctl 枚举：`proc_listallpids` → 同 uid 的 → `KERN_PROCARGS2` 读 argv 与环境变量；
 /// 端口用 `PROC_PIDLISTFDS` + `PROC_PIDFDSOCKETINFO` 找处于 LISTEN 的 TCP socket。只读，不需要额外权限（同用户进程）。
+///
+/// Linux 上读 `/proc`：`/proc/<pid>` 的属主就是进程的 uid，`cmdline` / `environ` 是 `\0` 分隔的 argv 与环境变量；
+/// 端口是 `/proc/<pid>/fd` 里 `socket:[inode]` 的 inode，到 `/proc/<pid>/net/tcp{,6}` 里找处于 LISTEN（`0A`）的那几行。
 public struct SystemDshProcessListing: DshProcessListing {
     public init() {}
 
     public func processes() -> [DshProcessInfo] {
+        #if canImport(Darwin)
         let uid = getuid()
         return Self.allPids().compactMap { pid in
             guard pid > 0, Self.owner(of: pid) == uid, let (arguments, environment) = Self.arguments(of: pid) else { return nil }
             return DshProcessInfo(pid: pid, arguments: arguments, environment: environment)
         }
+        #elseif os(Linux)
+        let uid = getuid()
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: "/proc")) ?? []
+        return entries.compactMap { Int32($0) }.sorted().compactMap { pid in
+            var info = stat()
+            guard pid > 0, stat("/proc/\(pid)", &info) == 0, info.st_uid == uid,
+                  let cmdline = FileManager.default.contents(atPath: "/proc/\(pid)/cmdline") else { return nil }
+            // 内核线程与僵尸进程的 cmdline 是空的：读不到命令行，跳过（与 Apple 那边一致）。
+            let arguments = Self.splitNulTerminated(Array(cmdline))
+            guard !arguments.isEmpty else { return nil }
+            let environ = FileManager.default.contents(atPath: "/proc/\(pid)/environ").map(Array.init) ?? []
+            return DshProcessInfo(pid: pid, arguments: arguments, environment: Self.environment(from: environ))
+        }
+        #else
+        return []
+        #endif
     }
 
     public func listeningPorts(pid: Int32) -> [Int] {
+        #if canImport(Darwin)
         let fdSize = MemoryLayout<proc_fdinfo>.stride
         let bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
         guard bytes > 0 else { return [] }
@@ -128,8 +157,83 @@ public struct SystemDshProcessListing: DshProcessListing {
             if port > 0 { ports.insert(port) }
         }
         return ports.sorted()
+        #elseif os(Linux)
+        let directory = "/proc/\(pid)/fd"
+        let fds = (try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? []
+        var inodes: Set<String> = []
+        for fd in fds {
+            guard let target = try? FileManager.default.destinationOfSymbolicLink(atPath: directory + "/" + fd),
+                  target.hasPrefix("socket:["), target.hasSuffix("]") else { continue }
+            inodes.insert(String(target.dropFirst("socket:[".count).dropLast()))
+        }
+        guard !inodes.isEmpty else { return [] }
+        var ports: Set<Int> = []
+        for table in ["tcp", "tcp6"] {
+            guard let data = FileManager.default.contents(atPath: "/proc/\(pid)/net/\(table)") else { continue }
+            ports.formUnion(Self.listeningPorts(procNetTCP: String(decoding: data, as: UTF8.self), inodes: inodes))
+        }
+        return ports.sorted()
+        #else
+        return []
+        #endif
     }
 
+    /// 拆 `/proc/net/tcp` 或 `tcp6` 的内容（单测用）：状态是 LISTEN（`0A`）、inode 在 `inodes` 里、
+    /// 本地地址是回环或全零的那些行的端口。地址是按 32 位字、主机字节序（小端）写的十六进制。
+    static func listeningPorts(procNetTCP text: String, inodes: Set<String>) -> [Int] {
+        var ports: Set<Int> = []
+        for line in text.split(separator: "\n").dropFirst() {
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard fields.count > 9, fields[3] == "0A", inodes.contains(String(fields[9])) else { continue }
+            let local = fields[1].split(separator: ":")
+            guard local.count == 2, let port = Int(local[1], radix: 16), port > 0,
+                  let address = procNetAddress(local[0]), isLoopbackOrAny(address) else { continue }
+            ports.insert(port)
+        }
+        return ports.sorted()
+    }
+
+    /// `0100007F` → [127, 0, 0, 1]；tcp6 的 32 位十六进制同理，每 8 位一个小端的 32 位字。
+    private static func procNetAddress(_ hex: Substring) -> [UInt8]? {
+        guard hex.count == 8 || hex.count == 32 else { return nil }
+        var bytes: [UInt8] = []
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let end = hex.index(index, offsetBy: 8)
+            guard let word = UInt32(hex[index..<end], radix: 16) else { return nil }
+            bytes += withUnsafeBytes(of: word.littleEndian) { Array($0) }
+            index = end
+        }
+        return bytes
+    }
+
+    /// 127.0.0.0/8、::1、0.0.0.0、::、::ffff:127.x.x.x（全零的也接受回环连接）。
+    private static func isLoopbackOrAny(_ raw: [UInt8]) -> Bool {
+        if raw.count == 4 { return raw.allSatisfy { $0 == 0 } || raw[0] == 127 }
+        let any = raw.allSatisfy { $0 == 0 }
+        let loopback = raw.dropLast().allSatisfy { $0 == 0 } && raw.last == 1
+        let mapped = raw.prefix(10).allSatisfy { $0 == 0 } && raw[10] == 0xff && raw[11] == 0xff && raw[12] == 127
+        return any || loopback || mapped
+    }
+
+    /// `\0` 结尾的一串串（`/proc/<pid>/cmdline`、`environ`）。
+    static func splitNulTerminated(_ bytes: [UInt8]) -> [String] {
+        var parts = bytes.split(separator: 0, omittingEmptySubsequences: false).map { String(decoding: $0, as: UTF8.self) }
+        if parts.last == "" { parts.removeLast() }
+        return parts
+    }
+
+    /// 环境变量里没有 `=` 的项跳过。
+    static func environment(from bytes: [UInt8]) -> [String: String] {
+        var environment: [String: String] = [:]
+        for entry in splitNulTerminated(bytes) where !entry.isEmpty {
+            guard let equals = entry.firstIndex(of: "=") else { continue }
+            environment[String(entry[..<equals])] = String(entry[entry.index(after: equals)...])
+        }
+        return environment
+    }
+
+    #if canImport(Darwin)
     /// 127.0.0.0/8、::1、0.0.0.0、::（后两者也接受回环连接）。
     static func isLoopbackOrAny(_ inet: in_sockinfo) -> Bool {
         if inet.insi_vflag & UInt8(INI_IPV4) != 0 {
@@ -172,6 +276,7 @@ public struct SystemDshProcessListing: DshProcessListing {
         guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 else { return nil }
         return parseProcArgs(Array(buffer.prefix(size)))
     }
+    #endif
 
     /// 拆 `KERN_PROCARGS2` 的字节（单测用）。环境变量里没有 `=` 的项跳过。
     static func parseProcArgs(_ bytes: [UInt8]) -> ([String], [String: String])? {

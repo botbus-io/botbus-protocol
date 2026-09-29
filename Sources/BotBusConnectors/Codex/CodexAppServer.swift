@@ -1,6 +1,8 @@
 import Foundation
 import BotBusConnectorKit
+#if canImport(os)
 import os
+#endif
 
 /// 一个已经在跑的 `codex app-server` 子进程。**这就是测试用的注入缝**：
 /// 生产实现是 `CodexSubprocess`（`Foundation.Process` + 三根管子），测试实现是内存里的假管子，
@@ -63,7 +65,7 @@ public actor CodexAppServer {
     public static let maxTrackedThreads = 256
     public static let eventBufferLimit = 512
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "codexappserver")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "codexappserver")
 
     /// 会把某个线程变成"由本机驱动"的方法：发过这些，重启后就该把它 resume 回来。
     private static let threadControllingMethods: Set<String> = [

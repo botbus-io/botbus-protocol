@@ -207,6 +207,19 @@ public struct AgentFrame: Codable, Hashable, Sendable {
     }
 }
 
+/// Agent → Relay 的 WebSocket 帧：确认收到命令。
+///
+/// Agent 解密并派发命令后立即发 ack，不等执行完成。Relay 收到后从队列移除该命令。
+public struct RelayAckFrame: Codable, Hashable, Sendable {
+    public enum FrameType: String, Codable, Sendable { case ack }
+    public var type: FrameType
+    public var commandIds: [String]
+    public init(commandIds: [String]) {
+        self.type = .ack
+        self.commandIds = commandIds
+    }
+}
+
 /// Relay → Agent 的 WebSocket 帧。
 public struct RelayFrame: Codable, Hashable, Sendable {
     public enum FrameType: String, Codable, Sendable { case command }

@@ -1,11 +1,13 @@
+#if canImport(ImageIO)
 import CoreGraphics
-import Foundation
 import ImageIO
 import UniformTypeIdentifiers
+import zlib
+#endif
+import Foundation
 import XCTest
 @testable import BotBusConnectorKit
 @testable import BotBusConnectors
-import zlib
 import BotBusProtocol
 
 /// 线程安全的小盒子，测试里跨任务收集数据。
@@ -145,6 +147,8 @@ enum TestImage {
     static var png: Data { Data(base64Encoded: pngBase64)! }
     static var pngDataURL: String { "data:image/png;base64,\(pngBase64)" }
 
+    // 现编图片要 ImageIO / zlib，只有 Apple 平台有；Linux 上的用例只用上面那张现成的 PNG。
+    #if canImport(ImageIO)
     /// 一张全黑的 8 位灰度 PNG，尺寸随意、字节很少（1 亿像素的也只有一百来 KB）。
     /// 逐行喂给 zlib 流式压缩，不在内存里摊开整张像素——测像素上限不必真的吃掉 100 MB。
     static func blankPNG(width: Int, height: Int) -> Data {
@@ -209,4 +213,5 @@ enum TestImage {
         pump(Z_FINISH)
         return output
     }
+    #endif
 }

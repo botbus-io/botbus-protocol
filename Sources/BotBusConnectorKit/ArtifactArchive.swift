@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 
 /// 挂在任务上的一件产物，加上预览的来源键（同一任务同一端口/目录重新分享时靠它找到旧的那条替换掉）。
@@ -14,7 +16,7 @@ public struct StoredArtifact: Codable, Hashable, Sendable {
 /// 读取整段容错：文件不在、JSON 坏了、某一件产物的形状将来变了，都只是少几条，绝不让 Agent 起不来。
 public enum ArtifactArchive {
     public static let currentVersion = 1
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "artifacts")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "artifacts")
 
     private struct File: Codable {
         var version: Int

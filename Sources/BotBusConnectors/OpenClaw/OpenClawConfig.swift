@@ -75,12 +75,20 @@ public struct OpenClawConfig: Sendable, Equatable {
     static func portValue(_ raw: Any?) -> Int? {
         let number: Int?
         switch raw {
-        case let value as NSNumber where CFGetTypeID(value) != CFBooleanGetTypeID(): number = value.intValue
+        case let value as NSNumber where !Self.isCFBoolean(value): number = value.intValue
         case let value as String: number = Int(value.trimmingCharacters(in: .whitespaces))
         default: number = nil
         }
         guard let number, (1...65535).contains(number) else { return nil }
         return number
+    }
+
+    private static func isCFBoolean(_ value: NSNumber) -> Bool {
+        #if canImport(Darwin)
+        return CFGetTypeID(value) == CFBooleanGetTypeID()
+        #else
+        return value === (true as NSNumber) || value === (false as NSNumber)
+        #endif
     }
 
     /// 密钥只认字符串。整串是 `${NAME}` 的按 OpenClaw 的环境变量替换规则展开；SecretRef 对象解不了，给 nil。

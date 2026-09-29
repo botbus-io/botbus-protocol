@@ -1,6 +1,8 @@
 import Foundation
 import BotBusConnectorKit
+#if canImport(os)
 import os
+#endif
 
 /// 反向扩展的监听端（spec「反向扩展」）：agent 自己的进程连 `~/.botbus/run/acp.sock`，
 /// 先发 `_botbus/hello`，通过后这条连接上的 ACP 消息全交给对应的 `AcpConnector`（经 `AcpHub`）。
@@ -20,7 +22,7 @@ public final class AcpReverseServer: @unchecked Sendable {
     public static var defaultSocketPath: String {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".botbus/run/acp.sock").path
     }
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "acp")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "acp")
 
     private let server: UnixSocketServer
     private let connections: ConnectionSet

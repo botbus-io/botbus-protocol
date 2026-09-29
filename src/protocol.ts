@@ -239,7 +239,22 @@ export const TaskMessages = z.object({
  */
 export const ConnectorKind = z.enum(["codex", "claude", "hermes", "pi", "openclaw", "acp", "dsh"]);
 export const ConnectorStatus = z.enum(["ok", "degraded", "error"]);
-export const AgentPlatform = z.enum(["macos"]);
+/**
+ * Agent 所在平台：`macos` / `linux` / `windows`（后两个 3.5 起）。开集：任何字符串都透传（不拒收整份快照），
+ * 包括空串——与 Swift / Kotlin 一致，都解成「其他」，手机按「其他系统」显示。
+ */
+export const AgentPlatform = z.string();
+
+/**
+ * 协议 3.5：宿主能力。每个键都是可选布尔，缺省 = 支持（现在的 Mac 整个对象都不报；Linux 报
+ * `remoteControl: false, previews: false`）。不认得的键忽略（zod 默认剥掉），以后加能力不用改 Relay。
+ */
+export const HostCapabilities = z.object({
+  remoteControl: z.boolean().optional(),
+  previews: z.boolean().optional(),
+  fetchFile: z.boolean().optional(),
+  fetchChanges: z.boolean().optional(),
+});
 
 /** 协议 3.2：手机上能选的一个模型；`defaultEffort` 必须是 `efforts` 里的一个。 */
 export const ModelOption = z
@@ -310,6 +325,8 @@ export const AgentInfo = z.object({
   projectsRoot: z.string().optional(),
   /** 协议 3.4：能从手机开 worktree 会话、能 mergeWorktree。只写 true。 */
   worktrees: z.literal(true).optional(),
+  /** 协议 3.5：宿主能力；省略 = 全部支持。 */
+  capabilities: HostCapabilities.optional(),
 });
 
 // ---- Snapshot ----
@@ -636,6 +653,7 @@ export const KeyEnvelope = z.object({
 export const AgentFrame = z.object({ type: z.literal("event"), event: SealedEvent });
 /** 协议 3.0：Agent 连上后的第一帧，只用来标就绪、换 hello。 */
 export const AgentReadyFrame = z.object({ type: z.literal("ready") });
+export const AgentAckFrame = z.object({ type: z.literal("ack"), commandIds: z.array(z.string()) });
 export const RelayFrame = z.object({ type: z.literal("command"), command: SealedCommand });
 /**
  * 每次连上后 Relay 告诉 Agent 它属于哪个组；Agent 下次连接带 `X-Pair-Hint`，跳过全局 Directory。
@@ -789,6 +807,7 @@ export type Project = z.infer<typeof Project>;
 export type ConnectorKind = z.infer<typeof ConnectorKind>;
 export type ConnectorInfo = z.infer<typeof ConnectorInfo>;
 export type AgentInfo = z.infer<typeof AgentInfo>;
+export type HostCapabilities = z.infer<typeof HostCapabilities>;
 export type Snapshot = z.infer<typeof Snapshot>;
 export type CommandResult = z.infer<typeof CommandResult>;
 export type Command = z.infer<typeof Command>;

@@ -5,7 +5,13 @@ import BotBusProtocol
 @testable import BotBusConnectors
 
 final class AcpHubTests: XCTestCase {
-    private let project = FileManager.default.temporaryDirectory.path
+    /// 临时目录下的子目录，不直接用临时目录：Linux 上它就是 `/tmp`，本身"不算项目"
+    /// （`OutsideProjectRule.systemDirectories`），对账不会把它报成项目。
+    private let project: String = {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("botbus-acp-hub-tests", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url.path
+    }()
 
     private func spec(_ id: String, origin: AcpAgentSpec.Origin = .registry,
                       arguments: [String] = []) -> AcpAgentSpec {

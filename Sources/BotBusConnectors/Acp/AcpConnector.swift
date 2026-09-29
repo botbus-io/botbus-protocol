@@ -1,6 +1,10 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
+#if canImport(UniformTypeIdentifiers)
 import UniformTypeIdentifiers
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -46,7 +50,7 @@ public actor AcpConnector {
     /// 超出的只留任务记录，要看时再 `session/load`。
     static let maxTranscripts = 100
     static let releaseRetryDelay: TimeInterval = 1
-    static let log = Logger(subsystem: "io.botbus.agent", category: "acp")
+    static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "acp")
 
     /// 健康回报。`handshakeFailed` 只在确定对方不是（能用的）ACP agent 时为 true：进程起不来、握手完成前就退出、
     /// `initialize` 回的不是 ACP、协议版本不对。`initialize` **超时不算**——登录时冷启动的 node agent 可能超过
@@ -1004,10 +1008,28 @@ public actor AcpConnector {
         guard !images.isEmpty else { return [] }
         guard capabilities?.images == true else { throw ConnectorError("这个 Agent 暂不支持发图") }
         return try images.map { url in
-            let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "image/jpeg"
+            let mime: String
+            #if canImport(UniformTypeIdentifiers)
+            mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "image/jpeg"
+            #else
+            mime = Self.mimeType(for: url.pathExtension)
+            #endif
             return AcpImage(base64: try Data(contentsOf: url).base64EncodedString(), mimeType: mime)
         }
     }
+
+    #if !canImport(UniformTypeIdentifiers)
+    private static func mimeType(for ext: String) -> String {
+        switch ext.lowercased() {
+        case "png": return "image/png"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "svg": return "image/svg+xml"
+        case "heic", "heif": return "image/heic"
+        default: return "image/jpeg"
+        }
+    }
+    #endif
 
     static func date(_ timestamp: String) -> Date? { ISO8601DateFormatter().date(from: timestamp) }
 

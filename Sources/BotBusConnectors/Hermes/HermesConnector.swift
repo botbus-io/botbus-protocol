@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -25,7 +27,7 @@ public actor HermesConnector: TaskConnector {
     static let maxSessions = 200
     static let ephemeralPromptVariable = "HERMES_EPHEMERAL_SYSTEM_PROMPT"
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "hermes")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "hermes")
 
     /// 本连接器起过的一个会话。
     struct Session: Sendable {
@@ -406,10 +408,11 @@ public struct HermesSubprocessLauncher: HermesProcessLauncher {
 
         let completion = ExitCoordinator(exit)
         let handle = stdout.fileHandleForReading
-        handle.readabilityHandler = { handle in
+        handle.portableReadabilityHandler = { handle in
             let chunk = handle.availableData
             if chunk.isEmpty {
-                handle.readabilityHandler = nil
+                // 不只摘 handler：Linux 上还得关读端，否则每一轮 hermes 漏一个描述符。
+                handle.finishPortableReading()
                 completion.sawEOF()
             } else {
                 output(chunk)
@@ -418,15 +421,16 @@ public struct HermesSubprocessLauncher: HermesProcessLauncher {
         process.terminationHandler = { process in
             completion.terminated(process.terminationStatus)
             DispatchQueue.global().asyncAfter(deadline: .now() + Self.drainTimeout) {
-                // EOF 迟迟不来：不再等了（之后再到的数据块会被解析器忽略）。
-                handle.readabilityHandler = nil
+                // EOF 迟迟不来：不再等了（之后再到的数据块会被解析器忽略），读端一并收掉。
+                handle.finishPortableReading()
                 completion.sawEOF()
             }
         }
         do {
             try process.run()
         } catch {
-            handle.readabilityHandler = nil
+            handle.finishPortableReading()
+            try? stdout.fileHandleForWriting.close()
             throw error
         }
         return HermesSubprocess(process: process)

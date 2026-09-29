@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -67,7 +69,7 @@ public actor OpenClawConnector: TaskConnector {
         var expiresAt: Date?
     }
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "openclaw")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "openclaw")
 
     private let store: TaskStore
     private let configProvider: @Sendable () -> OpenClawConfig

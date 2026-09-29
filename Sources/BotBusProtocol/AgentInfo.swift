@@ -6,9 +6,41 @@ public enum ConnectorKind: String, Codable, Sendable, CaseIterable {
     case codex, claude, hermes, pi, openclaw, acp, dsh
 }
 
-/// Agent 所在平台。目前只有 macOS，同样遇未知值即拒绝。
-public enum AgentPlatform: String, Codable, Sendable, CaseIterable {
+/// Agent 所在平台（协议 3.5 起加入 `linux`、`windows`）。未知值解码为 `.other`，三端不因新平台拒收整份快照。
+public enum AgentPlatform: RawRepresentable, Codable, Sendable, Hashable {
     case macos
+    case linux
+    case windows
+    /// Future platform not yet known to this build.
+    case other(String)
+
+    public init(rawValue: String) {
+        switch rawValue {
+        case "macos": self = .macos
+        case "linux": self = .linux
+        case "windows": self = .windows
+        default: self = .other(rawValue)
+        }
+    }
+
+    public var rawValue: String {
+        switch self {
+        case .macos: "macos"
+        case .linux: "linux"
+        case .windows: "windows"
+        case .other(let v): v
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self.init(rawValue: raw)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 /// 同一台电脑上一个 Connector 的身份（协议 2.13）：一档 agent 只有 kind；ACP agent 是 `kind = acp` 加上 connectorId。
@@ -207,6 +239,33 @@ public struct ModelOption: Codable, Hashable, Sendable, Identifiable {
     }
 }
 
+/// 协议 3.5：宿主（电脑这一端）的能力。每个键都是可选布尔，**缺省 = 支持**：现在的 Mac 整个对象都不报；
+/// Linux 宿主首版报 `remoteControl: false`（手机不给「电脑屏幕」入口）与 `previews: false`（手机不显示预览）。
+/// 不认得的键一律忽略（以后加能力不用发手机版）；`false` 表示不支持，`true` 与省略同义。
+public struct HostCapabilities: Codable, Sendable, Hashable {
+    /// 远程操作电脑屏幕（`remoteControl` 命令、自动开的远程操作预览）。
+    public var remoteControl: Bool?
+    /// 把本机端口分享成预览（`preview` 产物）。
+    public var previews: Bool?
+    /// 按需取回对话里提到的文件（`fetchFile` 命令）。
+    public var fetchFile: Bool?
+    /// 看未提交的改动（`fetchChanges` 命令）。
+    public var fetchChanges: Bool?
+
+    public init(remoteControl: Bool? = nil, previews: Bool? = nil, fetchFile: Bool? = nil, fetchChanges: Bool? = nil) {
+        self.remoteControl = remoteControl
+        self.previews = previews
+        self.fetchFile = fetchFile
+        self.fetchChanges = fetchChanges
+    }
+
+    /// 缺省（nil）= 支持。
+    public var supportsRemoteControl: Bool { remoteControl ?? true }
+    public var supportsPreviews: Bool { previews ?? true }
+    public var supportsFetchFile: Bool { fetchFile ?? true }
+    public var supportsFetchChanges: Bool { fetchChanges ?? true }
+}
+
 /// 一台已配对的电脑。`online` 与 `lastSeenAt` 由 Relay 按连接状态维护，Agent 上报时分别填 true 与当前时间。
 public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
     /// 一台电脑最多挂这么多 Connector：一档 6 个 + ACP 最多 10 个；空数组是合法的（刚被认领、还没连上过的电脑）。
@@ -225,10 +284,12 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
     public var projectsRoot: String?
     /// 协议 3.4：这台电脑能从手机开 worktree 会话（`startTask.worktree`）、能 `mergeWorktree`。只写 true，nil = 不能。
     public var worktrees: Bool?
+    /// 协议 3.5：宿主能力，见 `HostCapabilities`。nil = 全部支持（现在的 Mac）。
+    public var capabilities: HostCapabilities?
 
     public init(agentId: String, name: String, platform: AgentPlatform = .macos, online: Bool,
                 lastSeenAt: String, appVersion: String, connectors: [ConnectorInfo], projectsRoot: String? = nil,
-                worktrees: Bool? = nil) {
+                worktrees: Bool? = nil, capabilities: HostCapabilities? = nil) {
         self.agentId = agentId
         self.name = name
         self.platform = platform
@@ -238,10 +299,11 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         self.connectors = connectors
         self.projectsRoot = projectsRoot
         self.worktrees = worktrees
+        self.capabilities = capabilities
     }
 
     private enum CodingKeys: String, CodingKey {
-        case agentId, name, platform, online, lastSeenAt, appVersion, connectors, projectsRoot, worktrees
+        case agentId, name, platform, online, lastSeenAt, appVersion, connectors, projectsRoot, worktrees, capabilities
     }
 
     /// 校验集中在这里：Connector 最多 16 个且按 (kind, connectorId) 去重。数量下限没有——空数组合法。
@@ -256,6 +318,7 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         connectors = try container.decode([ConnectorInfo].self, forKey: .connectors)
         projectsRoot = try container.decodeIfPresent(String.self, forKey: .projectsRoot)
         worktrees = try container.decodeIfPresent(Bool.self, forKey: .worktrees)
+        capabilities = try container.decodeIfPresent(HostCapabilities.self, forKey: .capabilities)
 
         guard connectors.count <= Self.maxConnectors else {
             throw DecodingError.dataCorruptedError(

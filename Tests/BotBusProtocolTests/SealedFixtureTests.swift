@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import XCTest
 @testable import BotBusProtocol
@@ -14,9 +13,10 @@ final class SealedFixtureTests: XCTestCase {
     /// 与 `seal-fixtures.mjs` 的 `FIXTURE_ROOT_KEY` 一致：0x00 … 0x1f。
     static let rootKey = try! PairKey(root: Data((0..<32).map { UInt8($0) }))
     static let agentId = "hV3nQ7pLxK2mR8sTfW4bZQ"
-    static let macPrivate = try! Curve25519.KeyAgreement.PrivateKey(
+    // swift-crypto（Linux）的私钥类型不是 Sendable；测试里只读，不会跨线程改。
+    nonisolated(unsafe) static let macPrivate = try! Curve25519.KeyAgreement.PrivateKey(
         rawRepresentation: Data(SHA256.hash(data: Data("botbus-fixture-mac-key".utf8))))
-    static let phonePrivate = try! Curve25519.KeyAgreement.PrivateKey(
+    nonisolated(unsafe) static let phonePrivate = try! Curve25519.KeyAgreement.PrivateKey(
         rawRepresentation: Data(SHA256.hash(data: Data("botbus-fixture-phone-key".utf8))))
 
     static let sealer = PairSealer(pairKey: rootKey, nonce: Sealer.fixtureNonce)

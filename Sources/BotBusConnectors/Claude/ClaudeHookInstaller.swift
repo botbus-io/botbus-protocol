@@ -150,16 +150,26 @@ public enum ClaudeHookInstaller {
         try? FileManager.default.removeItem(at: scriptURL(in: supportDirectory))
     }
 
-    /// 老版本装的是少几个事件的旧套（`StopFailure` / `SessionEnd` 是后来补的）。用户装过——settings 里
-    /// 有我们的条目——却不是全套时，按当前版本重装一遍；没装过的不碰，装 hook 要用户在设置里点头。
-    /// 返回是否重装了。
+    /// 用户装过——settings 里有我们的条目——才升级；没装过的不碰，装 hook 要用户在设置里点头。两种旧装：
+    /// - settings 不是全套（老版本少 `StopFailure` / `SessionEnd`）：按当前版本重装一遍；
+    /// - 脚本不是当前版本（例如 v1 不带 hook 密钥）：只重写脚本，settings 一个字节不动。
+    /// 返回是否改了东西。
     @discardableResult
     public static func upgradeIfNeeded(paths: ClaudePaths, supportDirectory: URL) throws -> Bool {
         let settings = try loadSettings(at: paths.settingsFile)
-        guard hasAnyOfOurs(in: settings),
-              !isInstalled(in: settings, scriptPath: scriptURL(in: supportDirectory).path) else { return false }
-        try install(paths: paths, supportDirectory: supportDirectory)
+        guard hasAnyOfOurs(in: settings) else { return false }
+        if !isInstalled(in: settings, scriptPath: scriptURL(in: supportDirectory).path) {
+            try install(paths: paths, supportDirectory: supportDirectory)
+            return true
+        }
+        guard !isScriptCurrent(in: supportDirectory) else { return false }
+        try writeScript(into: supportDirectory)
         return true
+    }
+
+    /// 支持目录里的脚本和当前版本逐字节相同？整份比较：模板改了哪怕一个字（`scriptVersion` 每次改都要加一）都算旧。
+    static func isScriptCurrent(in supportDirectory: URL) -> Bool {
+        FileManager.default.contents(atPath: scriptURL(in: supportDirectory).path) == Data(script.utf8)
     }
 
     /// 这份 settings 里有没有任何一条本工具的 hook。
@@ -190,19 +200,33 @@ public enum ClaudeHookInstaller {
         return url.path
     }
 
+    /// 脚本模板的版本，写在脚本第二行。改模板就加一：`upgradeIfNeeded` 靠整份比对发现旧脚本，
+    /// 这个数字是给人看的（用户打开脚本知道是哪一版）。
+    /// v1：只带端口；v2：带 hook 密钥（`X-BotBus-Hook-Secret`）、`curl -f`。
+    static let scriptVersion = 2
+
     /// 转发脚本。三条硬要求：**永远 exit 0**、Agent 不在就安静退出、除了 `PermissionRequest`
     /// 都只等 3 秒——它挂在 Claude Code 的主流程上，绝不能因为我们的 app 没开就把用户卡住。
+    ///
+    /// 密钥文件是一行 curl 配置，交给 `curl --config`：密钥不进命令行（同机别的用户 `ps` 看得见 argv）。
+    /// 文件不在（老版本 Agent 在跑）就不带头，macOS 上的服务端照样收。
+    /// `-f`：非 2xx（例如 403）一律当作 Agent 没意见，错误 body 不会被当成 hook 输出吐给 Claude Code。
     static let script = """
     #!/bin/sh
-    # WatchCrew 的 Claude Code hook。由 app 写入，可以整份删掉。
+    # BotBus 的 Claude Code hook（脚本版本 \(scriptVersion)）。由 app 写入，可以整份删掉。
     # 把 hook 负载原样转给本机 Agent，再把 Agent 的回答原样吐回给 Claude Code。
     # 无论如何都 exit 0：这个脚本挂在 Claude Code 的主流程上，我们没资格让它失败。
     set -u
 
-    PORT_FILE="$(dirname "$0")/\(LocalHookServer.portFileName)"
+    DIR=$(dirname "$0")
+    PORT_FILE="$DIR/\(LocalHookServer.portFileName)"
     [ -f "$PORT_FILE" ] || exit 0
     PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\\([0-9]\\{1,\\}\\).*/\\1/p' "$PORT_FILE")
     [ -n "$PORT" ] || exit 0
+
+    # Agent 每次启动换一个随机密钥（请求头 \(LocalHookServer.SharedSecret.headerName)），只有本用户读得到。
+    SECRET_FILE="$DIR/\(LocalHookServer.SharedSecret.defaultFileName)"
+    if [ -r "$SECRET_FILE" ]; then set -- --config "$SECRET_FILE"; else set --; fi
 
     PAYLOAD=$(cat)
     # 只有"等人点头"那条值得久等（30 分钟）；其余 3 秒足够，超了就当 Agent 不在。
@@ -211,7 +235,7 @@ public enum ClaudeHookInstaller {
       *) TIMEOUT=3 ;;
     esac
 
-    RESPONSE=$(printf '%s' "$PAYLOAD" | curl -sS --max-time "$TIMEOUT" \\
+    RESPONSE=$(printf '%s' "$PAYLOAD" | curl -sS -f --noproxy '*' --max-time "$TIMEOUT" "$@" \\
       -H 'content-type: application/json' --data-binary @- \\
       "http://127.0.0.1:$PORT/hooks/claude" 2>/dev/null) || exit 0
     # 空回答 = 没有意见，Claude Code 回落到它自己的权限弹窗。

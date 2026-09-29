@@ -1,6 +1,10 @@
-import CryptoKit
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -38,7 +42,7 @@ public actor DshConnector: TaskConnector {
         LocalHookServer.defaultSupportDirectory.appendingPathComponent("dsh-sessions.json")
     }
 
-    static let log = Logger(subsystem: "io.botbus.agent", category: "dsh")
+    static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "dsh")
 
     public struct Timing: Sendable {
         /// 循环的节拍：web 不在时每拍找一次 web 并扫一次盘；连着时看要不要 ping、重新拉列表。

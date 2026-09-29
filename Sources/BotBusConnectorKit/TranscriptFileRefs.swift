@@ -1,4 +1,12 @@
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(WinSDK)
+import WinSDK
+#endif
 import Foundation
 import BotBusProtocol
 
@@ -192,7 +200,7 @@ public enum TranscriptFileRefs {
     /// POSIX `realpath`：解析全部软链接与 `.`/`..`，不存在就 nil。
     /// 不用 `URL.resolvingSymlinksInPath()`：它会把 `/private/var` 改写成 `/var`，路径不存在时还原样返回。
     public static func realPath(_ path: String) -> String? {
-        guard let resolved = Darwin.realpath(path, nil) else { return nil }
+        guard let resolved = realpath(path, nil) else { return nil }
         defer { free(resolved) }
         return String(cString: resolved)
     }

@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -27,7 +29,7 @@ public actor AcpHub: MultiAgentConnector, MessageReader {
 
     public static let listInterval: TimeInterval = 60
     public static let idleListInterval: TimeInterval = 600
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "acp")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "acp")
 
     public nonisolated var kind: ConnectorKind { .acp }
 
