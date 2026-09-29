@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 
 /// 一个任务当前由谁说了算。
@@ -54,7 +56,7 @@ public actor TaskStore {
         LocalHookServer.defaultSupportDirectory.appendingPathComponent("auto-approve.json")
     }
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "taskstore")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "taskstore")
 
     /// "值得再提醒一次"的身份：状态，加上等待审批/输入时的请求 id（换了请求也要提醒）。
     private struct NotificationKey: Equatable {
@@ -122,6 +124,8 @@ public actor TaskStore {
     private let hiddenTasksURL: URL?
     /// 这台电脑能不能从手机开 worktree 会话（`AgentInfo.worktrees`）：装了 `WorktreeManaging` 才是 true。
     private let supportsWorktrees: Bool
+    /// 宿主平台与能力（协议 3.5），见 `HostIdentity`。
+    private let host: HostIdentity
 
     /// 开了「自动批准」的项目路径（协议 3.3，盖章后的 `projectPath`：worktree 记主仓库）。和产物一样在
     /// `stamped(_:)` 与 `mergedProjects()` 里打到外发的任务与项目上，连接器与观察者不感知；
@@ -134,7 +138,9 @@ public actor TaskStore {
     ///   - autoApproveURL: 自动批准的项目设置；nil = 只在内存里（测试默认）。app 传 `defaultAutoApproveURL`。
     ///   - hiddenTasksURL: 隐藏会话的持久化文件；nil = 只在内存里。app 传 `defaultHiddenTasksURL`。
     ///   - supportsWorktrees: 分发器装了 `WorktreeManaging` 时传 true，快照的 `AgentInfo.worktrees` 随之为 true。
+    ///   - host: 宿主平台与能力（协议 3.5），原样进快照的 `AgentInfo.platform` / `capabilities`。
     public init(identity: AgentIdentity = AgentIdentity(),
+                host: HostIdentity = .mac,
                 connectors: ConnectorRegistry = ConnectorRegistry(),
                 artifactsURL: URL? = nil,
                 phoneTasksURL: URL? = nil,
@@ -148,6 +154,7 @@ public actor TaskStore {
                 systemPermissionInspectionTimeout: TimeInterval = 10,
                 now: @escaping @Sendable () -> Date = { Date() }) {
         self.identity = identity
+        self.host = host
         self.connectors = connectors
         self.outsideProjects = outsideProjects
         self.worktrees = worktrees
@@ -567,11 +574,12 @@ public actor TaskStore {
         let visible = visibleTasks()
         var counts: [ConnectorRef: Int] = [:]
         for task in visible { counts[task.connectorRef, default: 0] += 1 }
-        let me = AgentInfo(agentId: identity.agentId, name: identity.name, platform: .macos, online: true,
+        let me = AgentInfo(agentId: identity.agentId, name: identity.name, platform: host.platform, online: true,
                            lastSeenAt: generatedAt, appVersion: identity.appVersion,
                            connectors: connectors.connectors(taskCounts: counts),
                            projectsRoot: outsideProjects.projectsRoot,
-                           worktrees: supportsWorktrees ? true : nil)
+                           worktrees: supportsWorktrees ? true : nil,
+                           capabilities: host.capabilities)
         return Snapshot(agents: [me], tasks: visible, projects: mergedProjects(),
                         recentResults: [], seq: 0, generatedAt: generatedAt)
     }

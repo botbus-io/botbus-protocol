@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 
 /// 一个来源的只读快照：这一轮在磁盘上看到的全部任务与项目。
@@ -29,7 +31,7 @@ public actor SessionObserver {
     public typealias SourceProvider = @Sendable () -> any SessionSnapshotSource
     public typealias IntervalProvider = @Sendable () async -> TimeInterval
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "sessionobserver")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "sessionobserver")
 
     public let source: TaskSource
     private let store: TaskStore

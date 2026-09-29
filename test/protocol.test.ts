@@ -95,6 +95,7 @@ const SCHEMA: Record<string, ZodType> = {
   "relay-preview-session-response.json": P.PreviewSessionResponse,
   "snapshot-client.json": P.SealedSnapshot,
   "snapshot-dsh.json": P.SealedSnapshot,
+  "snapshot-linux-host.json": P.SealedSnapshot,
   "snapshot-auto-approve.json": P.SealedSnapshot,
   "snapshot-hermes-pi-openclaw.json": P.SealedSnapshot,
   "snapshot-multi-agent.json": P.SealedSnapshot,
@@ -122,12 +123,15 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "agent-info-acp.json": P.AgentInfo,
   "agent-info-models.json": P.AgentInfo,
   "agent-info-worktrees.json": P.AgentInfo,
+  "agent-info-linux.json": P.AgentInfo,
+  "agent-info-other-platform.json": P.AgentInfo,
   "connector-info-unavailable.json": P.ConnectorInfo,
   "snapshot.json": P.Snapshot,
   "snapshot-client.json": P.Snapshot,
   "snapshot-multi-agent.json": P.Snapshot,
   "snapshot-hermes-pi-openclaw.json": P.Snapshot,
   "snapshot-dsh.json": P.Snapshot,
+  "snapshot-linux-host.json": P.Snapshot,
   "snapshot-auto-approve.json": P.Snapshot,
   "task-waiting-approval.json": P.Task,
   "task-waiting-approval-choices.json": P.Task,
@@ -214,9 +218,9 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
 describe("fixture 目录与对照表一一对应", () => {
   it("每个 valid fixture 都在 SCHEMA / PLAIN_SCHEMA 表里，且表里没有已删除的文件", () => {
     expect([...validFixtures.keys()].sort()).toEqual(Object.keys(SCHEMA).sort());
-    expect(validFixtures.size).toBe(74);
+    expect(validFixtures.size).toBe(75);
     expect([...plainFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_SCHEMA).sort());
-    expect(plainFixtures.size).toBe(63);
+    expect(plainFixtures.size).toBe(66);
   });
   it("每个 invalid fixture 都在 MUST_REJECT / PLAIN_MUST_REJECT 表里", () => {
     expect([...invalidFixtures.keys()].sort()).toEqual(Object.keys(MUST_REJECT).sort());
@@ -273,8 +277,29 @@ describe("协议 v2 的新约束", () => {
     expect(P.ConnectorInfo.safeParse({ ...connector, taskCount: 1.5 }).success).toBe(false);
   });
 
-  it("未知的 platform 被拒绝", () => {
-    expect(P.AgentInfo.safeParse({ ...agentInfo, platform: "linux" }).success).toBe(false);
+  it("platform 接受已知与未知值（以后加平台不用改 Relay）", () => {
+    expect(P.AgentInfo.safeParse({ ...agentInfo, platform: "linux" }).success).toBe(true);
+    expect(P.AgentInfo.safeParse({ ...agentInfo, platform: "windows" }).success).toBe(true);
+    expect(P.AgentInfo.safeParse({ ...agentInfo, platform: "haiku" }).success).toBe(true);
+    // 空串也不拒收：与 Swift / Kotlin 一样按「其他」处理，不因一台电脑拒收整份快照。
+    expect(P.AgentInfo.safeParse({ ...agentInfo, platform: "" }).success).toBe(true);
+    expect(P.AgentInfo.parse({ ...agentInfo, platform: "" }).platform).toBe("");
+    // 类型仍要是字符串。
+    expect(P.AgentInfo.safeParse({ ...agentInfo, platform: 1 }).success).toBe(false);
+  });
+
+  it("3.5 capabilities：可选布尔、缺省 = 支持、不认得的键忽略", () => {
+    const linux = plainFixtures.get("agent-info-linux.json") as P.AgentInfo;
+    expect(linux.platform).toBe("linux");
+    expect(P.AgentInfo.parse(linux).capabilities).toEqual({ remoteControl: false, previews: false });
+    expect(P.AgentInfo.parse(agentInfo).capabilities).toBeUndefined();
+    expect(P.AgentInfo.safeParse({ ...agentInfo, capabilities: {} }).success).toBe(true);
+    // 以后加的能力：不拒收，剥掉。
+    const future = P.AgentInfo.parse({ ...agentInfo, capabilities: { remoteControl: false, gpu: true } });
+    expect(future.capabilities).toEqual({ remoteControl: false });
+    // 值必须是布尔。
+    expect(P.AgentInfo.safeParse({ ...agentInfo, capabilities: { previews: "no" } }).success).toBe(false);
+    expect(P.AgentInfo.safeParse({ ...agentInfo, capabilities: null }).success).toBe(false);
   });
 
   it("connectors 允许为空数组（刚被认领、还没连上的 Agent）", () => {

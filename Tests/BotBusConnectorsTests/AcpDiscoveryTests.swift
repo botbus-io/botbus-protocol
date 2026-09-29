@@ -185,4 +185,72 @@ final class AcpDiscoveryTests: XCTestCase {
         try write("my-agent.json", #"{"id":"my-agent","name":"My Agent"}"#)
         await assertEventually(timeout: 5) { fired.withLock { $0 } >= 1 }
     }
+
+    func testWatcherFiresWhenManifestRemoved() async throws {
+        try write("my-agent.json", #"{"id":"my-agent","name":"My Agent"}"#)
+        let fired = Locked(0)
+        let watcher = AcpManifestWatcher(directory: directory, debounce: 0.05) { fired.withLock { $0 += 1 } }
+        watcher.start()
+        defer { watcher.stop() }
+        try await Task.sleep(for: .milliseconds(300))
+        fired.withLock { $0 = 0 }
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("my-agent.json"))
+        await assertEventually(timeout: 5) { fired.withLock { $0 } >= 1 }
+    }
+
+    func testStoppedWatcherStaysQuiet() async throws {
+        let fired = Locked(0)
+        let watcher = AcpManifestWatcher(directory: directory, debounce: 0.05) { fired.withLock { $0 += 1 } }
+        watcher.start()
+        watcher.stop()
+        try write("my-agent.json", #"{"id":"my-agent","name":"My Agent"}"#)
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertEqual(fired.current, 0)
+    }
+
+    #if !canImport(CoreServices)
+    /// 一口气写好几个清单只回调一次：调用方每次回调都要重新 discover，不该被连着叫。
+    /// 只在 inotify 这边断言：FSEvents 自己会把一批事件拆成前后两批送来，那不是去抖该管的。
+    func testWatcherDebouncesABurstIntoOneCallback() async throws {
+        let fired = Locked(0)
+        let watcher = AcpManifestWatcher(directory: directory, debounce: 0.3) { fired.withLock { $0 += 1 } }
+        watcher.start()
+        defer { watcher.stop() }
+        try await Task.sleep(for: .milliseconds(300))
+        for index in 0..<5 { try write("agent-\(index).json", #"{"id":"agent-\#(index)","name":"A"}"#) }
+        await assertEventually(timeout: 5) { fired.withLock { $0 } >= 1 }
+        try await Task.sleep(for: .milliseconds(800))
+        XCTAssertEqual(fired.current, 1)
+    }
+
+    /// inotify 用不了时的退路：每隔一会儿比一次目录清单与 mtime / 大小 / inode。
+    func testPollingWatcherSeesAddRewriteRemoveAndRecreatedDirectory() async throws {
+        let fired = Locked(0)
+        let watcher = AcpManifestWatcher(directory: directory, debounce: 0.05, pollInterval: 0.1, forcePolling: true) {
+            fired.withLock { $0 += 1 }
+        }
+        watcher.start()
+        defer { watcher.stop() }
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(fired.current, 0, "启动时已有的东西不算变化")
+
+        try write("my-agent.json", #"{"id":"my-agent","name":"My Agent"}"#)
+        await assertEventually(timeout: 3) { fired.withLock { $0 } >= 1 }
+
+        fired.withLock { $0 = 0 }
+        try write("my-agent.json", #"{"id":"my-agent","name":"My Agent Renamed"}"#)
+        await assertEventually(timeout: 3) { fired.withLock { $0 } >= 1 }
+
+        fired.withLock { $0 = 0 }
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("my-agent.json"))
+        await assertEventually(timeout: 3) { fired.withLock { $0 } >= 1 }
+
+        try FileManager.default.removeItem(at: directory)
+        await assertEventually(timeout: 3) { FileManager.default.fileExists(atPath: self.directory.path) }
+        try await Task.sleep(for: .milliseconds(300))
+        fired.withLock { $0 = 0 }
+        try write("again.json", #"{"id":"again","name":"Again"}"#)
+        await assertEventually(timeout: 3) { fired.withLock { $0 } >= 1 }
+    }
+    #endif
 }

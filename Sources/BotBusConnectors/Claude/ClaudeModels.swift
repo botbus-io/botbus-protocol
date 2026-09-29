@@ -44,10 +44,16 @@ enum ClaudeModels {
         let output = Pipe()
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return nil }
+        do { try process.run() } catch {
+            try? output.fileHandleForReading.close()
+            try? output.fileHandleForWriting.close()
+            return nil
+        }
         let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3, execute: timeout)
         let data = output.fileHandleForReading.readDataToEndOfFile()
+        // 读完就关：Linux 的 Foundation 不会在 EOF 时替你关读端。
+        try? output.fileHandleForReading.close()
         process.waitUntilExit()
         timeout.cancel()
         guard process.terminationStatus == 0,

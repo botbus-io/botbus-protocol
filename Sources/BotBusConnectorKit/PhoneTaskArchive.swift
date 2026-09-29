@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 
 /// `~/Library/Application Support/BotBus/phone-tasks.json` 的读写：手机发起过的任务 id → 第一次见到的时间。
@@ -11,7 +13,7 @@ import BotBusProtocol
 /// 读取整段容错：文件不在、JSON 坏了都只是列表变短，绝不让 Agent 起不来。
 public enum PhoneTaskArchive {
     public static let currentVersion = 1
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "phone-tasks")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "phone-tasks")
 
     private struct File: Codable {
         var version: Int

@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 
 /// `~/Library/Application Support/BotBus/hidden-tasks.json` 的读写：手机「合并并结束」后隐藏的会话（协议 3.4），
@@ -11,7 +13,7 @@ public enum HiddenTaskArchive {
     public static let currentVersion = 1
     /// 最多记多少条，超了丢最早隐藏的：很久以前的会话早已沉到观察器的列表底下。
     public static let limit = 2000
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "hidden-tasks")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "hidden-tasks")
 
     private struct File: Codable {
         var version: Int

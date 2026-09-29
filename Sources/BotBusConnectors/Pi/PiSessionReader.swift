@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -420,7 +422,7 @@ enum PiTimestamp {
             return (try? fractional.parse(string)) ?? (try? plain.parse(string))
         case let number as NSNumber:
             // JSONSerialization 把 true/false 也给成 NSNumber，别把它当成 1970 年。
-            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            guard !isCFBoolean(number) else { return nil }
             let value = number.doubleValue
             guard value > 0 else { return nil }
             // 大于 1e11 的按毫秒（秒级要到 5138 年才有这么大）。
@@ -428,6 +430,14 @@ enum PiTimestamp {
         default:
             return nil
         }
+    }
+
+    private static func isCFBoolean(_ value: NSNumber) -> Bool {
+        #if canImport(Darwin)
+        return CFGetTypeID(value) == CFBooleanGetTypeID()
+        #else
+        return value === (true as NSNumber) || value === (false as NSNumber)
+        #endif
     }
 }
 

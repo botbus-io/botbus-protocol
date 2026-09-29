@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -71,7 +73,7 @@ public actor CodexConnector: TaskConnector {
     /// 回给"本 Agent 不实现这个请求"的 JSON-RPC 错误码（method not found）。
     public static let unsupportedRequestCode = -32601
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "codexconnector")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "codexconnector")
 
     public let kind: ConnectorKind = .codex
 

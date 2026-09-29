@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -65,7 +67,7 @@ public actor CodexObserver {
     /// 每轮现取：设置里的轮询间隔改了不需要重启循环。间隔的合法区间由调用方保证（设置页限制在 1…30 秒）。
     public typealias IntervalProvider = @Sendable () async -> TimeInterval
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "codexobserver")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "codexobserver")
 
     private let store: TaskStore
     private let availability: AvailabilityProvider

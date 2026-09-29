@@ -1,6 +1,60 @@
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(WinSDK)
+import WinSDK
+#endif
 import Foundation
+#if canImport(os)
 import os
+#endif
+
+// MARK: - Platform shims
+
+/// Wrap platform-divergent POSIX calls so call sites stay clean.
+/// On Darwin these are trivially forwarded; on Linux they adjust types / missing APIs.
+#if canImport(Darwin)
+@inline(__always) private func platformSocket(_ domain: Int32, _ type: Int32, _ proto: Int32) -> Int32 {
+    Darwin.socket(domain, type, proto)
+}
+@inline(__always) private func platformClose(_ fd: Int32) -> Int32 {
+    Darwin.close(fd)
+}
+@inline(__always) private func platformConnect(_ fd: Int32, _ addr: UnsafePointer<sockaddr>, _ len: socklen_t) -> Int32 {
+    Darwin.connect(fd, addr, len)
+}
+@inline(__always) private func platformWrite(_ fd: Int32, _ buf: UnsafeRawPointer, _ nbyte: Int) -> Int {
+    Darwin.write(fd, buf, nbyte)
+}
+@inline(__always) private func platformRead(_ fd: Int32, _ buf: UnsafeMutableRawPointer?, _ nbyte: Int) -> Int {
+    Darwin.read(fd, buf, nbyte)
+}
+#elseif canImport(Glibc) || canImport(Musl)
+@inline(__always) private func platformSocket(_ domain: Int32, _ type: Int32, _ proto: Int32) -> Int32 {
+    socket(domain, type, proto)
+}
+@inline(__always) private func platformClose(_ fd: Int32) -> Int32 {
+    close(fd)
+}
+@inline(__always) private func platformConnect(_ fd: Int32, _ addr: UnsafePointer<sockaddr>, _ len: socklen_t) -> Int32 {
+    connect(fd, addr, len)
+}
+/// Linux 没有 `SO_NOSIGPIPE`，而 swift-corelibs-foundation 并不会替进程忽略 SIGPIPE：
+/// 对端关了再 `write` 会把整个进程打死。socket 上用 `send(MSG_NOSIGNAL)`，只返回 EPIPE。
+@inline(__always) private func platformWrite(_ fd: Int32, _ buf: UnsafeRawPointer, _ nbyte: Int) -> Int {
+    send(fd, buf, nbyte, Int32(MSG_NOSIGNAL))
+}
+@inline(__always) private func platformRead(_ fd: Int32, _ buf: UnsafeMutableRawPointer?, _ nbyte: Int) -> Int {
+    read(fd, buf, nbyte)
+}
+/// 不阻塞地再读一次（fd 本身是阻塞的，见 `UnixSocketConnection.drainAfterRead`）。
+@inline(__always) private func platformReadNow(_ fd: Int32, _ buf: UnsafeMutableRawPointer?, _ nbyte: Int) -> Int {
+    recv(fd, buf, nbyte, Int32(MSG_DONTWAIT))
+}
+#endif
 
 /// 本机 Unix socket 监听（反向扩展用，spec「反向扩展 → 连接」）。目录 0700、socket 0600，另外按
 /// `getpeereid` 只收同一用户的进程：权限位之外再挡一道。
@@ -9,7 +63,7 @@ import os
 public final class UnixSocketServer: @unchecked Sendable {
     /// fd 用完（EMFILE / ENFILE）时暂停接受这么久：读事件源是电平触发的，不停下来就是空转。
     public static let acceptBackoff: TimeInterval = 1
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "acp")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "acp")
 
     private let path: String
     private let onConnection: @Sendable (UnixSocketConnection) -> Void
@@ -50,7 +104,7 @@ public final class UnixSocketServer: @unchecked Sendable {
                 // 只有监听端非阻塞：一次事件里 accept 到 EAGAIN 为止。
                 _ = fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) | O_NONBLOCK)
             } catch {
-                Darwin.close(descriptor)
+                platformClose(descriptor)
                 throw error
             }
             let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
@@ -61,7 +115,7 @@ public final class UnixSocketServer: @unchecked Sendable {
             source.setEventHandler {
                 Self.acceptPending(descriptor, source: source, queue: queue, throttle: throttle, onConnection: onConnection)
             }
-            source.setCancelHandler { Darwin.close(descriptor) }
+            source.setCancelHandler { platformClose(descriptor) }
             self.source = source
             source.resume()
         }
@@ -110,14 +164,32 @@ public final class UnixSocketServer: @unchecked Sendable {
             // macOS 上 accept 出来的 socket 继承监听端的 O_NONBLOCK：写要阻塞到写完，读由 DispatchSource 触发。
             _ = fcntl(client, F_SETFL, fcntl(client, F_GETFL) & ~O_NONBLOCK)
             configure(client)
-            var uid: uid_t = 0
-            var gid: gid_t = 0
-            guard getpeereid(client, &uid, &gid) == 0, uid == geteuid() else {
-                Darwin.close(client)
+            guard verifyPeerIdentity(client) else {
+                platformClose(client)
                 continue
             }
             onConnection(UnixSocketConnection(descriptor: client))
         }
+    }
+
+    /// 检查对端进程是否和自己同一用户。Darwin 用 `getpeereid`，Linux（Glibc / Musl）用 `SO_PEERCRED`。
+    /// 其余平台没有实现就一律拒绝：认不出对端是谁的连接不能放进来。
+    private static func verifyPeerIdentity(_ fd: Int32) -> Bool {
+        #if canImport(Darwin)
+        var uid: uid_t = 0
+        var gid: gid_t = 0
+        guard getpeereid(fd, &uid, &gid) == 0, uid == geteuid() else { return false }
+        return true
+        #elseif canImport(Glibc) || canImport(Musl)
+        // ucred is not exported by Swift's Glibc overlay; read the raw struct layout:
+        // struct ucred { pid_t pid; uid_t uid; gid_t gid; } — 12 bytes, uid at offset 4.
+        var buf = (Int32(0), UInt32(0), UInt32(0)) // (pid, uid, gid)
+        var len = socklen_t(MemoryLayout.size(ofValue: buf))
+        guard getsockopt(fd, SOL_SOCKET, Int32(SO_PEERCRED), &buf, &len) == 0 else { return false }
+        return buf.1 == geteuid()
+        #else
+        return false
+        #endif
     }
 
     // MARK: - 小工具
@@ -125,7 +197,9 @@ public final class UnixSocketServer: @unchecked Sendable {
     public static func address(_ path: String) throws -> sockaddr_un {
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
+        #if canImport(Darwin)
         address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        #endif
         let bytes = Array(path.utf8)
         guard !bytes.isEmpty, bytes.count < MemoryLayout.size(ofValue: address.sun_path) else {
             throw POSIXError(.ENAMETOOLONG)
@@ -138,7 +212,12 @@ public final class UnixSocketServer: @unchecked Sendable {
     }
 
     public static func makeSocket() throws -> Int32 {
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        #if canImport(Glibc)
+        // Glibc 把 SOCK_STREAM 导成枚举；Musl 与 Darwin 上它就是 Int32。
+        let descriptor = platformSocket(AF_UNIX, Int32(SOCK_STREAM.rawValue), 0)
+        #else
+        let descriptor = platformSocket(AF_UNIX, SOCK_STREAM, 0)
+        #endif
         guard descriptor >= 0 else { throw posixError() }
         configure(descriptor)
         return descriptor
@@ -147,8 +226,12 @@ public final class UnixSocketServer: @unchecked Sendable {
     /// 不让 agent 子进程继承这些 fd；对端关了再写返回 EPIPE 而不是给整个进程发 SIGPIPE。
     public static func configure(_ descriptor: Int32) {
         _ = fcntl(descriptor, F_SETFD, FD_CLOEXEC)
+        #if canImport(Darwin)
         var on: Int32 = 1
         _ = setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+        #else
+        // Linux 没有 SO_NOSIGPIPE：写路径（`platformWrite`）改用 `send(MSG_NOSIGNAL)`。
+        #endif
     }
 
     public static func posixError(_ code: Int32 = errno) -> POSIXError {
@@ -182,11 +265,11 @@ public final class UnixSocketServer: @unchecked Sendable {
 
     private static func isListening(_ path: String) -> Bool {
         guard let descriptor = try? makeSocket() else { return false }
-        defer { Darwin.close(descriptor) }
+        defer { platformClose(descriptor) }
         guard var address = try? address(path) else { return false }
         let connected = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                platformConnect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
         return connected == 0
@@ -219,7 +302,7 @@ public final class UnixSocketConnection: @unchecked Sendable {
 
     deinit {
         // 从没 start 过、也没 close 过（start 之后读事件源一直持有 self，走不到这里）。
-        if !closed { Darwin.close(descriptor) }
+        if !closed { platformClose(descriptor) }
     }
 
     /// 以客户端身份连一个 socket（测试与 `botbus agent` 自检用）。
@@ -229,12 +312,12 @@ public final class UnixSocketConnection: @unchecked Sendable {
             var address = try UnixSocketServer.address(path)
             let connected = withUnsafePointer(to: &address) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    platformConnect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
                 }
             }
             guard connected == 0 else { throw UnixSocketServer.posixError() }
         } catch {
-            Darwin.close(descriptor)
+            platformClose(descriptor)
             throw error
         }
         return UnixSocketConnection(descriptor: descriptor)
@@ -254,7 +337,7 @@ public final class UnixSocketConnection: @unchecked Sendable {
             source.setEventHandler { self.readAvailable(onData) }
             let descriptor = self.descriptor
             let writeQueue = self.writeQueue
-            source.setCancelHandler { writeQueue.async { Darwin.close(descriptor) } }
+            source.setCancelHandler { writeQueue.async { platformClose(descriptor) } }
             self.source = source
             source.resume()
             return false
@@ -275,7 +358,7 @@ public final class UnixSocketConnection: @unchecked Sendable {
                 guard let base = raw.baseAddress else { return true }
                 var offset = 0
                 while offset < raw.count {
-                    let written = Darwin.write(self.descriptor, base + offset, raw.count - offset)
+                    let written = platformWrite(self.descriptor, base + offset, raw.count - offset)
                     if written > 0 {
                         offset += written
                     } else if written < 0, errno == EINTR {
@@ -308,24 +391,49 @@ public final class UnixSocketConnection: @unchecked Sendable {
         }
         guard let taken else { return }
         // 到这里 fd 一定还开着：只有把 `closed` 置真的这一次调用会走到这里，fd 要等下面的取消之后才关。
-        shutdown(descriptor, SHUT_RDWR)
+        shutdown(descriptor, Int32(SHUT_RDWR))
         if let source = taken.source {
             source.cancel()
         } else {
             let descriptor = self.descriptor
-            writeQueue.async { Darwin.close(descriptor) }
+            writeQueue.async { platformClose(descriptor) }
         }
         taken.onClose?()
     }
 
     private func readAvailable(_ onData: @Sendable (Data) -> Void) {
-        let count = readBuffer.withUnsafeMutableBytes { read(descriptor, $0.baseAddress, $0.count) }
+        let count = readBuffer.withUnsafeMutableBytes { platformRead(descriptor, $0.baseAddress, $0.count) }
         if count > 0 {
             onData(Data(readBuffer[0..<count]))
+            #if !canImport(Darwin)
+            drainAfterRead(onData)
+            #endif
         } else if count == 0 {
             close()
         } else if errno != EINTR, errno != EAGAIN {
             close()
         }
     }
+
+    #if !canImport(Darwin)
+    /// Linux 的 libdispatch 对带 `EPOLLHUP` 的事件只通知一次：对端把最后一段数据和关闭一起送到（agent 写完就整个
+    /// close 掉 socket）时，上面那次读走数据之后，再也等不到读出 EOF 的那次事件，连接就永远不收尾。
+    /// 所以读到数据后接着不阻塞地读到 EAGAIN 为止，EOF 在这一轮里就能看见。
+    private func drainAfterRead(_ onData: @Sendable (Data) -> Void) {
+        while true {
+            let count = readBuffer.withUnsafeMutableBytes { platformReadNow(descriptor, $0.baseAddress, $0.count) }
+            if count > 0 {
+                onData(Data(readBuffer[0..<count]))
+            } else if count == 0 {
+                close()
+                return
+            } else if errno == EINTR {
+                continue
+            } else {
+                if errno != EAGAIN, errno != EWOULDBLOCK { close() }
+                return
+            }
+        }
+    }
+    #endif
 }

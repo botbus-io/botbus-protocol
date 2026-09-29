@@ -93,7 +93,12 @@ final class SQLiteDatabaseTests: XCTestCase {
         XCTAssertEqual(try journalModeByte(at: path), 2, "主文件必须仍然是 WAL 模式")
 
         let reader = try SQLiteDatabase(path: path)
+        #if canImport(Darwin)
         XCTAssertTrue(reader.usedImmutableFallback, "应当走 immutable=1 兜底")
+        #else
+        // Linux 发行版自带的 libsqlite3 只读连接会自己建 -shm，正常路径就打得开，用不上兜底；
+        // 这里只守"读得出来"这一条。
+        #endif
         let rows = try reader.query("SELECT id, note FROM t ORDER BY id")
         XCTAssertEqual(rows.count, 3)
         XCTAssertEqual(rows[0]["note"], .text("one"))

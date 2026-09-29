@@ -1,0 +1,48 @@
+{
+  "agents": [
+    {
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "online": true,
+      "lastSeenAt": "2026-09-29T08:30:00Z",
+      "sealed": "Aekmh4kP6vzlHzk7cKjMfww57UFoGNo0wnqkBNEoEUjKF_mzGTLkqcFCVPeX_fo5zzwfCw_BbHobDqs3JVnHYKnMBDgQTVc1L2R1SnimOHjqVycrAYnXLic_BvHflBOe8KHEO_M3p4noxeqXP4dceP3wey5DOVtrv_yUZIAgkVxxE6c6gifLPhnBF73oLpmRKntKTYeiZCniAvRf7ek6bSYn2MT84ipFQKsXNK8Pkb4vr1zmxfeLWpIdt1v88082vtq4pNIIAhZHsf-CqSFKUP6bddY1zvDt1G7NzRWGSLdkjkpPR4RBseVaPzp3SsVXCCMocveyJ1TeG323wALPww-IMd_MZFJIhmr6jlPvwSrSYrcCvsnnwOQgZPolWeTy7PWEglBF7T-xO84"
+    },
+    {
+      "agentId": "Lx4pQ9wN2rT7vB3kZmD8cA",
+      "online": true,
+      "lastSeenAt": "2026-09-29T08:30:00Z",
+      "sealed": "AYClNInA4rO-KeQpl-o8KMB2jyH3IA3fIsaEspId1eWH6iMGMOrE0n4OqGeQq-hdK8NR18131G9us_JFziwYYWZgn6ifYJjM8w-E9kdy0QvXnVJqf4BPuenAC9wV0O6iosfSqeqd7ClXvB_eswSkRyAzjM9xoe8XmliseCGmj8olFyB9tfTxxXW7lYeEkXs2P0pmsJVxlslNJfIKS6DvH2Wk6soXz4dLdEvHRZnUWaMYkM1dBoCXzp9LPQAOI4yRURF2IMxWxHZtJE5FOjoePie3zmiZ3idhI6GIE8aUC6O2y9dnOeHVQGZYfGtivE3mAira4jqG3kvIOW81a79ous7W-ck00r8lQb--j-tx7pN5ijRWvVFbFCgwxf2sDwmdQbI0dw-72Ol1s-YxLZYMZeOk7X7lyY440Y7_ui-oFjRdkoCrSjQ0QdG3EeIOfvmN4g0rOdz6chr9OX7Py9SaCVaORqE"
+    },
+    {
+      "agentId": "Wn5cJ2dP7xL9qS4vG1hT6b",
+      "online": false,
+      "lastSeenAt": "2026-09-28T22:10:00Z",
+      "sealed": "Ae-qkjmoCVh9iNLiwwS2krUvpa0vu2TaHszFZp1GI00fbu0liGr6jS9-kQ7iSfIH4SKFKa8fr8RWcrWtheEplaS9__Cug1EgkfoJrdwGsdkYP7nPyOZ2od5xuA03XdFp5isXV1cCNagUtWTrj0U49JraAEe6cITZcmjxLZTKRN0gVm6RuDFxbLyIYdCe9bKMMFWjmIHWPaHonh5NN82GZu99ZuvsrzMPVCI0bJrIFwQh2zwo-0Sj7mkHC59xPMAJt_lL0g"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "claude:0b7d3e9f-1a2c-4d5e-8f6a-7b8c9d0e1f2a",
+      "agentId": "Lx4pQ9wN2rT7vB3kZmD8cA",
+      "updatedAt": "2026-09-29T08:29:00Z",
+      "sealed": "Ac48q6WWEy_lxhWGU4YQxwnOkHHPb06PAuGtobg7FzQlmsgfmKWyaUIxDDgNcyn9Y43iC_roHbgI-Z3EAFNNEtdfnRhbstGZLYUHEcNHD9H2g05I54XCrdE7xmDNdm1dgm2e63bp91iBwL0Zq1alI7UD19hT_Nr_fd7vhMCR_M4pAlt_y_R_MdCY0FQ0Kr-KiW_--yhJgr5QoXeFjgB0wgCXtzj6bGuYbBuIS6LyUDQ5x9C2D5i4p78IGnhJONEFJbVr-kNM2wKrobBFVuVcHtl_N5It1BrXtslOefajacOhvSDaEim44Lqb8XXaIIQNhRgzJJMyrFKofBD5YjmzjyE2MhuQFZT8E5pwkk8fWsy7JLqYm8tgo-teXJHaxCeiM7-OKZLbDlsxSVgrLCMNrfCxI2MeLoqiIW1L9JU2DfWs6dL06E3EV3OZHkTzPgXcinKaACysqFJ3roup5_5T72dQ48gtamUzhFg"
+    }
+  ],
+  "projects": [
+    {
+      "agentId": "Lx4pQ9wN2rT7vB3kZmD8cA",
+      "sealed": "Ac6nzOOR9qdW6hgRfZYAiXUEEY9iGVHzsTfoI7GTD9O6IoiN9Xh-CkFMeQAW817s5PMnxnTJH9ziADYsiB-S5Jc5OA8xTXMhkwIZdR20ZymG2-W1cHkiX5MJK3ayqyTyhWsfsa0Pe3yYTifcmWadXO8-Zl7oQHmblx34p1tZFzUBat9P1JCZYYF9ksU3TVod_ohv7K8Q2kLZ4ChAzgTKec3qwwFDZG4LX7x-gTWS6EJh"
+    },
+    {
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "sealed": "AUy9XH8cn7ZPQIC6hc9QfpJDLozscMwxcwZGIolM7Q"
+    },
+    {
+      "agentId": "Wn5cJ2dP7xL9qS4vG1hT6b",
+      "sealed": "AQQFbFO04KVF-HNE6WRp1xrL6myWX3s79TTtUeDYfQ"
+    }
+  ],
+  "recentResults": [],
+  "recentMessages": [],
+  "seq": 12,
+  "generatedAt": "2026-09-29T08:30:00Z"
+}

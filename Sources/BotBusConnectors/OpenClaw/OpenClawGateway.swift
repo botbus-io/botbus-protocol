@@ -1,6 +1,11 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import BotBusConnectorKit
+#if canImport(os)
 import os
+#endif
 
 /// OpenClaw Gateway 报的错，以及本机这一侧"没连上 / 超时 / 断了"。`message` 是给人看的中文整句，直接进菜单栏与命令回执。
 public struct OpenClawGatewayError: LocalizedError, Hashable, Sendable {
@@ -113,7 +118,7 @@ public actor OpenClawGateway {
         let timer: Task<Void, Never>
     }
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "openclaw")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "openclaw")
 
     /// 事件出口，单一消费者（连接器）。无界缓冲：握手与 `sessions.subscribe` 期间到达的事件先攒着，
     /// 快照落定后再按序消费——文档要求"先装监听再订阅"，攒着就等于装好了。

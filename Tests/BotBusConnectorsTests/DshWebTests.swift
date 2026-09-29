@@ -1,4 +1,6 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#endif
 import XCTest
 @testable import BotBusConnectorKit
 @testable import BotBusConnectors
@@ -464,5 +466,37 @@ final class DshWebLocatorTests: XCTestCase {
         let me = getpid()
         let processes = SystemDshProcessListing().processes()
         XCTAssertTrue(processes.contains { $0.pid == me })
+    }
+
+    /// 本进程自己开一个回环监听，真实枚举要能看见这个端口。
+    func testSystemListingSeesOwnLoopbackListener() async throws {
+        let server = LocalHookServer(supportDirectory: FileManager.default.temporaryDirectory, portFileName: nil) { _ in
+            .now(.noContent)
+        }
+        let port = try await server.start()
+        defer { Task { await server.stop() } }
+        XCTAssertTrue(SystemDshProcessListing().listeningPorts(pid: getpid()).contains(Int(port)))
+    }
+
+    /// Linux 的 `/proc/net/tcp{,6}`：只要 LISTEN、inode 对得上、本地地址是回环或全零的。
+    func testParsesProcNetTCP() {
+        let v4 = """
+          sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+           0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 111 1 0 100 0 0 10 0
+           1: 00000000:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 222 1 0 100 0 0 10 0
+           2: 0F02000A:0FA0 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 333 1 0 100 0 0 10 0
+           3: 0100007F:1F91 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 444 1 0 100 0 0 10 0
+           4: 0100007F:1F92 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 555 1 0 100 0 0 10 0
+        """
+        XCTAssertEqual(SystemDshProcessListing.listeningPorts(procNetTCP: v4, inodes: ["111", "222", "333", "444"]),
+                       [3000, 8080], "10.0.2.15 上的、已建立连接的、别人家 inode 的都不算")
+        let v6 = """
+          sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+           0: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 7 1 0 100 0 0 10 0
+           1: 0000000000000000FFFF00000100007F:1F91 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 8 1 0 100 0 0 10 0
+           2: 000080FE00000000FF00000201000000:1F92 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 9 1 0 100 0 0 10 0
+        """
+        XCTAssertEqual(SystemDshProcessListing.listeningPorts(procNetTCP: v6, inodes: ["7", "8", "9"]), [8080, 8081],
+                       "::1 与 ::ffff:127.0.0.1 算，fe80:: 不算")
     }
 }

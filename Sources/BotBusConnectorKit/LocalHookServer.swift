@@ -1,12 +1,23 @@
 import Foundation
+#if canImport(Network)
 import Network
+#endif
+#if canImport(os)
 import os
+#endif
 
-/// Claude Code 的 hook 脚本 POST 进来的地方：`NWListener` 绑 `127.0.0.1` 的随机高位端口，
+/// Claude Code 的 hook 脚本 POST 进来的地方：监听绑 `127.0.0.1` 的随机高位端口，
 /// 自带一个够用的 HTTP/1.1 解析（只认 POST + Content-Length），端口写进 `agent.json`。不引第三方依赖。
+///
+/// 监听与收发按平台分两份，其余（请求解析、挂起、回写的报文、端口文件）只有这一份：
+/// 有 Network.framework 的平台用 `NWListener`（`LocalHookServer+Network.swift`），
+/// 其余（Linux）用 POSIX socket（`LocalHookServer+POSIX.swift`，系统调用集中在 `LoopbackSocket.swift`）。
 ///
 /// 本机工具服务器（`LocalToolAPI`，给 `botbus` CLI / MCP 用）是同一个实现的另一个实例：
 /// 不写端口文件（地址经环境变量交给 agent），解析层的错误也回 JSON。两个实例互不相干。
+///
+/// **鉴权**：回环挡不住同机的别的用户（Linux 多用户服务器）。Claude hook 实例开 `sharedSecret`：
+/// 每次 `start()` 换一个随机密钥写进 0600 的文件，请求头不对就 403，见 `LocalHookServer+Secret.swift`。
 ///
 /// **为什么要能"挂着不回"**：`PermissionRequest` 这条 hook 会一直阻塞在 HTTP 响应上，
 /// 等手机上点允许或拒绝。所以 handler 除了"立刻回"，还能返回一个 `Hold`，把响应留在半空中，
@@ -25,9 +36,9 @@ public actor LocalHookServer {
     public static let portFileName = "agent.json"
     public static let defaultMaxBodyBytes = 1 << 20
     /// 请求头的上限：hook 负载都在 body 里，头再长也属于不该收的东西。
-    private static let maxHeadBytes = 16 * 1024
-    private static let headSeparator = Data("\r\n\r\n".utf8)
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "hookserver")
+    static let maxHeadBytes = 16 * 1024
+    static let headSeparator = Data("\r\n\r\n".utf8)
+    static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "hookserver")
 
     public typealias Handler = @Sendable (Request) async -> Reply
     /// 解析层（请求行、头、Content-Length、方法）出错时回什么。默认纯文本，工具服务器换成 JSON。
@@ -126,34 +137,60 @@ public actor LocalHookServer {
         case noPortAssigned
     }
 
-    /// `~/Library/Application Support/BotBus`。测试一律注入临时目录，不碰这里。
+    /// Apple: `~/Library/Application Support/BotBus`。
+    /// Linux: `$XDG_DATA_HOME/botbus` or `~/.local/share/botbus`。
+    /// 测试一律注入临时目录，不碰这里。
     public static var defaultSupportDirectory: URL {
+        #if os(Linux)
+        let base: URL
+        if let xdg = ProcessInfo.processInfo.environment["XDG_DATA_HOME"], !xdg.isEmpty {
+            base = URL(fileURLWithPath: xdg, isDirectory: true)
+        } else {
+            base = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".local/share", isDirectory: true)
+        }
+        return base.appendingPathComponent("botbus", isDirectory: true)
+        #else
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
         return base.appendingPathComponent("BotBus", isDirectory: true)
+        #endif
     }
 
-    private let handler: Handler
-    private let supportDirectory: URL
-    private let portFileName: String?
-    private let requestedPort: UInt16?
-    private let maxBodyBytes: Int
-    private let errorResponder: ErrorResponder
-    private let queue = DispatchQueue(label: "io.botbus.agent.hookserver")
-    private let live = LiveConnections()
+    let handler: Handler
+    let supportDirectory: URL
+    let portFileName: String?
+    let requestedPort: UInt16?
+    let maxBodyBytes: Int
+    let errorResponder: ErrorResponder
+    let sharedSecret: SharedSecret?
+    /// 当前这一轮 `start()` 的密钥。只在内存与 0600 的密钥文件里，不进日志。
+    var activeSecret: String?
 
-    private var listener: NWListener?
+    let queue = DispatchQueue(label: "io.botbus.agent.hookserver")
+#if canImport(Network)
+    let live = LiveConnections<NWConnection>()
+    var listener: NWListener?
+#else
+    let live = LiveConnections<SocketConnection>()
+    var listener: SocketListener?
+#endif
+
     /// 实际监听的端口，`start()` 之后有值。
-    public private(set) var port: UInt16?
+    public internal(set) var port: UInt16?
 
-    /// - Parameter portFileName: 端口文件名，写在 `supportDirectory` 下；nil = 不写端口文件。
+    /// - Parameters:
+    ///   - portFileName: 端口文件名，写在 `supportDirectory` 下；nil = 不写端口文件。
+    ///   - sharedSecret: nil = 不鉴权（调用方自己有鉴权，或不对外）。开了就把密钥文件写在端口文件旁边。
     public init(supportDirectory: URL = LocalHookServer.defaultSupportDirectory,
                 portFileName: String? = LocalHookServer.portFileName,
                 maxBodyBytes: Int = LocalHookServer.defaultMaxBodyBytes,
                 requestedPort: UInt16? = nil,
+                sharedSecret: SharedSecret? = nil,
                 errorResponder: @escaping ErrorResponder = { Response.text(status: $0, $1) },
                 handler: @escaping Handler) {
         self.supportDirectory = supportDirectory
+        self.sharedSecret = sharedSecret
         self.portFileName = portFileName
         self.maxBodyBytes = maxBodyBytes
         self.requestedPort = requestedPort
@@ -166,143 +203,25 @@ public actor LocalHookServer {
         portFileName.map { supportDirectory.appendingPathComponent($0) }
     }
 
-    // MARK: - 生命周期
+    // 生命周期（`start()` / `stop()`）、来源校验（`isLoopbackAddress(_:)`）与每条连接的收发按平台实现，
+    // 见 `LocalHookServer+Network.swift` / `LocalHookServer+POSIX.swift`。
 
-    /// 起监听并返回系统分配的端口。端口随后写进端口文件（配置了的话）。
-    @discardableResult
-    public func start() async throws -> UInt16 {
-        guard listener == nil else { throw Failure.alreadyRunning }
+    // MARK: - 每条连接（两个平台共用）
 
-        let parameters = NWParameters.tcp
-        parameters.allowLocalEndpointReuse = false
-        // 绑死 127.0.0.1（端口 .any = 让系统挑）：外面根本连不进来，
-        // 下面 accept 里的 isLoopback 只是万一参数被改坏时的第二道闸。
-        parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: requestedPort.flatMap(NWEndpoint.Port.init(rawValue:)) ?? .any)
-
-        let listener: NWListener
-        do {
-            listener = try NWListener(using: parameters)
-        } catch {
-            throw Failure.listenerFailed(String(describing: error))
-        }
-
-        // ready / failed / cancelled 三条路径抢同一个出口，照例过盒子。
-        let ready = OneShotContinuation<UInt16>()
-        listener.stateUpdateHandler = { [weak listener] state in
-            switch state {
-            case .ready:
-                guard let value = listener?.port?.rawValue, value != 0 else {
-                    ready.resume(throwing: Failure.noPortAssigned)
-                    return
-                }
-                ready.resume(returning: value)
-            case .failed(let error):
-                ready.resume(throwing: Failure.listenerFailed(String(describing: error)))
-            case .cancelled:
-                ready.resume(throwing: Failure.listenerFailed("listener cancelled"))
-            default:
-                break
-            }
-        }
-        listener.newConnectionHandler = { [weak self] connection in
-            guard let self else { connection.cancel(); return }
-            self.accept(connection)
-        }
-        live.reopen()
-        listener.start(queue: queue)
-
-        let assigned: UInt16
-        do {
-            assigned = try await withCheckedThrowingContinuation { ready.install($0) }
-        } catch {
-            listener.stateUpdateHandler = nil
-            listener.newConnectionHandler = nil
-            listener.cancel()
-            throw error
-        }
-
-        self.listener = listener
-        self.port = assigned
-        writePortFile(assigned)
-        return assigned
-    }
-
-    /// 幂等：停监听、掐掉在跑的连接（挂着的响应会因此被放掉）、删端口文件。
-    public func stop() {
-        listener?.stateUpdateHandler = nil
-        listener?.newConnectionHandler = nil
-        listener?.cancel()
-        listener = nil
-        port = nil
-        live.cancelAll()
-        if let portFileURL { try? FileManager.default.removeItem(at: portFileURL) }
-    }
-
-    // MARK: - 来源校验
-
-    /// 第二道闸：监听本来就绑在 127.0.0.1 上，这里再挡一次非回环来源。
-    public nonisolated static func isLoopback(_ endpoint: NWEndpoint) -> Bool {
-        guard case .hostPort(let host, _) = endpoint else { return false }
-        switch host {
-        case .ipv4(let address): return isLoopback(address)
-        case .ipv6(let address): return address.isLoopback || (address.asIPv4.map(isLoopback) ?? false)
-        case .name(let name, _): return isLoopbackAddress(name)
-        @unknown default: return false
-        }
-    }
-
-    /// 文本形式的地址是不是回环。IPv6 的 zone（`%en0`）先去掉，再认 IPv4-mapped（`::ffff:127.0.0.1`）。
-    public nonisolated static func isLoopbackAddress(_ text: String) -> Bool {
-        let bare = String(text.split(separator: "%", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
-        if let v4 = IPv4Address(bare) { return isLoopback(v4) }
-        if let v6 = IPv6Address(bare) { return v6.isLoopback || (v6.asIPv4.map(isLoopback) ?? false) }
-        return bare.caseInsensitiveCompare("localhost") == .orderedSame
-    }
-
-    /// 整个 `127.0.0.0/8` 都是回环。`IPv4Address.isLoopback` 只认 127.0.0.1 一个地址，
-    /// 而 macOS 的 lo0 收下的是整段，别把 127.0.0.53 这种判成外来的。
-    private nonisolated static func isLoopback(_ address: IPv4Address) -> Bool {
-        address.rawValue.first == 127
-    }
-
-    // MARK: - 每条连接
-
-    private nonisolated func accept(_ connection: NWConnection) {
-        guard Self.isLoopback(connection.endpoint) else {
-            Self.log.warning("拒绝非回环来源：\(String(describing: connection.endpoint), privacy: .public)")
-            connection.cancel()
-            return
-        }
-        guard live.add(connection) else { connection.cancel(); return }
-
-        let inFlight = HoldBox()
-        connection.stateUpdateHandler = { state in
-            switch state {
-            case .failed, .cancelled:
-                // 第三条路径：对端走了（或 stop() 掐了连接），把挂着的响应放掉，别让 serve 干等。
-                inFlight.take()?.abandon()
-            default:
-                break
-            }
-        }
-        connection.start(queue: queue)
-        Task { [self] in
-            await serve(connection, inFlight: inFlight)
-            connection.cancel()
-            live.remove(connection)
-        }
-    }
-
-    private nonisolated func serve(_ connection: NWConnection, inFlight: HoldBox) async {
+    nonisolated func serve(_ connection: some HookTransport, inFlight: HoldBox) async {
         let request: Request
         do {
             request = try await readRequest(from: connection)
         } catch let bad as BadRequest {
             // 畸形请求一律好好回个错误码，绝不 crash。
-            await write(errorResponder(bad.status, bad.message), to: connection)
+            await connection.sendFinal(Self.encode(errorResponder(bad.status, bad.message)))
             return
         } catch {
             // 连接层面的错误：对端已经不在了，回什么都没人收。
+            return
+        }
+        if let rejected = await rejection(for: request) {
+            await connection.sendFinal(Self.encode(rejected))
             return
         }
 
@@ -312,11 +231,11 @@ public actor LocalHookServer {
             response = immediate
         case .hold(let hold):
             inFlight.set(hold)
-            watchForDisconnect(connection, hold: hold)
+            connection.watchForDisconnect(hold)
             response = await settle(hold)
             inFlight.clear()
         }
-        await write(response, to: connection)
+        await connection.sendFinal(Self.encode(response))
     }
 
     /// 等一个挂起的响应。超时由同一个 `OneShotContinuation` 兜住——定时器直接往盒子里塞结果，
@@ -330,22 +249,19 @@ public actor LocalHookServer {
         return await hold.value()
     }
 
-    /// 挂起期间对端可能直接走人。`stateUpdateHandler` 只在连接被 reset 时才动，
-    /// 普通的 FIN 要再挂一个 receive 才看得见。
-    private nonisolated func watchForDisconnect(_ connection: NWConnection, hold: Hold) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, isComplete, error in
-            if isComplete || error != nil { hold.abandon() }
-        }
-    }
-
     // MARK: - 最小 HTTP/1.1
 
-    private struct BadRequest: Error {
+    struct BadRequest: Error {
         let status: Int
         let message: String
     }
 
-    private nonisolated func readRequest(from connection: NWConnection) async throws -> Request {
+    struct ReceivedChunk: Sendable {
+        let data: Data
+        let isComplete: Bool
+    }
+
+    private nonisolated func readRequest(from connection: some HookTransport) async throws -> Request {
         var buffer = Data()
         var reachedEOF = false
         var separator = buffer.range(of: Self.headSeparator)
@@ -354,7 +270,7 @@ public actor LocalHookServer {
                 throw BadRequest(status: 431, message: "请求头过长")
             }
             guard !reachedEOF else { throw BadRequest(status: 400, message: "请求头不完整") }
-            guard let chunk = try await receive(on: connection) else {
+            guard let chunk = try await connection.receiveChunk() else {
                 throw BadRequest(status: 400, message: "请求头不完整")
             }
             buffer.append(chunk.data)
@@ -396,7 +312,7 @@ public actor LocalHookServer {
         var body = Data(buffer[separator.upperBound...])
         while body.count < length {
             guard !reachedEOF else { throw BadRequest(status: 400, message: "请求体不完整") }
-            guard let chunk = try await receive(on: connection) else {
+            guard let chunk = try await connection.receiveChunk() else {
                 throw BadRequest(status: 400, message: "请求体不完整")
             }
             body.append(chunk.data)
@@ -409,56 +325,24 @@ public actor LocalHookServer {
         return Request(method: method, target: target, path: path, headers: headers, body: body)
     }
 
-    private struct ReceivedChunk {
-        let data: Data
-        let isComplete: Bool
-    }
-
-    /// 读一段。`nil` = 对端把写端关了。数据与 FIN 可以在同一次回调中到达，必须一起带回解析器。
-    private nonisolated func receive(on connection: NWConnection) async throws -> ReceivedChunk? {
-        let box = OneShotContinuation<ReceivedChunk?>()
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
-            if let data, !data.isEmpty {
-                box.resume(returning: ReceivedChunk(data: data, isComplete: isComplete))
-            } else if isComplete {
-                // 某些 macOS 版本在对端半关闭时同时给出 EOF 和错误；EOF 仍是可回复的坏请求。
-                box.resume(returning: nil)
-            } else if let error {
-                box.resume(throwing: error)
-            } else {
-                // minimumIncompleteLength 是 1，走到这里只可能是对端关了（isComplete）。
-                box.resume(returning: nil)
-            }
-        }
-        return try await withCheckedThrowingContinuation { box.install($0) }
-    }
-
-    private nonisolated func write(_ response: Response, to connection: NWConnection) async {
+    /// 整个响应报文。一条连接一个请求：不做 keep-alive，hook 脚本每次都是新起一条 curl。
+    nonisolated static func encode(_ response: Response) -> Data {
         var head = "HTTP/1.1 \(response.status) \(Self.reason(response.status))\r\n"
         if let contentType = response.contentType, response.status != 204 {
             head += "Content-Type: \(contentType)\r\n"
         }
         // 204 按规范不带 body，也不带 Content-Length。
         if response.status != 204 { head += "Content-Length: \(response.body.count)\r\n" }
-        // 一条连接一个请求：不做 keep-alive，hook 脚本每次都是新起一条 curl。
         head += "Connection: close\r\n\r\n"
 
         var data = Data(head.utf8)
         if response.status != 204 { data.append(response.body) }
-
-        let box = OneShotContinuation<Void>()
-        // HTTP/1.1 一次请求一条连接。先用 FIN 完成写端，再由调用方 cancel；
-        // 对端已半关闭写端时，直接 cancel 可能在较慢的系统上丢掉这个错误响应。
-        connection.send(content: data, isComplete: true, completion: .contentProcessed { error in
-            if let error { box.resume(throwing: error) } else { box.resume(returning: ()) }
-        })
-        // 写失败只意味着对端不在了，没有补救动作。
-        _ = try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            box.install(continuation)
-        }
+        return data
     }
 
-    private nonisolated static func reason(_ status: Int) -> String {
+    // MARK: - 状态码
+
+    nonisolated static func reason(_ status: Int) -> String {
         switch status {
         case 200: "OK"
         case 202: "Accepted"
@@ -483,20 +367,33 @@ public actor LocalHookServer {
 
     private struct PortFile: Codable { var port: Int }
 
-    private func writePortFile(_ port: UInt16) {
+    func writePortFile(_ port: UInt16) {
         guard let portFileURL else { return }
         do {
             try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
             try JSONEncoder().encode(PortFile(port: Int(port))).write(to: portFileURL, options: .atomic)
         } catch {
             // 写不了只是 hook 脚本找不到端口，服务本身照跑——不能因此让 Agent 起不来。
-            Self.log.error("写端口文件失败：\(String(describing: error))")
+            Self.log.error("写端口文件失败：\(String(describing: error), privacy: .public)")
         }
     }
 }
 
+/// 解析层眼里的一条连接：Network.framework 的 `NWConnection` 与 POSIX socket 各实现一份，
+/// 请求解析、挂起与回写只写一遍（`LocalHookServer.serve`）。
+protocol HookTransport: AnyObject, Sendable {
+    /// 读一段。`nil` = 对端把写端关了。数据与 FIN 可以在同一次读中到达（`isComplete`），必须一起带回解析器。
+    func receiveChunk() async throws -> LocalHookServer.ReceivedChunk?
+    /// 写出整个响应并关掉写端（FIN），之后由调用方 `cancel()`。写失败只意味着对端不在了，没有补救动作。
+    func sendFinal(_ data: Data) async
+    /// 挂起期间对端可能直接走人：看到 FIN 或出错就 `abandon()` 这个 hold。
+    func watchForDisconnect(_ hold: LocalHookServer.Hold)
+    /// 关掉连接。挂着的响应要因此被放掉（每个平台在自己的关闭回调里 `abandon()`）。
+    func cancel()
+}
+
 /// 一条连接当前挂着的响应。连接断开与正常回答会同时来碰它，所以加锁。
-private final class HoldBox: @unchecked Sendable {
+final class HoldBox: @unchecked Sendable {
     private let lock = NSLock()
     private var hold: LocalHookServer.Hold?
 
@@ -511,20 +408,20 @@ private final class HoldBox: @unchecked Sendable {
 }
 
 /// 在跑的连接。`stop()` 要把它们一次性掐掉，挂着的响应才会被放掉、serve 的任务才会退出。
-private final class LiveConnections: @unchecked Sendable {
+final class LiveConnections<Connection: HookTransport>: @unchecked Sendable {
     private let lock = NSLock()
-    private var connections: [ObjectIdentifier: NWConnection] = [:]
+    private var connections: [ObjectIdentifier: Connection] = [:]
     private var closed = false
 
     /// 已经在 stop 了就返回 false，调用方直接把连接关掉。
-    func add(_ connection: NWConnection) -> Bool {
+    func add(_ connection: Connection) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard !closed else { return false }
         connections[ObjectIdentifier(connection)] = connection
         return true
     }
 
-    func remove(_ connection: NWConnection) {
+    func remove(_ connection: Connection) {
         lock.lock()
         connections.removeValue(forKey: ObjectIdentifier(connection))
         lock.unlock()

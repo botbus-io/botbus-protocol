@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 
 /// 会话开在 git worktree 里时，它属于哪个项目（协议 2.7 `Task.worktreePath`）。
 ///
@@ -35,7 +37,7 @@ public final class WorktreeResolver: @unchecked Sendable {
         LocalHookServer.defaultSupportDirectory.appendingPathComponent("worktrees.json")
     }
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "worktrees")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "worktrees")
 
     private struct File: Codable {
         var version: Int

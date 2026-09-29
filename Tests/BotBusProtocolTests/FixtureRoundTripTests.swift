@@ -57,6 +57,7 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(Snapshot.self, "plain/snapshot-multi-agent.json"),
         roundTripCase(Snapshot.self, "plain/snapshot-hermes-pi-openclaw.json"),
         roundTripCase(Snapshot.self, "plain/snapshot-dsh.json"),
+        roundTripCase(Snapshot.self, "plain/snapshot-linux-host.json"),
         roundTripCase(Snapshot.self, "plain/snapshot-auto-approve.json"),
     ] }
 
@@ -136,6 +137,8 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(AgentInfo.self, "plain/agent-info-acp.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-models.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-worktrees.json"),
+        roundTripCase(AgentInfo.self, "plain/agent-info-linux.json"),
+        roundTripCase(AgentInfo.self, "plain/agent-info-other-platform.json"),
     ] }
 
     private static var relayCases: [FixtureCase] { [
@@ -252,6 +255,80 @@ final class FixtureRoundTripTests: XCTestCase {
         XCTAssertNil(unavailable.lastError)
 
         try run(Self.agentCases)
+    }
+
+    // 协议 3.5：AgentPlatform 是开集，未知值回落 .other 而不拒收整份快照。
+    func testAgentPlatformUnknownValueDecodesAsOther() throws {
+        let json = """
+        {"agentId":"testId","name":"Test","platform":"haiku","online":false,
+         "lastSeenAt":"2026-09-29T00:00:00Z","appVersion":"1.0","connectors":[]}
+        """.data(using: .utf8)!
+        let info = try ProtocolJSON.decoder().decode(AgentInfo.self, from: json)
+        XCTAssertEqual(info.platform, .other("haiku"), "未知平台应解码为 .other，不应抛出")
+        // 已知值正常解析
+        XCTAssertEqual(AgentPlatform(rawValue: "linux"), .linux)
+        XCTAssertEqual(AgentPlatform(rawValue: "windows"), .windows)
+        XCTAssertEqual(AgentPlatform(rawValue: "macos"), .macos)
+        // rawValue 往返
+        XCTAssertEqual(AgentPlatform.other("freebsd").rawValue, "freebsd")
+        // 编码后再解码保持一致
+        let encoded = try ProtocolJSON.encoder().encode(info)
+        let reDecoded = try ProtocolJSON.decoder().decode(AgentInfo.self, from: encoded)
+        XCTAssertEqual(reDecoded.platform, .other("haiku"))
+
+        // 空串同样按「其他」处理（Relay 的 schema 也不拒收），原样往返。
+        let emptyPlatform = #"{"agentId":"testId","name":"Test","platform":"","online":false,"lastSeenAt":"2026-09-29T00:00:00Z","appVersion":"1.0","connectors":[]}"#
+        let empty = try ProtocolJSON.decoder().decode(AgentInfo.self, from: Data(emptyPlatform.utf8))
+        XCTAssertEqual(empty.platform, .other(""))
+        XCTAssertEqual(AgentPlatform(rawValue: ""), .other(""))
+        let emptyJSON = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(empty)) as! [String: Any]
+        XCTAssertEqual(emptyJSON["platform"] as? String, "")
+    }
+
+    /// 协议 3.5：宿主能力。缺省 = 支持；编码时 nil 的键整个省略；不认得的键忽略。
+    func testHostCapabilities() throws {
+        let linux = try decodeFixture(AgentInfo.self, "plain/agent-info-linux.json")
+        XCTAssertEqual(linux.platform, .linux)
+        let caps = try XCTUnwrap(linux.capabilities)
+        XCTAssertEqual(caps, HostCapabilities(remoteControl: false, previews: false))
+        XCTAssertFalse(caps.supportsRemoteControl)
+        XCTAssertFalse(caps.supportsPreviews)
+        XCTAssertTrue(caps.supportsFetchFile)
+        XCTAssertTrue(caps.supportsFetchChanges)
+
+        let other = try decodeFixture(AgentInfo.self, "plain/agent-info-other-platform.json")
+        XCTAssertEqual(other.platform, .other("freebsd"))
+        XCTAssertEqual(other.capabilities, HostCapabilities(remoteControl: false, previews: false, fetchFile: true,
+                                                            fetchChanges: false))
+        XCTAssertTrue(other.capabilities!.supportsFetchFile)
+        XCTAssertFalse(other.capabilities!.supportsPreviews)
+        XCTAssertFalse(other.capabilities!.supportsFetchChanges)
+
+        let mac = try decodeFixture(AgentInfo.self, "plain/agent-info.json")
+        XCTAssertNil(mac.capabilities, "Mac 不报能力")
+
+        // 编码：nil 的 capabilities 整个键省略；对象里 nil 的键也省略。
+        let macJSON = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(mac)) as! [String: Any]
+        XCTAssertFalse(macJSON.keys.contains("capabilities"))
+        let capsJSON = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(caps)) as! [String: Any]
+        XCTAssertEqual(capsJSON.keys.sorted(), ["previews", "remoteControl"])
+        XCTAssertEqual(capsJSON["remoteControl"] as? Bool, false)
+        XCTAssertEqual(capsJSON["previews"] as? Bool, false)
+        let empty = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(HostCapabilities())) as! [String: Any]
+        XCTAssertTrue(empty.isEmpty)
+
+        // 解码：不认得的键忽略，空对象 = 全部支持。
+        let future = #"{"remoteControl":false,"gpu":true,"sandbox":{"kind":"x"}}"#
+        let decoded = try ProtocolJSON.decoder().decode(HostCapabilities.self, from: Data(future.utf8))
+        XCTAssertEqual(decoded, HostCapabilities(remoteControl: false))
+        let none = try ProtocolJSON.decoder().decode(HostCapabilities.self, from: Data("{}".utf8))
+        XCTAssertTrue(none.supportsRemoteControl && none.supportsPreviews && none.supportsFetchFile && none.supportsFetchChanges)
+
+        // 往返。
+        let info = AgentInfo(agentId: "a", name: "n", platform: .windows, online: true, lastSeenAt: "2026-09-29T00:00:00Z",
+                             appVersion: "1", connectors: [], capabilities: HostCapabilities(previews: false))
+        let again = try ProtocolJSON.decoder().decode(AgentInfo.self, from: ProtocolJSON.encoder().encode(info))
+        XCTAssertEqual(again, info)
     }
 
     func testWorkingChanges() throws {

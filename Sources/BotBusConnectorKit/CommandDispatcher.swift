@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 
 /// 客户端命令的唯一入口：去重、校验目标电脑、按 id 前缀路由到连接器、把一切错误收敛成
@@ -23,7 +25,7 @@ public actor CommandDispatcher {
     /// `CommandResult.error` 的截断长度。协议没规定上限，但没人要看一屏子进程日志。
     public static let errorLimit = 200
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "dispatcher")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "dispatcher")
 
     /// 内部失败。带上已知的 taskId，失败的回执也能被客户端对上号。
     private struct DispatchFailure: Error {

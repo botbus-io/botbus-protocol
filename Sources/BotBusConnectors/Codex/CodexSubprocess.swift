@@ -1,6 +1,8 @@
 import Foundation
 import BotBusConnectorKit
+#if canImport(os)
 import os
+#endif
 
 /// 生产用的启动器：真的 fork 一个 `codex app-server` 出来。
 ///
@@ -47,13 +49,16 @@ final class CodexSubprocess: CodexProcessHandle, @unchecked Sendable {
     /// stderr 只留这么多字节（取末尾）。
     private static let stderrTailLimit = 4096
     private static let exitReasonLimit = 200
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "codexsubprocess")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "codexsubprocess")
 
     private let process = Process()
     private let stdinPipe = Pipe()
     private let stdoutPipe = Pipe()
-    private let stderrPipe = Pipe()
+    /// `forwardStderr` 时没有这根管子（stderr 直接给父进程的），免得白开两个描述符。
+    private let stderrPipe: Pipe?
     private let writeQueue = DispatchQueue(label: "io.botbus.agent.codex.stdin")
+    /// 只在 `writeQueue` 上读写：stdin 的写端关了之后不再写（关掉的 FileHandle 上写会直接崩）。
+    private var stdinClosed = false
     private let lock = NSLock()
     private var stderrTail = Data()
     private let exitBox = OneShotContinuation<CodexProcessExit>()
@@ -73,24 +78,28 @@ final class CodexSubprocess: CodexProcessHandle, @unchecked Sendable {
         process.arguments = arguments
         if let environment { process.environment = environment }
         if let currentDirectory { process.currentDirectoryURL = currentDirectory }
+        let stderrPipe = forwardStderr ? nil : Pipe()
+        self.stderrPipe = stderrPipe
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
-        process.standardError = forwardStderr ? FileHandle.standardError : stderrPipe
+        process.standardError = stderrPipe ?? FileHandle.standardError
 
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+        // 读端读到 EOF 一律 `finishPortableReading()`：Linux 上它顺带关 fd，只摘 handler 的话
+        // 每次重启（进程崩了、ACP agent 空闲关掉又拉起）都漏下上一代的描述符。
+        stdoutPipe.fileHandleForReading.portableReadabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty {
-                handle.readabilityHandler = nil
+                handle.finishPortableReading()
                 outContinuation.finish()
             } else {
                 outContinuation.yield(data)
             }
         }
-        if !forwardStderr {
-            stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        if let stderrPipe {
+            stderrPipe.fileHandleForReading.portableReadabilityHandler = { [weak self] handle in
                 let data = handle.availableData
                 if data.isEmpty {
-                    handle.readabilityHandler = nil
+                    handle.finishPortableReading()
                 } else {
                     self?.appendStderr(data)
                 }
@@ -98,6 +107,15 @@ final class CodexSubprocess: CodexProcessHandle, @unchecked Sendable {
         }
         process.terminationHandler = { [weak self] finished in
             guard let self else { return }
+            // 进程没了：stdin 再写也没人读，写端关掉。stdout / stderr 的读端通常随 EOF 自己关；
+            // 孙进程攥着它们时 EOF 不来，退出后再等 2 秒就不读了（stdout 流此刻已经结束，之后的数据本来就没人要）。
+            self.closeStdin()
+            let stdout = self.stdoutPipe.fileHandleForReading
+            let stderr = self.stderrPipe?.fileHandleForReading
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                stdout.finishPortableReading()
+                stderr?.finishPortableReading()
+            }
             self.stdoutContinuation.finish()
             self.exitBox.resume(returning: CodexProcessExit(status: finished.terminationStatus,
                                                             reason: self.takeStderrTail()))
@@ -106,8 +124,13 @@ final class CodexSubprocess: CodexProcessHandle, @unchecked Sendable {
         do {
             try process.run()
         } catch {
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            // 没起来：四根管子端全关（Linux 上没人替我们关）。
+            stdoutPipe.fileHandleForReading.finishPortableReading()
+            stderrPipe?.fileHandleForReading.finishPortableReading()
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe?.fileHandleForWriting.close()
+            try? stdinPipe.fileHandleForReading.close()
+            closeStdin()
             outContinuation.finish()
             process.terminationHandler = nil
             exitBox.resume(returning: CodexProcessExit(status: -1, reason: "无法启动 \(executablePath)"))
@@ -125,6 +148,10 @@ final class CodexSubprocess: CodexProcessHandle, @unchecked Sendable {
         let box = OneShotContinuation<Void>()
         let handle = stdinPipe.fileHandleForWriting
         writeQueue.async {
+            guard !self.stdinClosed else {
+                box.resume(throwing: CodexAppServerError(.notRunning, "子进程的 stdin 已经关了"))
+                return
+            }
             do {
                 try handle.write(contentsOf: data)
                 box.resume(returning: ())
@@ -137,8 +164,17 @@ final class CodexSubprocess: CodexProcessHandle, @unchecked Sendable {
 
     func terminate() {
         guard process.isRunning else { return }
-        try? stdinPipe.fileHandleForWriting.close()
+        closeStdin()
         process.terminate()
+    }
+
+    /// 幂等。排在已经在队里的写之后关，不会撞上一次正在进行的写。
+    private func closeStdin() {
+        writeQueue.async {
+            guard !self.stdinClosed else { return }
+            self.stdinClosed = true
+            try? self.stdinPipe.fileHandleForWriting.close()
+        }
     }
 
     func waitForExit() async -> CodexProcessExit {

@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -23,7 +25,7 @@ public actor PiConnector: TaskConnector {
     /// 收尾后隔多久再补一次 `releaseLive`，见 `complete(_:releasing:)`。
     static let releaseRetryDelay: TimeInterval = 1
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "pi")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "pi")
 
     /// 一次子进程启动。以启动为单位记账而不是以 session 为单位：id 要等首行才知道，
     /// 而子进程可能在那之前、或在 `start` 还没登记完时就已经结束了。
@@ -372,6 +374,8 @@ public struct PiSubprocessLauncher: PiProcessLauncher {
 /// 两样都到了才报 `onExit`，否则最后几行（`message_end` / `agent_settled`）会在收尾之后才到，白读了。
 final class PiSubprocess: PiProcessHandle, @unchecked Sendable {
     private let process = Process()
+    /// stdout：退出后 EOF 迟迟不来（孙进程攥着）时由 `markExit` 收掉读端。
+    private let output = Pipe()
     private let lock = NSLock()
     private var exitStatus: Int32?
     private var reachedEOF = false
@@ -385,16 +389,17 @@ final class PiSubprocess: PiProcessHandle, @unchecked Sendable {
         process.arguments = request.arguments
         process.environment = request.environment
         process.currentDirectoryURL = URL(fileURLWithPath: request.workingDirectory)
-        let output = Pipe()
+        let output = self.output
         process.standardOutput = output
         // stderr 没人读：给 Pipe 的话写满 64 KB 缓冲 pi 就阻塞了。stdin 同 GUI 进程本来的样子（空）。
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
 
-        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        output.fileHandleForReading.portableReadabilityHandler = { [weak self] handle in
             let chunk = handle.availableData
             if chunk.isEmpty {
-                handle.readabilityHandler = nil
+                // 不只摘 handler：Linux 上还得关读端，否则每一轮 pi 漏一个描述符。
+                handle.finishPortableReading()
                 self?.markEOF()
             } else {
                 onOutput(chunk)
@@ -408,7 +413,8 @@ final class PiSubprocess: PiProcessHandle, @unchecked Sendable {
         do {
             try process.run()
         } catch {
-            output.fileHandleForReading.readabilityHandler = nil
+            output.fileHandleForReading.finishPortableReading()
+            try? output.fileHandleForWriting.close()
             process.terminationHandler = nil
             throw error
         }
@@ -432,8 +438,12 @@ final class PiSubprocess: PiProcessHandle, @unchecked Sendable {
     private func markExit(_ status: Int32) {
         lock.lock(); exitStatus = status; lock.unlock()
         reportIfDone()
-        // 子进程若把 stdout 交给了还活着的孙进程，EOF 可能永远不来；退出后最多再等 2 秒。
-        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { self.markEOF() }
+        // 子进程若把 stdout 交给了还活着的孙进程，EOF 可能永远不来；退出后最多再等 2 秒，
+        // 之后不再读（读端在 Linux 上一并关掉，孙进程再写只会收到 EPIPE）。
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+            self.output.fileHandleForReading.finishPortableReading()
+            self.markEOF()
+        }
     }
 
     private func reportIfDone() {

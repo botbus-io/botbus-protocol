@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -49,7 +51,7 @@ public actor ClaudeConnector: TaskConnector {
     /// 更早的是上一轮留下的，不算。
     static let turnEndSlack: TimeInterval = 2
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "claude")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "claude")
 
     /// 标题从哪来。排后面的顶掉排前面的；Claude 起的名字同级也会被新值顶掉（桌面 app 里改了名）。
     enum TitleSource: Int, Comparable, Sendable {
@@ -1187,7 +1189,8 @@ public actor ClaudeConnector: TaskConnector {
         process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
         let output = Pipe()
         process.standardOutput = output
-        process.standardError = Pipe()
+        // stderr 没人读：给 Pipe 的话写满 64 KB 缓冲 claude 就阻塞了，读端在 Linux 上还会一直开着。
+        process.standardError = FileHandle.nullDevice
         let input = Pipe()
         process.standardInput = input
         let channel = ClaudeControlChannel(handle: input.fileHandleForWriting)
@@ -1213,7 +1216,11 @@ public actor ClaudeConnector: TaskConnector {
         do {
             try process.run()
         } catch {
+            // 没起来：两根管子剩下的三端也关掉（stdin 的写端由 channel 关），Linux 上不会有人替我们关。
             channel.close()
+            try? output.fileHandleForReading.close()
+            try? output.fileHandleForWriting.close()
+            try? input.fileHandleForReading.close()
             throw ConnectorError("起不了 claude：\(error.localizedDescription)")
         }
         reader.start()

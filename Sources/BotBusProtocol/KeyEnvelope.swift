@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 /// 手机 → Mac 的密钥信封（协议 3.0）：把组密钥 K 加密给一台 Mac 的临时 X25519 公钥。

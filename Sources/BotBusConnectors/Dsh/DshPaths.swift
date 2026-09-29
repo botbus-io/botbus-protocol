@@ -193,10 +193,16 @@ extension DshPaths {
         process.standardOutput = stdout
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return nil }
+        guard (try? process.run()) != nil else {
+            try? stdout.fileHandleForReading.close()
+            try? stdout.fileHandleForWriting.close()
+            return nil
+        }
         let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
         DispatchQueue.global().asyncAfter(deadline: .now() + 3, execute: timeout)
         let data = (try? stdout.fileHandleForReading.readToEnd()) ?? Data()
+        // 读完就关：Linux 的 Foundation 不会在 EOF 时替你关读端。
+        try? stdout.fileHandleForReading.close()
         process.waitUntilExit()
         timeout.cancel()
         guard process.terminationStatus == 0 else { return nil }

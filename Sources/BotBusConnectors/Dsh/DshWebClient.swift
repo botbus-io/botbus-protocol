@@ -1,7 +1,11 @@
-import CryptoKit
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import BotBusConnectorKit
+#if canImport(os)
 import os
+#endif
 
 /// 本机一个 `dsh web` 的地址。dsh 要求 Host 是回环地址，cookie 按 `authority` 签，所以一律用 `127.0.0.1:<port>`。
 public struct DshWebEndpoint: Hashable, Sendable {
@@ -101,7 +105,7 @@ public enum DshWebError: Error, LocalizedError, Hashable, Sendable {
 /// 其余是 `request`；`$events/result` 例外，`args` 就是结果本身。回应 `{type:"server-response", rpcId, result:{ok, value | error}}`。
 /// 日志只记方法名与类别，不记参数、回应与 cookie。
 public struct DshWebClient: Sendable {
-    static let log = Logger(subsystem: "io.botbus.agent", category: "dsh")
+    static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "dsh")
 
     public let endpoint: DshWebEndpoint
     private let secret: SymmetricKey

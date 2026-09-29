@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import BotBusProtocol
 
 /// 基于 URLSessionWebSocketTask 的真实传输。
@@ -23,6 +26,11 @@ public final class URLSessionWebSocketTransport: WebSocketTransport {
         let task = session.webSocketTask(with: request)
         task.resume()
         do {
+            #if canImport(FoundationNetworking)
+            // Linux 的 FoundationNetworking（libcurl）不像 Apple 那样把握手前的 ping 排队：升级还没完成就发，
+            // 立刻报 curl 55。先等到 101（或连接失败）再 ping。
+            try await Self.waitForUpgrade(task, timeout: Self.handshakeTimeout)
+            #endif
             try await URLSessionWebSocketConnection.ping(task, timeout: Self.handshakeTimeout)
         } catch {
             task.cancel(with: .abnormalClosure, reason: nil)
@@ -46,6 +54,18 @@ public final class URLSessionWebSocketTransport: WebSocketTransport {
         }
         return connection
     }
+
+    #if canImport(FoundationNetworking)
+    /// 等 WebSocket 升级完成：`response` 出现（101 或被拒的状态码）或任务已结束。超时抛 `.timedOut`，外层取消即停。
+    static func waitForUpgrade(_ task: URLSessionWebSocketTask, timeout: TimeInterval) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while task.response == nil, task.state == .running {
+            guard Date() < deadline else { throw URLError(.timedOut) }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        if let error = task.error { throw error }
+    }
+    #endif
 
     /// 把 wss://…/agent/ws 当普通 https GET 一次，只为拿 HTTP 状态码。
     private func probeStatus(url: URL, headers: [String: String]) async -> Int? {

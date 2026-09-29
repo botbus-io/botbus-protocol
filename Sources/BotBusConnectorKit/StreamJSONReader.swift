@@ -64,9 +64,12 @@ public final class StreamJSONReader: @unchecked Sendable {
     }
 
     public func start() {
-        handle.readabilityHandler = { [weak self] handle in
+        handle.portableReadabilityHandler = { [weak self] handle in
             let chunk = handle.availableData
-            guard let self else { return }
+            guard let self else {
+                handle.finishPortableReading()
+                return
+            }
             if chunk.isEmpty {
                 self.finish()
                 return
@@ -75,7 +78,7 @@ public final class StreamJSONReader: @unchecked Sendable {
         }
     }
 
-    /// 幂等：进程退出与读到 EOF 会各调一次，只有第一次作数。
+    /// 幂等：进程退出与读到 EOF 会各调一次，只有第一次作数。之后不再读，读端交给 `finishPortableReading()` 关。
     public func finish() {
         let callback: (@Sendable (Result) -> Void)?
         let result: Result
@@ -85,7 +88,8 @@ public final class StreamJSONReader: @unchecked Sendable {
             return
         }
         finished = true
-        handle.readabilityHandler = nil
+        // 不只摘 handler：Linux 上还得关掉读端，否则每一轮 `claude -p` 漏一个描述符。
+        handle.finishPortableReading()
         callback = finishedCallback
         // 一行 `result` 都没见到就当失败：正常结束一定有它。
         result = Result(sessionID: sessionID, lastText: lastText, failed: failed || !sawResult)

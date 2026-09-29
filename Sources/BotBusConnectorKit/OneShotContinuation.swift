@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// 独占一个 `CheckedContinuation` 的一次性盒子：谁先 resume 谁生效，其余静默丢弃，线程安全。
 ///

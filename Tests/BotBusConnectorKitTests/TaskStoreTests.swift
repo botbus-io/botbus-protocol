@@ -142,6 +142,35 @@ final class TaskStoreTests: XCTestCase {
         XCTAssertTrue(snapshot.projects.allSatisfy { $0.agentId == Self.agentId })
     }
 
+    /// 协议 3.5：外发的 AgentInfo 带上宿主的平台与能力；Mac（默认）不报 capabilities。
+    func testSnapshotCarriesHostPlatformAndCapabilities() async throws {
+        let mac = await makeStore().snapshot().agents[0]
+        XCTAssertEqual(mac.platform, .macos)
+        XCTAssertNil(mac.capabilities, "Mac 什么能力都不报 = 全部支持")
+
+        let linuxStore = TaskStore(identity: AgentIdentity(agentId: Self.agentId, name: "box", appVersion: "0.9.0"),
+                                   host: .linux, connectors: makeRegistry(), now: { [self] in self.clock })
+        let linux = await linuxStore.snapshot().agents[0]
+        XCTAssertEqual(linux.platform, .linux)
+        XCTAssertEqual(linux.capabilities, HostCapabilities(remoteControl: false, previews: false))
+        XCTAssertEqual(linux.capabilities?.supportsRemoteControl, false)
+        XCTAssertEqual(linux.capabilities?.supportsFetchChanges, true)
+
+        // 线上 JSON：Linux 多一个 capabilities（remoteControl、previews 为 false），Mac 没有这个键。
+        let json = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(linux)) as! [String: Any]
+        XCTAssertEqual(json["platform"] as? String, "linux")
+        XCTAssertEqual(json["capabilities"] as? [String: Bool], ["remoteControl": false, "previews": false])
+        let macJSON = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(mac)) as! [String: Any]
+        XCTAssertNil(macJSON["capabilities"])
+
+        let windows = TaskStore(identity: AgentIdentity(agentId: Self.agentId, name: "pc", appVersion: "0.9.0"),
+                                host: HostIdentity(platform: .windows), connectors: makeRegistry(),
+                                now: { [self] in self.clock })
+        let win = await windows.snapshot().agents[0]
+        XCTAssertEqual(win.platform, .windows)
+        XCTAssertNil(win.capabilities)
+    }
+
     /// 来源报上来的 agentId 一律以本机为准：连接器不该有能力把任务记到别的电脑名下。
     func testForeignAgentIdIsRestampedWithThisMachine() async {
         let store = makeStore()

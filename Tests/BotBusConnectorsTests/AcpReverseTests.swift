@@ -1,4 +1,8 @@
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Foundation
 import XCTest
 import BotBusProtocol
@@ -101,19 +105,26 @@ final class AcpReverseTests: XCTestCase {
         let descriptor = try UnixSocketServer.makeSocket()
         var address = try UnixSocketServer.address(stale)
         let bound = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { systemBind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
         }
         XCTAssertEqual(bound, 0)
-        Darwin.close(descriptor) // 留下一个没人听的 socket 文件
+        close(descriptor) // 留下一个没人听的 socket 文件
         let replacement = UnixSocketServer(path: stale, onConnection: { _ in })
         XCTAssertNoThrow(try replacement.start())
         replacement.stop()
     }
 
-    /// socket 所在目录必须是自己的真目录：软链接、别人的目录（`/tmp` 两样都占）都不行。
+    /// socket 所在目录必须是自己的真目录：软链接、别人的目录（macOS 的 `/tmp` 两样都占）都不行。
     func testSymlinkedOrForeignDirectoryIsRefused() throws {
+        #if os(macOS)
         expectPOSIX(.ENOTDIR) { try UnixSocketServer(path: "/tmp/bb-\(UUID().uuidString.prefix(8)).sock", onConnection: { _ in }).start() }
         expectPOSIX(.EACCES) { try UnixSocketServer(path: "/private/tmp/bb-\(UUID().uuidString.prefix(8)).sock", onConnection: { _ in }).start() }
+        #else
+        // Linux 的 `/tmp` 是 root 的真目录：不是 root 跑的话就是"别人的目录"。root 跑（容器里）什么目录都是自己的，测不了这一条。
+        if geteuid() != 0 {
+            expectPOSIX(.EACCES) { try UnixSocketServer(path: "/tmp/bb-\(UUID().uuidString.prefix(8)).sock", onConnection: { _ in }).start() }
+        }
+        #endif
         let real = directory + "/real"
         try FileManager.default.createDirectory(atPath: real, withIntermediateDirectories: false)
         XCTAssertEqual(symlink(real, directory + "/ln"), 0)
@@ -648,4 +659,13 @@ final class AcpReverseTests: XCTestCase {
         let reply = try await hello(peer)
         XCTAssertEqual(reply["accepted"], false)
     }
+}
+
+/// XCTestCase（NSObject）自己有个 `bind(_:to:withKeyPath:options:)`，裸写 `bind` 会解析到它身上。
+private func systemBind(_ descriptor: Int32, _ address: UnsafePointer<sockaddr>, _ length: socklen_t) -> Int32 {
+    #if canImport(Darwin)
+    Darwin.bind(descriptor, address, length)
+    #else
+    Glibc.bind(descriptor, address, length)
+    #endif
 }

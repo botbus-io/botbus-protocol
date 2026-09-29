@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 /// 端到端加密（协议 3.0，`docs/superpowers/specs/2026-09-26-end-to-end-encryption-design.md`）。

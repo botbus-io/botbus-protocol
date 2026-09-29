@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -12,7 +14,7 @@ import BotBusConnectorKit
 public struct ClaudeMessageReader: MessageReader {
     public var kind: ConnectorKind { .claude }
 
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "claude")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "claude")
     private let paths: @Sendable () -> ClaudePaths
 
     public init(paths: @escaping @Sendable () -> ClaudePaths = { ClaudePaths() }) {

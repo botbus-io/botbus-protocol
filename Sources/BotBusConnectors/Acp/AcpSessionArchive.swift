@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(os)
 import os
+#endif
 import BotBusProtocol
 import BotBusConnectorKit
 
@@ -14,7 +16,7 @@ public actor AcpSessionArchive {
     public static var defaultURL: URL {
         LocalHookServer.defaultSupportDirectory.appendingPathComponent("acp-sessions.json")
     }
-    private static let log = Logger(subsystem: "io.botbus.agent", category: "acp")
+    private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "acp")
 
     private let url: URL?
     private let now: @Sendable () -> Date
