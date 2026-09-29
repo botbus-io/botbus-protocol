@@ -207,6 +207,34 @@ public struct AgentFrame: Codable, Hashable, Sendable {
     }
 }
 
+/// Agent → Relay 的第一帧（协议 3.0）：Relay 收到它才开始发 hello 与命令。
+///
+/// 3.6 起可带 `minClientProtocol`：这台电脑要求手机至少是这个版本（Linux 宿主报 3.5——更早的手机见到
+/// `platform: "linux"` 会拒收整份快照）。它在信封外面：Relay 据此给组里版本不够的手机回 412。省略 = 不要求（Mac）。
+/// 写法必须是 `ProtocolVersion.isWellFormed` 认的版本号，否则解码失败（Relay 整帧不认）。
+public struct AgentReadyFrame: Codable, Hashable, Sendable {
+    public enum FrameType: String, Codable, Sendable { case ready }
+    public var type: FrameType
+    public var minClientProtocol: String?
+
+    public init(minClientProtocol: String? = nil) {
+        self.type = .ready
+        self.minClientProtocol = minClientProtocol
+    }
+
+    private enum CodingKeys: String, CodingKey { case type, minClientProtocol }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        type = try container.decode(FrameType.self, forKey: .type)
+        minClientProtocol = try container.decodeIfPresent(String.self, forKey: .minClientProtocol)
+        if let minClientProtocol, !ProtocolVersion.isWellFormed(minClientProtocol) {
+            throw DecodingError.dataCorruptedError(forKey: .minClientProtocol, in: container,
+                                                   debugDescription: "not a protocol version: \(minClientProtocol)")
+        }
+    }
+}
+
 /// Agent → Relay 的 WebSocket 帧：确认收到命令。
 ///
 /// Agent 解密并派发命令后立即发 ack，不等执行完成。Relay 收到后从队列移除该命令。

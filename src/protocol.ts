@@ -651,8 +651,18 @@ export const KeyEnvelope = z.object({
 
 // ---- WebSocket frames ----
 export const AgentFrame = z.object({ type: z.literal("event"), event: SealedEvent });
-/** 协议 3.0：Agent 连上后的第一帧，只用来标就绪、换 hello。 */
-export const AgentReadyFrame = z.object({ type: z.literal("ready") });
+/**
+ * 协议版本号的写法：两到三段点分整数（`3.5`、`3.10`、`4.0.1`），每段 1–4 位数字。
+ * 与 Swift 的 `ProtocolVersion.isWellFormed` 一致。
+ */
+export const ProtocolVersionString = z.string().regex(/^[0-9]{1,4}(\.[0-9]{1,4}){1,2}$/, "not a protocol version");
+/**
+ * 协议 3.0：Agent 连上后的第一帧，用来标就绪、换 hello。
+ * 3.6 起可带 `minClientProtocol`：这台电脑要求手机至少是这个版本（Linux 宿主报 3.5——更早的手机见到
+ * `platform: "linux"` 会拒收整份快照）。它在信封外面，是 Relay 按组给旧手机回 412 用的路由元数据；
+ * 省略 = 不要求（Mac）。写法不对的整帧不认。
+ */
+export const AgentReadyFrame = z.object({ type: z.literal("ready"), minClientProtocol: ProtocolVersionString.optional() });
 export const AgentAckFrame = z.object({ type: z.literal("ack"), commandIds: z.array(z.string()) });
 export const RelayFrame = z.object({ type: z.literal("command"), command: SealedCommand });
 /**

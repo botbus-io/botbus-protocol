@@ -9,7 +9,7 @@ import Foundation
 ///
 /// 没带版本头的一方按 `legacy` 算：版本头是 2.8 才有的，之前的实现一律视为 2.7。
 public enum ProtocolVersion {
-    public static let current = "3.5"
+    public static let current = "3.6"
     public static let legacy = "2.7"
     /// 本端（Mac、手机、手表）要求 Relay 至少是这个版本。依赖 Relay 新行为的改动发版前，把它抬上去。
     /// 2.10：旧 Relay 会剥掉 TaskRecord / CommandResult 的 systemPermission 字段。
@@ -20,6 +20,10 @@ public enum ProtocolVersion {
     /// 3.0：端到端加密，线上形状全换（密封信封）；2.x 的 Relay 会把密文帧整条拒掉。
     /// （2.15 的 `/agent/devices` 手机表与电脑移除手机一并由这条线盖住。）
     public static let minimumRelay = "3.0"
+    /// 要求手机最低版本的电脑（ready 帧带 `minClientProtocol`，协议 3.6；Linux 宿主）要的 Relay 版本。
+    /// 更早的 Relay 不认这个字段、也不按组回 412：旧手机见到 `platform: "linux"` 会拒收整份快照，只会一直"正在连接"。
+    /// Mac 不带这个字段，照旧只要 `minimumRelay`。
+    public static let minimumRelayForClientMinimum = "3.6"
 
     /// 请求与响应都用这个头报各自的版本。
     public static let header = "X-Protocol-Version"
@@ -31,6 +35,15 @@ public enum ProtocolVersion {
 
     /// 每个请求都要合进去的头。
     public static var requestHeaders: [String: String] { [header: current] }
+
+    /// 版本号写法对不对：两到三段点分整数，每段 1–4 位数字（`3.5`、`3.10`、`4.0.1`）。与 Relay 的 `ProtocolVersionString` 一致。
+    public static func isWellFormed(_ version: String) -> Bool {
+        let segments = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard (2...3).contains(segments.count) else { return false }
+        return segments.allSatisfy { segment in
+            (1...4).contains(segment.count) && segment.allSatisfy { ("0"..."9").contains($0) }
+        }
+    }
 
     /// `a` 是否比 `b` 旧。按点分的整数逐段比（`2.10` 比 `2.9` 新），缺的段当 0，解析不了的段当 0。
     public static func isOlder(_ a: String, than b: String) -> Bool {

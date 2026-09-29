@@ -6,12 +6,29 @@ final class ProtocolVersionTests: XCTestCase {
     /// （2.15 的手机表与电脑移除手机、2.14 的 `questions`、2.13 的 `acp` 等更早的依赖一并由这条线盖住。）
     /// 3.1 只加了 `dsh` 枚举、3.2 只加了模型与思考强度的可选字段、3.3 只加了自动批准的可选字段、3.4 的 worktree 字段与 `mergeWorktree` 命令
     /// 同样都在密文里：Relay 只见密文、不解析它们，所以对 Relay 的要求仍是 3.0。
+    /// 3.6 的 `minClientProtocol` 只有要求手机版本的电脑（Linux）才发，它们另要 Relay 3.6（`minimumRelayForClientMinimum`）。
     func testSealedWireRequiresRelayThatSpeaksIt() {
-        XCTAssertEqual(ProtocolVersion.current, "3.5")
+        XCTAssertEqual(ProtocolVersion.current, "3.6")
         XCTAssertEqual(ProtocolVersion.minimumRelay, "3.0")
         XCTAssertEqual(ProtocolVersion.incompatibility(status: 200, relayVersion: "2.14"), .relayOutdated)
         XCTAssertEqual(ProtocolVersion.incompatibility(status: 200, relayVersion: "2.11"), .relayOutdated)
         XCTAssertNil(ProtocolVersion.incompatibility(status: 200, relayVersion: "3.0"))
+    }
+
+    func testHostsThatRequireANewerPhoneNeedTheRelayThatEnforcesIt() {
+        XCTAssertEqual(ProtocolVersion.minimumRelayForClientMinimum, "3.6")
+        XCTAssertEqual(ProtocolVersion.incompatibility(status: 101, relayVersion: "3.5",
+                                                       minimumRelay: ProtocolVersion.minimumRelayForClientMinimum), .relayOutdated)
+        XCTAssertNil(ProtocolVersion.incompatibility(status: 101, relayVersion: "3.6",
+                                                     minimumRelay: ProtocolVersion.minimumRelayForClientMinimum))
+        XCTAssertFalse(ProtocolVersion.isOlder(ProtocolVersion.current, than: ProtocolVersion.minimumRelayForClientMinimum))
+    }
+
+    func testWellFormedVersions() {
+        for good in ["3.5", "3.10", "4.0.1", "10.2"] { XCTAssertTrue(ProtocolVersion.isWellFormed(good), good) }
+        for bad in ["", "3", "3.", ".5", "3.5.0.1", "v3.5", "3.5-beta", " 3.5", "12345.1", "3..5"] {
+            XCTAssertFalse(ProtocolVersion.isWellFormed(bad), bad)
+        }
     }
 
     func testComparesNumericallyBySegment() {

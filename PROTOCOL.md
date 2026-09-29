@@ -1,6 +1,6 @@
 # BotBus 协议
 
-版本 **3.5**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
+版本 **3.6**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
 
 Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，Kotlin 实现（Android）是 `Protocol.kt`，密封层在同目录的 `Sealing.kt` / `SealedTypes.kt`。在 app 仓库里它们分别位于 `Packages/BotBusProtocol`、`relay/src/protocol.ts` 与 `android/core/src/main/kotlin/io/botbus/core/`；公开仓库 `botbus-io/botbus-protocol` 由 app 仓库自动同步，前两者在那里是 `Sources/BotBusProtocol` 与 `src/protocol.ts`。三端都必须通过 `protocol-fixtures/` 下全部样本的往返测试，且拒绝 `invalid/` 下的样本：顶层是线上的密封形状，`plain/` 是密文里的明文结构（见文末「Fixture 与类型对应」）。Swift 中 `Task` 命名为 `TaskRecord`。
 
@@ -102,7 +102,7 @@ Relay 只解析这些形状（`relay/src/protocol.ts` 的 `Sealed*`），`sealed
 - `SealedNotify {taskId, agentId, category, requestId?, sealed}`：`TASK_APPROVAL` 必带明文 `requestId`。
 - `SealedSnapshot {agents, tasks, projects, recentResults, recentMessages, seq, generatedAt}`；`SealedEvent` 同 Event（`kind` 明文，配套字段是密封形状，`taskRemoved.taskId` 明文）；`SealedCommand {id, agentId, createdAt, sealed}`：命令种类与载荷都在密文里，Relay 只路由、限长（整条 ≤ 16 KiB，含 base64 膨胀）。
 
-Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态、任务 id（含来源前缀，如 `codex:`）与更新时间、命令 id 与时间、推送的类别、各段密文的大小。
+Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态、任务 id（含来源前缀，如 `codex:`）与更新时间、命令 id 与时间、推送的类别、各段密文的大小、各电脑在 ready 帧里声明的手机最低版本（`minClientProtocol`，3.6）与连接握手报的协议版本。`minClientProtocol` 放在信封外面是因为 Relay 要靠它给版本不够的手机回 412（见「版本握手」）——手机解不开快照之前没法自己判断，而 `AgentInfo.platform` 在密文里、Relay 看不到；它只透露「组里有一台要求新手机的电脑」（今天等于有一台非 Mac 的电脑），不透露是哪台、叫什么。
 
 #### 新客户端怎么自证兼容
 
@@ -110,9 +110,11 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 
 ### WebSocket 帧
 
-- Agent → Relay：`{"type":"ready"}`（3.0 起，连上后的第一帧），之后是 `{"type":"event","event":SealedEvent}`
+- Agent → Relay：`{"type":"ready","minClientProtocol":string?}`（3.0 起，连上后的第一帧；`minClientProtocol` 3.6 起，见下），之后是 `{"type":"event","event":SealedEvent}` 与 `{"type":"ack","commandIds":[string]}`（3.5 起，确认收到命令，见下）
 - Relay → Agent：`{"type":"command","command":SealedCommand}`，以及 `{"type":"hello","pairId":string,"keyEnvelope":KeyEnvelope?}`
 - Relay → 客户端（`/client/ws`）：`{"type":"snapshot","snapshot":SealedSnapshot}` 或 `{"type":"changed","seq":integer}`
+
+3.6 起 `ready` 可带 `minClientProtocol`：这台电脑要求手机至少是这个版本（两到三段点分整数，写法不对整帧不认）。Linux 宿主报 `3.5`（更早的手机见到 `platform: "linux"` 会拒收整份快照），Mac 省略。Relay 把它记在这台电脑的记录上，电脑离线时照样生效，下一次 `ready` 省略它就清掉，电脑被移出组时随之消失；组里各台的最高值就是这一组对手机的要求（见「版本握手」）。带这个字段的电脑要求 Relay ≥ 3.6（`ProtocolVersion.minimumRelayForClientMinimum`），更早的 Relay 不会执行这道门，101 上的版本低于它按「Relay 太旧」处理；不带的（Mac）照旧只要 `minimumRelay`。
 
 3.0 起 Agent 连上后先发 `ready`（Relay 收到第一帧才发 hello 与命令），本机还没有组密钥时等 hello 里的 `keyEnvelope`，用这次配对 offer 的临时私钥解开、存好，再发 `kind = snapshot` 的全量快照；已经有组密钥的可以紧跟着 `ready` 发快照。hello 里没有信封而本机又没有组密钥（3.0 之前的配对），这份配对无法加密通信，Agent 按「已撤销」处理、提示重新配对。
 
@@ -123,16 +125,17 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 - **Agent 发出第一帧之前，Relay 不向它发任何数据帧**（协议 2.4 起）。Mac 用一次 ping 确认握手，而 `URLSessionWebSocketTask` 只在有挂起的 `receive()` 时才处理 pong：握手刚完成就到的数据帧会挡住 pong，让握手超时、连接被丢弃，帧里的命令也就丢了。第一帧（协议规定是全量快照）到了之后，Relay 先发 `hello`，再投递离线队列；这期间到达的新命令先入队。Agent 仍应能在初始化完成前缓冲命令。
 - Relay 不对 `event` 帧回 ack，也不回错误帧；校验失败的帧被丢弃并只记录字段路径。Agent 靠下一次全量 snapshot 自愈。
 - Relay 不按 `id` 去重命令：客户端重试可能导致同一命令投递两次，Agent 应按 `id` 去重。
+- 命令投递（3.5 起按 Agent 分两种）。**回 ack 的 Agent**：收到命令帧、解开并派发后立刻回 `{"type":"ack","commandIds":[…]}`（不等执行完），重复收到的也要回。Relay 对它按「至少一次」投递：在线直投的命令也留在队列里，收到 ack 才删；重连时重投还没 ack 的；超过 TTL（10 分钟）仍没 ack 的记 `expired`。所以同一条命令可能到达多次，Agent 必须按 `id` 去重（重启之后也可能收到，只在内存里去重的实现要接受这一点）。**不回 ack 的 Agent**（握手报的版本低于 3.5，即已经装机的 Mac 1.0）用 3.5 之前的语义：直投成功就算送达、不入队；离线队列在它重连就绪后发出即删；只有没投出去的命令会过期。握手报的版本 ≥ 3.5 的连接一开始就按回 ack 算；更早的连接只要回过一次 ack（报 3.4 却带了 ack 的构建），这条连接之后的命令也改按回 ack 算——只记在这条连接上，重连重新判断。Agent 离线时排进队列的命令，由它下次连上时那条连接的类型决定按哪种投递。
 - Relay 不发心跳、不做空闲超时。Agent 每 30 秒发一次协议层 ping（`URLSessionWebSocketTask.sendPing`），断线后指数退避重连（1、2、4… 最大 60 秒）。
 - `Snapshot.projects` 只随 `snapshot` 事件更新，`taskUpdated`/`taskRemoved` 不碰它；Agent 在项目列表变化时必须重发全量 snapshot。
-- `commandResult` 经 WebSocket 至多送达一次，Relay 不会在后续 snapshot 里补 `recentResults`；Agent 若在断线期间产生结果，应在重连并发出快照后补发。
+- `commandResult` 经 WebSocket 至多送达一次（Relay 不对 event 回 ack，ack 只有 Agent → Relay 这一个方向），Relay 不会在后续 snapshot 里补 `recentResults`；Agent 若在断线期间产生结果，应在重连并发出快照后补发。
 - 每次连上、收到 Agent 的第一帧后，Relay 发出的**第一帧**是 `hello`，带本 Agent 所属组的 `pairId`（排在离线命令之前）。Agent 应记下它，之后所有请求（WebSocket 握手与 HTTP 的 agent 端点）带 `X-Pair-Hint: <pairId>`。这只是路由提示，不是凭据：Relay 凭它直接去该组核对 agentToken，省掉一次全局 Directory 查询；提示不对（过期、伪造）时 Relay 回落到 Directory，**不会因为提示不对回 401**。旧版 Agent 解不开 hello 帧，按"校验失败的帧忽略"处理即可。
 - 断线重连的退避应乘一个随机系数（Mac 用 0.5–1.5）：Relay 部署时全部 Agent 同一秒掉线，不抖动就会同一秒重连。
 
 客户端推送连接（`/client/ws`，协议 2.4）：
 - 游标语义与长轮询相同：`since` 与服务端当前 `seq` 不同时 Relay 立即推一帧，相同则等下一次变化；此后每次 `seq` 变化推一帧，严格按 `seq` 递增顺序。连续的多次变化可能合并成一帧（只推最新那份）。
 - `snapshot` 帧带全量快照，和 `GET /client/snapshot` 的 200 响应体相同。快照序列化后超过 512 KiB 时改推 `changed`，只带新 `seq`，客户端应改用 `GET /client/snapshot?since=-1` 取全量。
-- 关闭码 **4001**：这份 clientToken 被 `DELETE /pair/clients/:id` 踢掉，或整组被撤销——应清凭据回配对页。其他关闭码（含 Relay 部署时的断开）退避重连，重连时带上最新 `seq`。同一组同时存活的推送连接超过 30 条时，Relay 以 1008 关掉最早的那条。
+- 关闭码 **4001**：这份 clientToken 被 `DELETE /pair/clients/:id` 踢掉，或整组被撤销——应清凭据回配对页。**4002**（3.6）：组里有电脑刚声明了比这台手机更高的最低版本（握手时报的版本低于它），Relay 不再给它推它解不开的快照；按普通断线处理即可，重连握手会收 412、界面提示升级。其他关闭码（含 Relay 部署时的断开）退避重连，重连时带上最新 `seq`。同一组同时存活的推送连接超过 30 条时，Relay 以 1008 关掉最早的那条。
 - 客户端不发数据帧（发了也被忽略），每 30 秒发一次协议层 ping 保活。
 - 与 Agent 连接不同，Relay **一连上就可能推首帧**。客户端必须从握手起就一直挂着 `receive()`（iPhone 的传输有常驻的接收泵），否则首帧会挡住握手 ping 的 pong。
 - 旧版 Relay 没有这个端点（握手 404），客户端应回落到长轮询。**手表只用长轮询**：watchOS 不允许普通 app 使用 `URLSessionWebSocketTask`（Apple TN3135）。
@@ -144,11 +147,12 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 两个方向各有一条最低线：
 
 - **app 太旧**：Relay 按调用方角色比最低版本——`/agent/*` 与带 `X-Agent-Id` 的请求是电脑（`MIN_AGENT_PROTOCOL`），其余是手机与手表（`MIN_CLIENT_PROTOCOL`，手表沿用手机凭据，同一条线）。低于最低线时在任何鉴权与副作用之前回 **412** `{error:"upgrade required", minProtocol, protocol}`，另带 `X-Min-Protocol-Version: <最低版本>`。客户端**只认 412 这个状态码**，头与响应体只供日志；412 不清凭据，按最长退避继续重试（Relay 回滚或降线后自己恢复），界面提示「请更新 BotBus」。不用 426，是因为它已经表示「缺 `Upgrade: websocket`」，WebSocket 握手失败后的探测请求正好会拿到它。
+- **手机比组里某台电脑要求的旧**（3.6）：电脑在 ready 帧里声明 `minClientProtocol`（Linux 宿主是 3.5），组里各台的最高值就是这一组对手机的要求。手机与手表的每个请求——长轮询与 `/client/ws` 握手、命令、上传下载、设备登记、手机表、移除与撤销、预览会话——只要到了 PairObject（凭据有效之后），版本低于这条线就回同样的 412，`X-Min-Protocol-Version` 与响应体的 `minProtocol` 是这一组的要求。挂着的长轮询醒来时再判一次；已经连着的推送连接以 **4002** 关闭。只有 Mac 的组（没有电脑声明）不受影响，照旧服务全局最低线以上的手机。认领：用手机邀请码加入已有的组时组的要求已知，版本不够当场 412、不发凭据（码已消费，换新版手机后重新印一张）；用注册码建新组时那台电脑还没连上、要求未知，照常认领，连上之后的第一次快照收 412；`/pair/agents` 按组里已有电脑的要求判，412 时不消费码。
 - **Relay 太旧**：本端要求 Relay 至少是 `ProtocolVersion.minimumRelay`。只在**成功**响应（2xx、101、304）上判 Relay 的版本头——Cloudflare 边缘或代理自己回的 502 也不带这个头，拿它判会把一次抖动说成要升级。低于最低线时同样不清凭据、按最长退避重试，界面提示「请升级 Relay」。
 
-目前 `MIN_CLIENT_PROTOCOL` 是 **3.1**，`MIN_AGENT_PROTOCOL` 与 `minimumRelay` 是 **3.0**：端到端加密换掉了整个线上形状，2.x 的 app 既发不出 Relay 认得的帧，也解不开 Relay 合并的快照，所以 Relay 3.0 上线即对 2.x 回 412。3.1 的 `dsh` 是旧手机与手表接不住的新枚举（整份快照拒收），所以 `MIN_CLIENT_PROTOCOL` 抬到了 3.1；抬线一部署就生效，所以当时先部署只改了版本号的 Relay，等 3.1 的 iOS 上了 TestFlight 再抬线，**然后**才发 3.1 的 Mac——Mac 一发版，装了 DeepSeek Harness 的电脑就会上报 `dsh`。`MIN_AGENT_PROTOCOL` 与 `minimumRelay` 不动：旧 Mac 不上报 `dsh`，Relay 只见密文。3.2 的模型与思考强度都是旧端能忽略的可选字段（3.1 的手机不认 `models` 就不画入口，旧 Mac 忽略 `followUp.model`），三条线都不动。3.3 的项目级自动批准也只是旧端能忽略的可选字段（旧 Mac 不报 `canAutoApprove`，手机就不画开关），三条线都不动。3.4 的 worktree 字段与 `mergeWorktree` 同样都在密文里（命令种类也在密文里，Relay 不解析），三条线都不动；旧 Mac 不报 `worktrees` / `mergeTarget`，手机就不给开关与合并按钮。3.5 的 `AgentInfo.capabilities` 是旧端能忽略的可选字段，眼下三条线都不动；但 3.4 及更早的手机与手表把 `platform` 当闭集（只认 `macos`），见到 `linux` 会拒收整份快照——**Linux 宿主发布时必须把 `MIN_CLIENT_PROTOCOL` 抬到 3.5**（先让 3.5 的 iOS / Android 上架，再抬线，再发 Linux 宿主）。以下是 2.x 期间的记录：`minimumRelay` 曾是 2.15。2.15 只是电脑一侧的新能力，旧手机与旧 Mac 都不受影响，不抬 app 最低线；但新版 Mac 要解 `/agent/devices` 里的 `clients`、要用电脑凭据移除手机，旧 Relay 两样都不行。2.14 的 `questions` / `answers` 都是旧端能忽略的可选字段（旧手机只看得到 `question` 纯文字，照旧打字回答），不抬 app 最低线；但旧 Relay 会把它们剥掉，新版 app 要求 Relay 2.14。2.13 的 `acp` 是旧端接不住的新枚举值：旧手机与手表见到 `source = acp` 的任务会整条拒收、解不开整份快照，按下面的规则应把 `MIN_CLIENT_PROTOCOL` 抬到 2.13；但抬线一部署就立刻生效，而新版 iOS 还没上 TestFlight，现在抬会把所有现有装机 412 掉，所以和 2.9 一样先保持 2.7——**新版 Mac 发布时必须同时把 `MIN_CLIENT_PROTOCOL` 抬到 2.13**（新版 iOS 先上 TestFlight，再发 Mac 并抬线）：Mac 一发版，装了 ACP agent 的用户就会上报 `acp`。`MIN_AGENT_PROTOCOL` 不用抬——旧 Mac 不上报 ACP agent，手机也就不会给它发带 `connectorId` 的命令。旧 Relay 会拒收 `acp` 来源、剥掉 `connectorId` / `canStartTask`，所以新版 app 要求 Relay 2.13。2.12 的 `remoteControl` 只由新手机发出（旧 Mac 解不开这条命令，手机等不到结果），所以不抬 app 最低线；但旧 Relay 的 kind 枚举会拒收整条命令，新版 app 要求 Relay 2.12。2.11 的 `fetchChanges` 只由新手机发出（旧 Mac 解不开这条命令，手机等不到结果，60 秒后显示「未收到确认」），`CommandResult.artifactId` 旧端忽略即可，所以同样不抬 app 最低线；但旧 Relay 会拒收这条命令、剥掉新字段，新版 app 要求 Relay 2.11。2.10 只新增旧 app 可以忽略的可选字段，不抬高这两条 app 最低线；新版 app 要求 Relay 2.10，以免旧 schema 剥掉系统授权提示。2.9 的 app 依赖 Relay 2.9 的上传端点（`PUT /client/uploads`、`GET /agent/uploads`）与不剥附件字段的 schema，所以 `minimumRelay` 抬到了 2.9（Relay 先部署，不影响现有用户）。2.9 同时新增了旧端接不住的枚举值——`ArtifactKind.video`（旧手机与手表解快照会整条拒收）与命令 `fetchFile`（旧 Mac 解命令会拒收）——按下面的规则应把两条最低线都抬到 2.9；但为了不在新版 Mac / iOS 发布前挡住现有装机，暂时保持 2.7，待新版 Mac 与 iOS 发布后再把 `MIN_AGENT_PROTOCOL`、`MIN_CLIENT_PROTOCOL` 抬到 2.9。在此期间，新 Mac 分享的视频会让旧手机与手表解不开快照（已知风险）；`fetchFile` 只由新手机发出，旧 Mac 解不开这条命令。什么时候抬线：
+目前 `MIN_CLIENT_PROTOCOL` 是 **3.1**，`MIN_AGENT_PROTOCOL` 与 `minimumRelay` 是 **3.0**：端到端加密换掉了整个线上形状，2.x 的 app 既发不出 Relay 认得的帧，也解不开 Relay 合并的快照，所以 Relay 3.0 上线即对 2.x 回 412。3.1 的 `dsh` 是旧手机与手表接不住的新枚举（整份快照拒收），所以 `MIN_CLIENT_PROTOCOL` 抬到了 3.1；抬线一部署就生效，所以当时先部署只改了版本号的 Relay，等 3.1 的 iOS 上了 TestFlight 再抬线，**然后**才发 3.1 的 Mac——Mac 一发版，装了 DeepSeek Harness 的电脑就会上报 `dsh`。`MIN_AGENT_PROTOCOL` 与 `minimumRelay` 不动：旧 Mac 不上报 `dsh`，Relay 只见密文。3.2 的模型与思考强度都是旧端能忽略的可选字段（3.1 的手机不认 `models` 就不画入口，旧 Mac 忽略 `followUp.model`），三条线都不动。3.3 的项目级自动批准也只是旧端能忽略的可选字段（旧 Mac 不报 `canAutoApprove`，手机就不画开关），三条线都不动。3.4 的 worktree 字段与 `mergeWorktree` 同样都在密文里（命令种类也在密文里，Relay 不解析），三条线都不动；旧 Mac 不报 `worktrees` / `mergeTarget`，手机就不给开关与合并按钮。3.5 的 `AgentInfo.capabilities` 是旧端能忽略的可选字段，三条线都不动；但 3.4 及更早的手机与手表把 `platform` 当闭集（只认 `macos`），见到 `linux` 会拒收整份快照。原计划是 Linux 宿主发布时把 `MIN_CLIENT_PROTOCOL` 抬到 3.5，那会逼只用 Mac 的人也升级手机；3.6 改成按组要求（见上「手机比组里某台电脑要求的旧」）：Linux 宿主在 ready 帧里报 `minClientProtocol: 3.5`，只有组里有它的手机要 3.5，全局 `MIN_CLIENT_PROTOCOL` 留在 3.1。Linux 宿主要求 Relay ≥ 3.6（`minimumRelayForClientMinimum`），发布顺序是 3.5 起的 iOS / Android 上架 → 部署 Relay 3.6 → 发 Linux 宿主。以下是 2.x 期间的记录：`minimumRelay` 曾是 2.15。2.15 只是电脑一侧的新能力，旧手机与旧 Mac 都不受影响，不抬 app 最低线；但新版 Mac 要解 `/agent/devices` 里的 `clients`、要用电脑凭据移除手机，旧 Relay 两样都不行。2.14 的 `questions` / `answers` 都是旧端能忽略的可选字段（旧手机只看得到 `question` 纯文字，照旧打字回答），不抬 app 最低线；但旧 Relay 会把它们剥掉，新版 app 要求 Relay 2.14。2.13 的 `acp` 是旧端接不住的新枚举值：旧手机与手表见到 `source = acp` 的任务会整条拒收、解不开整份快照，按下面的规则应把 `MIN_CLIENT_PROTOCOL` 抬到 2.13；但抬线一部署就立刻生效，而新版 iOS 还没上 TestFlight，现在抬会把所有现有装机 412 掉，所以和 2.9 一样先保持 2.7——**新版 Mac 发布时必须同时把 `MIN_CLIENT_PROTOCOL` 抬到 2.13**（新版 iOS 先上 TestFlight，再发 Mac 并抬线）：Mac 一发版，装了 ACP agent 的用户就会上报 `acp`。`MIN_AGENT_PROTOCOL` 不用抬——旧 Mac 不上报 ACP agent，手机也就不会给它发带 `connectorId` 的命令。旧 Relay 会拒收 `acp` 来源、剥掉 `connectorId` / `canStartTask`，所以新版 app 要求 Relay 2.13。2.12 的 `remoteControl` 只由新手机发出（旧 Mac 解不开这条命令，手机等不到结果），所以不抬 app 最低线；但旧 Relay 的 kind 枚举会拒收整条命令，新版 app 要求 Relay 2.12。2.11 的 `fetchChanges` 只由新手机发出（旧 Mac 解不开这条命令，手机等不到结果，60 秒后显示「未收到确认」），`CommandResult.artifactId` 旧端忽略即可，所以同样不抬 app 最低线；但旧 Relay 会拒收这条命令、剥掉新字段，新版 app 要求 Relay 2.11。2.10 只新增旧 app 可以忽略的可选字段，不抬高这两条 app 最低线；新版 app 要求 Relay 2.10，以免旧 schema 剥掉系统授权提示。2.9 的 app 依赖 Relay 2.9 的上传端点（`PUT /client/uploads`、`GET /agent/uploads`）与不剥附件字段的 schema，所以 `minimumRelay` 抬到了 2.9（Relay 先部署，不影响现有用户）。2.9 同时新增了旧端接不住的枚举值——`ArtifactKind.video`（旧手机与手表解快照会整条拒收）与命令 `fetchFile`（旧 Mac 解命令会拒收）——按下面的规则应把两条最低线都抬到 2.9；但为了不在新版 Mac / iOS 发布前挡住现有装机，暂时保持 2.7，待新版 Mac 与 iOS 发布后再把 `MIN_AGENT_PROTOCOL`、`MIN_CLIENT_PROTOCOL` 抬到 2.9。在此期间，新 Mac 分享的视频会让旧手机与手表解不开快照（已知风险）；`fetchFile` 只由新手机发出，旧 Mac 解不开这条命令。什么时候抬线：
 
-- 做了旧 app 接不住的改动（新增枚举值、改字段语义、删字段）时，部署 Relay 的同时把对应角色的 `MIN_*_PROTOCOL` 抬到新版本；只加可选字段这类旧端能忽略的改动不用抬。
+- 做了旧 app 接不住的改动（新增枚举值、改字段语义、删字段）时，部署 Relay 的同时把对应角色的 `MIN_*_PROTOCOL` 抬到新版本；只加可选字段这类旧端能忽略的改动不用抬。只有某些电脑才会发出旧手机接不住的内容时（新平台），改由那些电脑在 ready 帧里声明 `minClientProtocol`，不抬全局线。
 - app 开始依赖 Relay 的新行为时，把 `ProtocolVersion.minimumRelay` 抬上去再发版（部署顺序仍是先 Relay 后 app，所以正常不会触发，它防的是自建或回滚的 Relay）。
 - 每次协议版本号变化都同步改 Swift 的 `ProtocolVersion.current` 与 Relay 的 `PROTOCOL_VERSION`。
 
@@ -185,9 +189,9 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 
 - `since` 与服务端当前 `seq` 相等时挂起最多 25 秒：期间有变化返回 200 全量，无变化返回 304；不相等（缺失、-1、落后、超前或非法）一律立即返回 200 全量。首次请求用 `since=-1`。
 - `delivered: true` 仅表示帧已写入 Agent 连接，不代表 Agent 已处理；处理结果以后续 Snapshot `recentResults` 中同 `commandId` 的 CommandResult 为准。
-- 离线队列中超过 10 分钟未投递的命令由 Relay 记为 `CommandResult{ok:false, error:"expired"}`。
+- 排队超过 10 分钟的命令由 Relay 记为 `CommandResult{ok:false, error:"expired"}`：回 ack 的 Agent 是一直没 ack 的（含已发出但没确认的），不回 ack 的旧 Agent 只有一直没投出去的（见「连接语义」的命令投递）。
 - 组闲置 30 天（`PAIR_IDLE_TTL_MS`）清内容不清凭据，见 Snapshot 一节。
-- 412：调用方的 `X-Protocol-Version` 低于它那个角色的最低线，见「版本握手」。适用于除 `/health` 外的全部 API 路由，排在鉴权之前。
+- 412：调用方的 `X-Protocol-Version` 低于它那个角色的最低线，见「版本握手」。适用于除 `/health` 外的全部 API 路由，排在鉴权之前。3.6 起手机与手表还可能因为版本低于**本组**的要求收 412（排在鉴权之后，形状相同；手机邀请码认领与 `/pair/agents` 也会），见「版本握手」。
 - 401：凭据无效、缺少或格式错误的 `X-Pair-Id` / `X-Agent-Id`，或本 Agent 已被移除、整个 Pair 已撤销（应清空凭据回到配对页）。403：凭据有效但角色不符。409：`/agent/ws` 的 `agentId` 有效但尚未被任何客户端认领。426：`/agent/ws` 缺少 `Upgrade: websocket`。
 - `POST /pair/create` 已移除。`X-Pair-Id` 仅客户端使用；Agent 一侧改用 `X-Agent-Id`。
 - 产物与预览（2.3）：单个产物 ≤ 10 MiB，默认保留 7 天（`ARTIFACT_TTL_MS`）；预览默认存活 2 小时（`PREVIEW_TTL_MS`）。同时存活的预览数由 Mac 限制（≤ 5），Relay 不做跨预览计数。每次打开预览都要重新取 session——ticket 用过即废；每个预览同时有效的 ticket 最多 20 张，再签发会挤掉最早的一张。
@@ -545,7 +549,8 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - 版本 3.2 加入**续聊时换模型与思考强度**：`ConnectorInfo.models` 报这个 agent 在手机上能选的模型（各带可选的强度与默认档），`Task.model` / `effort` 报这条会话下一轮会用的，`followUp.model` / `effort` 从这一轮起换掉、之后沿用，`startTask.model` / `effort` 让新会话从第一轮起就用选定的。都是旧端能忽略的可选字段，都在密文里：Relay 只改版本号，两条最低线不动；旧 Mac 不报 `models`，手机也就不给换模型的入口。
 - 版本 3.3 加入**项目级自动批准**（见「项目级自动批准」）：`ConnectorInfo.canAutoApprove` 标出支持的 agent，`Project.autoApprove` / `Task.autoApprove` 报项目是否开着，`startTask` / `followUp` 的 `autoApprove` 设开或关、之后沿用。都是旧端能忽略的可选字段、都在密文里：Relay 只改版本号，两条最低线不动；旧 Mac 不报 `canAutoApprove`，手机也就不画这个开关。
 - 版本 3.4 加入**手机开 worktree 会话与合并回检出分支**：`startTask.worktree`、`AgentInfo.worktrees`、`WorkingChanges.mergeTarget` 与命令 `mergeWorktree`。都在密文里：Relay 只改版本号，两条最低线不动。
-- 版本 3.5 加入**宿主能力与新平台**（为 Linux 宿主准备，之后是 Windows）：`AgentPlatform` 新增 `linux`、`windows` 并改为开集（三端遇到不认得的值按「其他」处理）；`AgentInfo.capabilities`（`remoteControl` / `previews` / `fetchFile` / `fetchChanges`，均为可选布尔，省略 = 支持），Linux 报 `remoteControl: false`（没有屏幕）与 `previews: false`（第一版的预览隧道依赖静态 Linux 构建不支持的 WebSocket），手机据此隐藏入口、不发探测（`previews: false` 在预览隧道换掉 URLSession 的 WebSocket 后去掉）。都在密文里：Relay 只改版本号，眼下两条最低线不动；Linux 宿主发布时 `MIN_CLIENT_PROTOCOL` 抬到 3.5（见「版本握手」）。
+- 版本 3.5 加入**宿主能力与新平台**（为 Linux 宿主准备，之后是 Windows）：`AgentPlatform` 新增 `linux`、`windows` 并改为开集（三端遇到不认得的值按「其他」处理）；`AgentInfo.capabilities`（`remoteControl` / `previews` / `fetchFile` / `fetchChanges`，均为可选布尔，省略 = 支持），Linux 报 `remoteControl: false`（没有屏幕）与 `previews: false`（第一版的预览隧道依赖静态 Linux 构建不支持的 WebSocket），手机据此隐藏入口、不发探测（`previews: false` 在预览隧道换掉 URLSession 的 WebSocket 后去掉）。都在密文里：Relay 只改版本号，眼下两条最低线不动；Linux 宿主发布时手机要 3.5（原计划抬全局 `MIN_CLIENT_PROTOCOL`，3.6 改成按组要求）。同一批还加入了**命令 ack**：Agent 收到命令回 `{"type":"ack","commandIds":[…]}`，Relay 对回 ack 的 Agent 按「至少一次」投递（见「连接语义」）；最早带 ack 的构建报的还是 3.4，所以 Relay 也把回过 ack 的连接当作会回 ack。
+- 版本 3.6 加入**按组的手机最低版本**：Agent 的 `ready` 帧可带 `minClientProtocol`（在信封外面，Relay 路由用的元数据），Linux 宿主报 3.5、Mac 不报；组里各台电脑的最高值就是这一组对手机的要求，版本不够的手机在 PairObject 里收与全局最低线同样的 412（已连着的推送连接以 4002 关闭），只有 Mac 的组照旧服务 3.1 起的手机，全局 `MIN_CLIENT_PROTOCOL` 不抬。带 `minClientProtocol` 的电脑要求 Relay ≥ 3.6。同时 Relay 按 Agent 握手报的版本分开投递语义：≥ 3.5（或回过 ack 的连接）至少一次，更早的（Mac 1.0）用 ack 之前的语义，免得它的命令在每次重连时重发、到期补假的 `expired`。发布顺序：部署 Relay 3.6 → 发 Linux 宿主（要求 3.5 的 iOS / Android 已上架）。
 
 ## 附录 B：Fixture 与类型对应
 
@@ -575,6 +580,8 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | event-notify-input.json | Event |
 | event-notify-failed.json | Event |
 | frame-agent-event.json | AgentFrame |
+| frame-agent-ready.json | AgentReadyFrame（Mac 的 ready 帧，不带 `minClientProtocol`） |
+| frame-agent-ready-min-client.json | AgentReadyFrame（3.6 带 `minClientProtocol: "3.5"`，Linux 宿主） |
 | frame-relay-command.json | RelayFrame |
 | frame-relay-hello.json | RelayHelloFrame |
 | frame-client-snapshot.json | ClientFrame |
@@ -637,6 +644,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | invalid/agent-info-bad-connector-kind.json | 必须被拒绝：未知 connector kind |
 | invalid/artifact-bad-kind.json | 必须被拒绝：未知 artifact kind |
 | invalid/client-frame-payload-mismatch.json | 必须被拒绝：ClientFrame 的 type 与配套字段不匹配 |
+| invalid/frame-agent-ready-bad-min-client.json | 必须被拒绝：ready 帧的 `minClientProtocol` 不是版本号（`latest`） |
 | invalid/event-system-permission-missing-dialog-text.json | 必须被拒绝：系统授权提示缺少必填 dialogText |
 | invalid/task-acp-missing-connector-id.json | 必须被拒绝：`source = acp` 却没有 connectorId |
 | invalid/agent-info-acp-missing-connector-id.json | 必须被拒绝：`kind = acp` 的 connector 没有 connectorId |

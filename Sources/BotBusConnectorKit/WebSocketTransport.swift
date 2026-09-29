@@ -7,6 +7,13 @@ public protocol WebSocketConnection: AnyObject, Sendable {
     func receiveText() async throws -> String
     func sendPing() async throws
     func close()
+    /// 握手 101 上对端报的协议版本（Relay 的 `X-Protocol-Version`，协议 2.8）。连的不是 Relay、
+    /// 或传输拿不到响应头时为 nil（按 `ProtocolVersion.legacy` 算）。RelayClient 在要求更高的 Relay 时用它（协议 3.6）。
+    var relayProtocolVersion: String? { get }
+}
+
+public extension WebSocketConnection {
+    var relayProtocolVersion: String? { nil }
 }
 
 public protocol WebSocketTransport: Sendable {

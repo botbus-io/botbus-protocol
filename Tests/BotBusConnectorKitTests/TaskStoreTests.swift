@@ -171,6 +171,15 @@ final class TaskStoreTests: XCTestCase {
         XCTAssertNil(win.capabilities)
     }
 
+    /// 协议 3.6：Linux 宿主要求手机 ≥ 3.5（更早的手机见到 `platform: "linux"` 会拒收整份快照），Mac 不要求。
+    func testHostMinimumPhoneProtocol() {
+        XCTAssertNil(HostIdentity.mac.minClientProtocol)
+        XCTAssertEqual(HostIdentity.linux.minClientProtocol, "3.5")
+        XCTAssertTrue(ProtocolVersion.isWellFormed(HostIdentity.linux.minClientProtocol!))
+        XCTAssertFalse(ProtocolVersion.isOlder(ProtocolVersion.current, than: HostIdentity.linux.minClientProtocol!))
+        XCTAssertNil(HostIdentity(platform: .windows).minClientProtocol)
+    }
+
     /// 来源报上来的 agentId 一律以本机为准：连接器不该有能力把任务记到别的电脑名下。
     func testForeignAgentIdIsRestampedWithThisMachine() async {
         let store = makeStore()

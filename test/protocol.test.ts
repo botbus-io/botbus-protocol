@@ -71,6 +71,8 @@ const SCHEMA: Record<string, ZodType> = {
   "event-task-removed.json": P.SealedEvent,
   "event-task-updated.json": P.SealedEvent,
   "frame-agent-event.json": P.AgentFrame,
+  "frame-agent-ready.json": P.AgentReadyFrame,
+  "frame-agent-ready-min-client.json": P.AgentReadyFrame,
   "frame-client-changed.json": P.ClientFrame,
   "frame-client-snapshot.json": P.ClientFrame,
   "frame-relay-command.json": P.RelayFrame,
@@ -192,6 +194,7 @@ const MUST_REJECT: Record<string, ZodType> = {
   "client-frame-payload-mismatch.json": P.ClientFrame,
   "command-missing-agent-id.json": P.SealedCommand,
   "event-payload-mismatch.json": P.SealedEvent,
+  "frame-agent-ready-bad-min-client.json": P.AgentReadyFrame,
 };
 
 const PLAIN_MUST_REJECT: Record<string, ZodType> = {
@@ -218,13 +221,13 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
 describe("fixture 目录与对照表一一对应", () => {
   it("每个 valid fixture 都在 SCHEMA / PLAIN_SCHEMA 表里，且表里没有已删除的文件", () => {
     expect([...validFixtures.keys()].sort()).toEqual(Object.keys(SCHEMA).sort());
-    expect(validFixtures.size).toBe(75);
+    expect(validFixtures.size).toBe(77);
     expect([...plainFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_SCHEMA).sort());
     expect(plainFixtures.size).toBe(66);
   });
   it("每个 invalid fixture 都在 MUST_REJECT / PLAIN_MUST_REJECT 表里", () => {
     expect([...invalidFixtures.keys()].sort()).toEqual(Object.keys(MUST_REJECT).sort());
-    expect(invalidFixtures.size).toBe(3);
+    expect(invalidFixtures.size).toBe(4);
     expect([...plainInvalidFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_MUST_REJECT).sort());
     expect(plainInvalidFixtures.size).toBe(18);
   });
@@ -608,5 +611,17 @@ describe("协议 3.0：Relay 只认密封形状", () => {
   it("密钥信封的 epk 必须是 32 字节 X25519 公钥", () => {
     const envelope = validFixtures.get("key-envelope.json") as P.KeyEnvelope;
     expect(P.KeyEnvelope.safeParse({ ...envelope, epk: envelope.epk.slice(1) }).success).toBe(false);
+  });
+});
+
+describe("协议 3.6：ready 帧的 minClientProtocol", () => {
+  it("两到三段点分整数才认，省略 = 不要求", () => {
+    for (const ok of ["3.5", "3.10", "4.0.1", "10.2"]) {
+      expect(P.AgentReadyFrame.safeParse({ type: "ready", minClientProtocol: ok }).success, ok).toBe(true);
+    }
+    expect(P.AgentReadyFrame.parse({ type: "ready" })).toEqual({ type: "ready" });
+    for (const bad of ["", "3", "3.", ".5", "3.5.0.1", "v3.5", "3.5-beta", " 3.5", "12345.1", 3.5, null]) {
+      expect(P.AgentReadyFrame.safeParse({ type: "ready", minClientProtocol: bad }).success, String(bad)).toBe(false);
+    }
   });
 });
