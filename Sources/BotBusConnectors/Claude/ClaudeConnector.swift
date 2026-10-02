@@ -109,7 +109,10 @@ public actor ClaudeConnector: TaskConnector {
     private let paths: ClaudePaths
     private let binary: @Sendable () -> String?
     /// 本机 `claude --help` 认的强度；nil = CLI 不可用，不报 models。
-    private let supportedEfforts: [String]?
+    private var supportedEfforts: [String]?
+    /// `supportedEfforts` 是哪一份 claude 报的（软链接解析到底的路径）。挑中的那份换了（升级、桌面 app
+    /// 更新了自带的那份）就重读一次，见 `refreshSupportedEfforts`。
+    private var effortsBinary: String?
     private let now: @Sendable () -> Date
     private let tools: @Sendable () -> AgentToolsConfiguration?
     private let registry: TaskContextRegistry
@@ -224,7 +227,9 @@ public actor ClaudeConnector: TaskConnector {
         self.store = store
         self.paths = paths
         self.binary = binary
-        self.supportedEfforts = ClaudeModels.efforts(forBinary: binary())
+        let executable = binary()
+        self.supportedEfforts = ClaudeModels.efforts(forBinary: executable)
+        self.effortsBinary = executable.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
         self.now = now
         self.tools = tools
         self.registry = registry
@@ -256,6 +261,19 @@ public actor ClaudeConnector: TaskConnector {
         titleRefreshes.removeAll()
         turnEndCheck?.cancel()
         turnEndCheck = nil
+    }
+
+    /// 手机发起新一轮之前看一眼挑中的 claude 换没换：换了就重读它认的强度，变了下一次 `publish` 补发快照。
+    /// 没换时只是找一遍可执行文件（版本号有缓存），不起进程。
+    private func refreshSupportedEfforts() {
+        let executable = binary()
+        let resolved = executable.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
+        guard resolved != effortsBinary else { return }
+        effortsBinary = resolved
+        let efforts = ClaudeModels.efforts(forBinary: executable)
+        guard efforts != supportedEfforts else { return }
+        supportedEfforts = efforts
+        if store.connectors.setModels(modelOptions, for: .claude) { modelsChanged = true }
     }
 
     /// 见到一个完整模型名：版本比记着的新就更新手机上的模型列表，下一次 `publish` 补发快照。
@@ -858,6 +876,7 @@ public actor ClaudeConnector: TaskConnector {
     public func start(projectPath: String, prompt: String, images: [URL],
                       selection: ModelSelection) async throws -> ConnectorOutcome {
         // 先查模型、再读图：不对就别起进程，也别签 token。
+        refreshSupportedEfforts()
         let chosen = try Self.resolve(selection, current: nil, options: modelOptions ?? [])
         let input = try Self.stdinMessage(prompt: prompt, images: images)
         let injection = await AgentToolsInjection.make(tools(), registry: registry)
@@ -903,6 +922,7 @@ public actor ClaudeConnector: TaskConnector {
     public func followUp(taskId: String, prompt: String, images: [URL],
                          selection: ModelSelection) async throws -> ConnectorOutcome {
         let sessionID = try nativeID(taskId)
+        refreshSupportedEfforts()
         var chosen = (model: sessions[sessionID]?.chosenModel, effort: sessions[sessionID]?.chosenEffort)
         if !selection.isEmpty {
             chosen = try Self.resolve(selection, current: sessions[sessionID], options: modelOptions ?? [])
