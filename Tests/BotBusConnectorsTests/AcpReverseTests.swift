@@ -19,7 +19,11 @@ final class AcpReverseTests: XCTestCase {
 
     override func setUp() async throws {
         // sockaddr_un 的路径上限约 104 字节：临时目录用短名。socket 所在目录必须是自己的真目录（`/tmp` 是软链接、属于 root）。
+        #if os(Windows)
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString.prefix(8))").path
+        #else
         directory = "/tmp/bb-\(UUID().uuidString.prefix(8))"
+        #endif
         socketPath = directory + "/a.sock"
         store = makeAcpStore([])
         subprocesses = FakeAgentQueue([])
@@ -67,6 +71,9 @@ final class AcpReverseTests: XCTestCase {
         await peer.notify("_botbus/session", params: ["sessionId": "desk-1", "cwd": "/Users/me/app", "title": "电脑上的会话"])
     }
 
+    // 下面四条查的是 POSIX 的权限位、软链接与 errno；Windows 版的同一套检查（DACL、重解析点、用户 SID）在
+    // `UnixSocket+Windows.swift`，Windows 上只跑经 socket 说 JSON-RPC 的那些用例。
+    #if !os(Windows)
     private func expectPOSIX(_ code: POSIXErrorCode, file: StaticString = #filePath, line: UInt = #line,
                              _ body: () throws -> Void) {
         XCTAssertThrowsError(try body(), file: file, line: line) { error in
@@ -130,6 +137,7 @@ final class AcpReverseTests: XCTestCase {
         XCTAssertEqual(symlink(real, directory + "/ln"), 0)
         expectPOSIX(.ENOTDIR) { try UnixSocketServer(path: directory + "/ln/a.sock", onConnection: { _ in }).start() }
     }
+    #endif
 
     func testUnknownAgentIsRejectedAndDisconnected() async throws {
         let (peer, connection) = try await connectAgent()
@@ -661,6 +669,7 @@ final class AcpReverseTests: XCTestCase {
     }
 }
 
+#if !os(Windows)
 /// XCTestCase（NSObject）自己有个 `bind(_:to:withKeyPath:options:)`，裸写 `bind` 会解析到它身上。
 private func systemBind(_ descriptor: Int32, _ address: UnsafePointer<sockaddr>, _ length: socklen_t) -> Int32 {
     #if canImport(Darwin)
@@ -669,3 +678,4 @@ private func systemBind(_ descriptor: Int32, _ address: UnsafePointer<sockaddr>,
     Glibc.bind(descriptor, address, length)
     #endif
 }
+#endif

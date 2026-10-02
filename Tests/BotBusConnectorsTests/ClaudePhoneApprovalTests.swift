@@ -18,6 +18,7 @@ final class ClaudePhoneApprovalTests: XCTestCase {
     /// 假 `claude`：读一行 user 消息，吐 init，再吐 `request.json` 里的那行控制请求，读一行回答存进 `answer`，
     /// 然后吐 result，像真 claude 一样等 stdin 关了才退出（连接器读到 result 就关）。
     private func fakeClaude(in directory: URL) throws -> URL {
+        try skipPOSIXScriptOnWindows()
         let url = directory.appendingPathComponent("claude")
         let dir = directory.path
         let script = """

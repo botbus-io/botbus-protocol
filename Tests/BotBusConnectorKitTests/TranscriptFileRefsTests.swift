@@ -129,23 +129,23 @@ final class TranscriptFileRefsTests: XCTestCase {
 
     func testSymlinkInsideProjectPointingOutsideIsDropped() throws {
         let outside = try file("secret.png", in: sandbox)
-        try FileManager.default.createSymbolicLink(at: project.appendingPathComponent("link.png"),
+        try makeSymbolicLink(at: project.appendingPathComponent("link.png"),
                                                    withDestinationURL: outside)
-        try FileManager.default.createSymbolicLink(at: project.appendingPathComponent("linked-dir"),
+        try makeSymbolicLink(at: project.appendingPathComponent("linked-dir"),
                                                    withDestinationURL: sandbox)
         XCTAssertEqual(resolve(["link.png", "linked-dir/secret.png"]), [])
     }
 
     func testSymlinkInsideProjectPointingInsideResolvesToTheRealFile() throws {
         let real = try file("out/real.png")
-        try FileManager.default.createSymbolicLink(at: project.appendingPathComponent("alias.png"), withDestinationURL: real)
+        try makeSymbolicLink(at: project.appendingPathComponent("alias.png"), withDestinationURL: real)
         XCTAssertEqual(resolve(["alias.png"]).map(\.path), [real.path])
         XCTAssertEqual(resolve(["alias.png"]).first?.name, "real.png")
     }
 
     func testSymlinkWithMediaNameToNonMediaFileIsDropped() throws {
         let notes = try file("notes.txt")
-        try FileManager.default.createSymbolicLink(at: project.appendingPathComponent("notes.png"), withDestinationURL: notes)
+        try makeSymbolicLink(at: project.appendingPathComponent("notes.png"), withDestinationURL: notes)
         XCTAssertEqual(resolve(["notes.png"]), [], "扩展名按真实文件判断")
     }
 
@@ -165,11 +165,11 @@ final class TranscriptFileRefsTests: XCTestCase {
         try file(".hidden/x.png"); try file(".env.png"); try file(".git/x.png"); try file("a/.cache/b/x.png")
         XCTAssertEqual(resolve([".hidden/x.png", ".env.png", ".git/x.png", "a/.cache/b/x.png"]), [])
         let real = try file("out/x.png")
-        try FileManager.default.createSymbolicLink(at: project.appendingPathComponent("out/.alias.png"), withDestinationURL: real)
+        try makeSymbolicLink(at: project.appendingPathComponent("out/.alias.png"), withDestinationURL: real)
         XCTAssertEqual(resolve(["out/.alias.png"]).map(\.path), [real.path],
                        "判断的是 realpath 之后的路径：隐藏的软链接指向普通文件时，给出的是那个普通文件")
         let hiddenTarget = try file(".secret/y.png")
-        try FileManager.default.createSymbolicLink(at: project.appendingPathComponent("y.png"), withDestinationURL: hiddenTarget)
+        try makeSymbolicLink(at: project.appendingPathComponent("y.png"), withDestinationURL: hiddenTarget)
         XCTAssertEqual(resolve(["y.png"]), [], "普通名字的软链接指向隐藏目录也不行")
     }
 
@@ -182,9 +182,14 @@ final class TranscriptFileRefsTests: XCTestCase {
 
     func testMissingDirectoriesAndSpecialFilesAreDropped() throws {
         try FileManager.default.createDirectory(at: project.appendingPathComponent("dir.png"), withIntermediateDirectories: true)
+        #if os(Windows)
+        // Windows 的文件系统里没有 FIFO。
+        XCTAssertEqual(resolve(["missing.png", "dir.png"]), [])
+        #else
         let fifo = project.appendingPathComponent("pipe.png")
         XCTAssertEqual(mkfifo(fifo.path, 0o600), 0)
         XCTAssertEqual(resolve(["missing.png", "dir.png", "pipe.png"]), [])
+        #endif
     }
 
     func testAtMostFourAndDuplicatesByRealPathCountOnce() throws {
@@ -217,6 +222,20 @@ final class TranscriptFileRefsTests: XCTestCase {
         XCTAssertEqual(resolve(["a.png"]).map(\.path), [url.path])
     }
 
+    #if os(Windows)
+    /// Windows：盘符根、`C:\Users`、系统目录与 home 本身（及它们的祖先）不行；它们的后代可以。不分大小写、不管分隔符写法。
+    func testAcceptableProjectRootRule() {
+        let home = "C:\\Users\\alice"
+        for root in ["C:\\", "D:\\", "C:\\Users", "c:\\users", "C:\\Windows", "C:\\Program Files", "C:\\ProgramData", home,
+                     "C:/Users/alice"] {
+            XCTAssertFalse(TranscriptFileRefs.isAcceptableProjectRoot(root, home: home), root)
+        }
+        XCTAssertTrue(TranscriptFileRefs.isAcceptableProjectRoot(home + "\\code\\app", home: home))
+        XCTAssertTrue(TranscriptFileRefs.isAcceptableProjectRoot("D:\\work\\proj", home: home))
+        XCTAssertTrue(TranscriptFileRefs.isAcceptableProjectRoot("C:\\Users\\alice2", home: home))
+        XCTAssertFalse(TranscriptFileRefs.isAcceptableProjectRoot("relative\\proj", home: home))
+    }
+    #else
     func testAcceptableProjectRootRule() {
         let home = "/Users/alice"
         // 固定集合本身与它们的祖先一律不行。
@@ -240,6 +259,7 @@ final class TranscriptFileRefsTests: XCTestCase {
         // home 放在别处时（例如 `/Volumes/Home/alice`），它的祖先 `/Volumes/Home` 也不行。
         XCTAssertFalse(TranscriptFileRefs.isAcceptableProjectRoot("/Volumes/Home", home: "/Volumes/Home/alice"))
     }
+    #endif
 
     // MARK: - validate
 

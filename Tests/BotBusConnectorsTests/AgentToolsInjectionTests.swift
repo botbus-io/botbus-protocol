@@ -21,6 +21,8 @@ final class AgentToolsInjectionTests: XCTestCase {
     }
 
     private func executable(_ name: String, in directory: URL, script: String) throws -> URL {
+        if name != "botbus" { try skipPOSIXScriptOnWindows() }
+        let name = name == "botbus" ? fakeCLIName : name
         let url = directory.appendingPathComponent(name)
         try Data(script.utf8).write(to: url)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
@@ -59,11 +61,11 @@ final class AgentToolsInjectionTests: XCTestCase {
                                                                              toolsURL: "http://127.0.0.1:1"),
                                                      registry: registry)
         XCTAssertNil(missing, "开发环境没嵌 CLI：完全不注入")
-        let noURL = await AgentToolsInjection.make(AgentToolsConfiguration(cliPath: "/bin/sh", toolsURL: ""),
+        let noURL = await AgentToolsInjection.make(AgentToolsConfiguration(cliPath: anyExecutablePath, toolsURL: ""),
                                                    registry: registry)
         XCTAssertNil(noURL)
 
-        let usable = AgentToolsConfiguration(cliPath: "/bin/sh", toolsURL: "http://127.0.0.1:1")
+        let usable = AgentToolsConfiguration(cliPath: anyExecutablePath, toolsURL: "http://127.0.0.1:1")
         let made = await AgentToolsInjection.make(usable, registry: registry, reusing: "claude:s1")
         let fresh = try XCTUnwrap(made)
         await registry.bind(fresh.token, taskId: "claude:s1")

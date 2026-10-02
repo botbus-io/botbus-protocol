@@ -68,6 +68,8 @@ public actor CommandDispatcher {
     /// 正在执行的针对已有任务的命令（`onTask`）：任务 id → 条数。有命令在跑时不合并——Claude 要等命令返回
     /// 才把状态翻成 running，光看 `status` 挡不住刚发出去的续聊。
     private var activeTaskCommands: [String: Int] = [:]
+    /// 新建命令还没有 taskId，用真实 cwd 与 worktree 合并互斥。
+    private var activeStartDirectories: [String: Int] = [:]
     private var remoteControl: (any RemoteControlling)?
     private var systemPermissionInspector: SystemPermissionInspector?
     private let systemPermissionInspectionTimeout: TimeInterval
@@ -323,6 +325,31 @@ public actor CommandDispatcher {
                 // 协议 2.6：空目录 = 「不在项目中」。OpenClaw 自己会退回它的默认工作区，其余在主目录下跑。
                 projectPath = await store.homeDirectory
             }
+            // 项目身份是主仓库对应的子目录，它可能只存在于 worktree。仅能唯一定位时才使用现存 cwd。
+            if payload.newProject == nil, !projectPath.isEmpty,
+               !FileManager.default.fileExists(atPath: projectPath) {
+                let candidates = await store.worktreeDirectories(forProject: projectPath).filter { path in
+                    var directory: ObjCBool = false
+                    return FileManager.default.fileExists(atPath: path, isDirectory: &directory) && directory.boolValue
+                }
+                if candidates.count > 1 {
+                    throw DispatchFailure("这个项目只在多个 worktree 中存在，请在其中一个会话里继续聊天")
+                }
+                if let candidate = candidates.first { projectPath = candidate }
+            }
+            // create 也会读来源 worktree；尚未拿到 taskId 的准备阶段同样不能让合并删掉目录。
+            let sourceDirectory = TranscriptFileRefs.realPath(projectPath) ?? PlatformPath.canonical(projectPath)
+            guard !merging.values.contains(where: { $0.contains(sourceDirectory) }) else {
+                throw DispatchFailure("这个会话正在合并")
+            }
+            var reservedDirectories = [sourceDirectory]
+            activeStartDirectories[sourceDirectory, default: 0] += 1
+            defer {
+                for directory in reservedDirectories {
+                    let remaining = (activeStartDirectories[directory] ?? 1) - 1
+                    activeStartDirectories[directory] = remaining > 0 ? remaining : nil
+                }
+            }
             // 协议 3.3：设置在第一轮开始之前落地（落盘 + 快照），启动失败也不回滚。新项目作用在刚建的文件夹上。
             if let autoApprove = payload.autoApprove,
                let project = await store.autoApproveProject(forWorkingDirectory: projectPath) {
@@ -339,6 +366,15 @@ public actor CommandDispatcher {
             }
             // startTask 还没有 id，所有权只能等连接器把 id 还回来才认领得上。
             let outcome: ConnectorOutcome
+            let startingDirectory = TranscriptFileRefs.realPath(projectPath) ?? PlatformPath.canonical(projectPath)
+            guard !merging.values.contains(where: { $0.contains(startingDirectory) }) else {
+                if let worktree { await worktrees?.discard(worktree) }
+                throw DispatchFailure("这个会话正在合并")
+            }
+            if startingDirectory != sourceDirectory {
+                activeStartDirectories[startingDirectory, default: 0] += 1
+                reservedDirectories.append(startingDirectory)
+            }
             do {
                 if let target {
                     outcome = try await target.connector.start(connectorId: target.connectorId, projectPath: projectPath,
@@ -483,17 +519,17 @@ public actor CommandDispatcher {
         let taskId = payload.taskId
         let (kind, reader) = try messageReader(for: taskId)
         guard let files else { throw DispatchFailure("本机无法取回文件", taskId: taskId) }
-        guard let projectPath = await store.task(id: taskId)?.projectPath else {
+        guard let workingDirectory = await store.task(id: taskId)?.workingDirectory else {
             throw DispatchFailure("本机没有这个任务：\(taskId)", taskId: taskId)
         }
         let limit = TaskMessages.maxMessages
         let (entries, hasMore) = try await reader.entries(taskId: taskId, limit: limit)
         guard let entry = entries.first(where: { $0.message.id == payload.messageId }), entry.message.role == .agent,
-              TranscriptFileRefs.resolve(entry.pathCandidates, projectPath: projectPath)
+              TranscriptFileRefs.resolve(entry.pathCandidates, projectPath: workingDirectory)
                   .contains(where: { $0.path == payload.path }) else {
             throw DispatchFailure("这个文件不在对话里", taskId: taskId)
         }
-        guard let url = TranscriptFileRefs.validate(path: payload.path, projectPath: projectPath),
+        guard let url = TranscriptFileRefs.validate(path: payload.path, projectPath: workingDirectory),
               url.path == payload.path else {
             throw DispatchFailure("这个文件已经不在项目里了", taskId: taskId)
         }
@@ -566,7 +602,8 @@ public actor CommandDispatcher {
         }
         let related = Set(sessions.map(\.id)).union([taskId])
         // 从这里到登记进 `merging` 没有挂起点：与 `onTask` 的检查互斥，两条并发的合并也只有一条能过。
-        guard !related.contains(where: { activeTaskCommands[$0] != nil }) else {
+        guard !related.contains(where: { activeTaskCommands[$0] != nil }),
+              !activeStartDirectories.keys.contains(where: { managed.contains($0) }) else {
             throw DispatchFailure("会话还在进行中，等它停下来再合并", taskId: taskId)
         }
         guard !merging.values.contains(where: { $0.path == managed.path }) else {
@@ -640,7 +677,7 @@ public actor CommandDispatcher {
     /// 读取器的 entry → 外发的消息：填上已传好的图（`attachments`），再给 Agent 回复补文件卡片（`files`）。
     /// `hasPending` 表示还有图没传，调用方决定要不要后台传完再发一次。
     ///
-    /// 文件卡片按任务的项目目录校验（`TranscriptFileRefs.resolve`）：store 里没有这个任务就不知道项目目录，
+    /// 文件卡片按任务实际工作目录校验（`TranscriptFileRefs.resolve`，worktree 优先）：store 里没有这个任务就不知道目录，
     /// 一张卡片都不给——宁可少给，也不拿别的目录兜底。
     ///
     /// 最后丢掉「没字、没图、没文件、也没有图在排队」的消息：读取器保留纯图消息，但图可能永远拿不到
@@ -652,9 +689,9 @@ public actor CommandDispatcher {
         var messages = resolved?.messages ?? entries.map(\.message)
         let pending = resolved?.pending ?? Array(repeating: false, count: entries.count)
         if entries.contains(where: { $0.message.role == .agent && !$0.pathCandidates.isEmpty }),
-           let projectPath = await store.task(id: taskId)?.projectPath {
+           let workingDirectory = await store.task(id: taskId)?.workingDirectory {
             for (index, entry) in entries.enumerated() where entry.message.role == .agent {
-                var refs = TranscriptFileRefs.resolve(entry.pathCandidates, projectPath: projectPath)
+                var refs = TranscriptFileRefs.resolve(entry.pathCandidates, projectPath: workingDirectory)
                 guard !refs.isEmpty else { continue }
                 if let files {
                     for ref in refs.indices {

@@ -1,4 +1,4 @@
-#if !canImport(Network)
+#if !canImport(Network) && !os(Windows)
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Musl)
@@ -213,4 +213,4 @@ enum LoopbackSocket {
         return String(cString: text)
     }
 }
-#endif // !canImport(Network)
+#endif // !canImport(Network) && !os(Windows)

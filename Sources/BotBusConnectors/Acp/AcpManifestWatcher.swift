@@ -127,6 +127,8 @@ import BotBusConnectorKit
 import Glibc
 #elseif canImport(Musl)
 import Musl
+#elseif canImport(WinSDK)
+import WinSDK
 #endif
 
 /// 监视约定目录（spec「发现」）：目录里文件增删、改名、**原地重写**都去抖后回调一次，
@@ -158,6 +160,9 @@ public final class AcpManifestWatcher: @unchecked Sendable {
     private var notifyDescriptor: Int32 = -1
     private var watchDescriptor: Int32 = -1
     #endif
+    #if os(Windows)
+    private var changeWatch: ChangeWatch?
+    #endif
     private var timer: DispatchSourceTimer?
     private var snapshot: [String: FileStamp] = [:]
 
@@ -187,6 +192,8 @@ public final class AcpManifestWatcher: @unchecked Sendable {
             self.ensureDirectory()
             #if os(Linux)
             if !self.forcePolling, self.startNotifier() { return }
+            #elseif os(Windows)
+            if !self.forcePolling, self.startChangeWatch() { return }
             #endif
             self.startPolling()
         }
@@ -199,6 +206,9 @@ public final class AcpManifestWatcher: @unchecked Sendable {
             self.pending = nil
             #if os(Linux)
             self.stopNotifier()
+            #elseif os(Windows)
+            self.changeWatch?.stop()
+            self.changeWatch = nil
             #endif
             self.timer?.cancel()
             self.timer = nil
@@ -309,6 +319,66 @@ public final class AcpManifestWatcher: @unchecked Sendable {
             stopNotifier()
             startPolling()
             return
+        }
+    }
+    #endif
+
+    // MARK: - Windows 目录变更通知
+
+    #if os(Windows)
+    /// `FindFirstChangeNotificationW` 盯目录（文件增删、改名、写入、大小变化都算）；一条线程等通知，来了就回队列去抖。
+    /// 目录被删掉、通知句柄作废时退回轮询（轮询会把目录建回来）。
+    private func startChangeWatch() -> Bool {
+        let filter = DWORD(FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE
+                           | FILE_NOTIFY_CHANGE_SIZE)
+        let handle = Win32.withWide(directory.path) { FindFirstChangeNotificationW($0, false, filter) }
+        guard let handle, handle != INVALID_HANDLE_VALUE else {
+            Self.log.notice("FindFirstChangeNotificationW failed (\(GetLastError(), privacy: .public)); polling manifests")
+            return false
+        }
+        let watch = ChangeWatch(handle: handle)
+        changeWatch = watch
+        let queue = self.queue
+        watch.run(onChange: { [weak self] in
+            queue.async { self?.scheduleChange() }
+        }, onFailure: { [weak self] in
+            queue.async {
+                guard let self, self.running, self.changeWatch === watch else { return }
+                self.changeWatch = nil
+                self.startPolling()
+            }
+        })
+        return true
+    }
+
+    /// 一个通知句柄与等它的线程。`stop()` 之后线程最多 0.5 秒退出，退出时关句柄。
+    private final class ChangeWatch: @unchecked Sendable {
+        private let handle: HANDLE
+        private let lock = NSLock()
+        private var stopped = false
+
+        init(handle: HANDLE) { self.handle = handle }
+
+        func stop() { lock.withLock { stopped = true } }
+
+        private var isStopped: Bool { lock.withLock { stopped } }
+
+        func run(onChange: @escaping @Sendable () -> Void, onFailure: @escaping @Sendable () -> Void) {
+            let thread = Thread { [self] in
+                defer { FindCloseChangeNotification(handle) }
+                while !isStopped {
+                    let result = WaitForSingleObject(handle, 500)
+                    if result == WAIT_TIMEOUT { continue }
+                    guard result == WAIT_OBJECT_0, !isStopped else { break }
+                    onChange()
+                    guard FindNextChangeNotification(handle) else {
+                        if !isStopped { onFailure() }
+                        return
+                    }
+                }
+            }
+            thread.name = "botbus-acp-manifests"
+            thread.start()
         }
     }
     #endif

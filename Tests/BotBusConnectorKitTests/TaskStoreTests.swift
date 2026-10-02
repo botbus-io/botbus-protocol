@@ -178,6 +178,11 @@ final class TaskStoreTests: XCTestCase {
         XCTAssertTrue(ProtocolVersion.isWellFormed(HostIdentity.linux.minClientProtocol!))
         XCTAssertFalse(ProtocolVersion.isOlder(ProtocolVersion.current, than: HostIdentity.linux.minClientProtocol!))
         XCTAssertNil(HostIdentity(platform: .windows).minClientProtocol)
+        // Windows 宿主同理：手机要认得 `platform: "windows"`，没有远程操作与预览。
+        XCTAssertEqual(HostIdentity.windows.platform, .windows)
+        XCTAssertEqual(HostIdentity.windows.minClientProtocol, "3.5")
+        XCTAssertEqual(HostIdentity.windows.capabilities?.supportsRemoteControl, false)
+        XCTAssertEqual(HostIdentity.windows.capabilities?.supportsPreviews, false)
     }
 
     /// 来源报上来的 agentId 一律以本机为准：连接器不该有能力把任务记到别的电脑名下。
@@ -395,6 +400,31 @@ final class TaskStoreTests: XCTestCase {
         XCTAssertEqual(current?.updatedAt, "2026-09-18T02:05:00Z")
         let owner = await store.owner(of: "codex:a")
         XCTAssertEqual(owner, .live)
+    }
+
+    func testLateCommandAndPreviousConnectorCannotReleaseNewRealtimeOwner() async {
+        let store = makeStore()
+        await store.upsert(task("a", .running))
+        let acp = UUID(), web = UUID()
+        await store.claimLive("codex:a", ownerToken: acp)
+        await store.releaseLive("codex:a", ownerToken: acp)
+        await store.claimLive("codex:a") // 原命令迟到的认领，旧连接器仍需补放。
+        await store.releaseLive("codex:a", ownerToken: acp)
+        var owner = await store.owner(of: "codex:a")
+        XCTAssertEqual(owner, .observer)
+        await store.claimLive("codex:a", ownerToken: web)
+        await store.claimLive("codex:a") // 临时命令不覆盖 web 的 token。
+        await store.releaseLive("codex:a", ownerToken: acp)
+        await store.releaseLive("codex:a") // 命令失败也不能释放仍在跑的 web。
+        owner = await store.owner(of: "codex:a")
+        XCTAssertEqual(owner, .live)
+        await store.releaseLive("codex:a", ownerToken: web)
+        owner = await store.owner(of: "codex:a")
+        XCTAssertEqual(owner, .observer)
+        await store.claimLive("codex:unknown", ownerToken: web)
+        await store.hide(id: "codex:unknown")
+        owner = await store.owner(of: "codex:unknown")
+        XCTAssertEqual(owner, .observer)
     }
 
     /// 命令结束后交还给 observer：SQLite 还没落盘的那几轮既不能删也不能把状态抖回去。

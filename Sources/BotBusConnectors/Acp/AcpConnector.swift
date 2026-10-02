@@ -68,6 +68,9 @@ public actor AcpConnector {
     let tools: @Sendable () -> AgentToolsConfiguration?
     let registry: TaskContextRegistry
     let archive: AcpSessionArchive
+    private let openCodeReader: OpenCodeSessionReader?
+    private var localTasks: [TaskRecord] = []
+    private var localBaselined = false
     let now: @Sendable () -> Date
     /// 健康变化（起不来、登录过期、又好了）。hub 转给 ConnectorRegistry 并重发快照。
     let onHealth: HealthHandler
@@ -112,6 +115,7 @@ public actor AcpConnector {
     var sessions: [String: AcpSessionState] = [:]
     /// 在当前子进程里建过或载入过的会话：只有它们能直接 prompt。
     var loaded: Set<String> = []
+    let liveOwnerToken = UUID()
     /// 在跑的一轮：sessionId → 发 prompt 的那个 Task。
     var turns: [String: Turn] = [:]
     /// 被我们主动关掉进程打断的轮次（配置变了、空闲）：收尾时记 interrupted。
@@ -162,6 +166,7 @@ public actor AcpConnector {
                 tools: @escaping @Sendable () -> AgentToolsConfiguration? = { nil },
                 registry: TaskContextRegistry = TaskContextRegistry(),
                 archive: AcpSessionArchive = AcpSessionArchive(url: nil),
+                openCodeReader: OpenCodeSessionReader? = nil,
                 clientVersion: String = AgentIdentity.bundleVersion(),
                 idleTimeout: TimeInterval = AcpConnector.idleTimeout,
                 initializeTimeout: TimeInterval = AcpClient.initializeTimeout,
@@ -176,6 +181,7 @@ public actor AcpConnector {
         self.tools = tools
         self.registry = registry
         self.archive = archive
+        self.openCodeReader = openCodeReader
         self.clientVersion = clientVersion
         self.idleTimeout = idleTimeout
         self.initializeTimeout = initializeTimeout
@@ -193,7 +199,7 @@ public actor AcpConnector {
     /// 所以 hub 只把基线已就绪的 agent 报给 `TaskStore.reconcileAcp`，没就绪的一律静默。
     /// 停用（`stop()`）或换了启动方式之后重新算：回来后要再静默一轮。
     public var isListBaselined: Bool {
-        listedOnce || spec.executable == nil || knownCapabilities?.listSessions == false
+        localBaselined || listedOnce || spec.executable == nil || knownCapabilities?.listSessions == false
     }
 
     /// 发现结果变了。启动方式变了就把正在跑（或正在起）的进程关掉，下一条命令按新配置拉起。
@@ -297,6 +303,12 @@ public actor AcpConnector {
         guard turns[sessionId] == nil, !preparing.contains(sessionId) else {
             throw ConnectorError("这个会话正在运行，等它这一轮结束再续聊")
         }
+        if let openCodeReader {
+            let desktop = try openCodeReader.tasks(now: now()).first { $0.id == taskId }
+            if let desktop, [.running, .waitingApproval, .waitingInput].contains(desktop.status) {
+                throw ConnectorError("这个会话正在电脑上运行，等它这一轮结束再续聊")
+            }
+        }
         // 第一个 await 之前就占位：手机和手表同时发的两条续聊不能各起一轮。
         preparing.insert(sessionId)
         defer { preparing.remove(sessionId) }
@@ -383,6 +395,9 @@ public actor AcpConnector {
     public func entries(taskId: String, limit: Int) async throws -> (entries: [TranscriptEntry], hasMore: Bool) {
         let sessionId = try sessionId(taskId)
         touchCommandActivity()
+        if let openCodeReader, turns[sessionId] == nil, reverseOwner[sessionId] == nil {
+            return try await openCodeReader.entries(taskId: taskId, limit: limit)
+        }
         if let state = sessions[sessionId] {
             let live = turns[sessionId] != nil || reverseOwner[sessionId] != nil || loaded.contains(sessionId)
             let cannotReload = knownCapabilities?.loadSession != true
@@ -457,7 +472,32 @@ public actor AcpConnector {
             record.controllable = controllable(sessionId, otherwise: record.controllable)
             byId[record.id] = record
         }
+        for var record in localTasks {
+            guard let sessionId = identity.sessionId(taskId: record.id),
+                  turns[sessionId] == nil, reverseOwner[sessionId] == nil else { continue }
+            if let existing = byId[record.id] {
+                guard record.updatedAt >= existing.updatedAt else { continue }
+                record.origin = existing.origin
+            }
+            record.controllable = spec.executable != nil
+            byId[record.id] = record
+        }
         return Array(byId.values)
+    }
+
+    /// 内置 OpenCode 的全机发现不依赖 ACP 的项目列表。读失败保留上一次结果。
+    public func refreshLocalSessions() async {
+        guard let openCodeReader, !isShutDown,
+              FileManager.default.fileExists(atPath: openCodeReader.databaseURL.path) else { return }
+        do {
+            let fresh = try openCodeReader.tasks(now: now())
+            let changed = !localBaselined || fresh != localTasks
+            localTasks = fresh
+            localBaselined = true
+            if changed { await onTasksChanged() }
+        } catch {
+            Self.log.error("opencode local session scan failed")
+        }
     }
 
     /// 刷新 `session/list`。进程没在跑就按需拉起一次；agent 不支持列表就什么都不做。
@@ -683,7 +723,7 @@ public actor AcpConnector {
     /// 3. 期间进程若被停掉或换了一代，这一轮就不发了，直接记成被中断。
     private func commitTurn(_ sessionId: String, state: AcpSessionState, taskId: String, prompt: String,
                             images: [AcpImage], running: Running) async -> ConnectorOutcome? {
-        await store.claimLive(taskId)
+        await store.claimLive(taskId, ownerToken: liveOwnerToken)
         await store.upsert(state.record)
         await archive.remember(connectorId: id, record: state.record)
         guard reverseOwner[sessionId] == nil else {
@@ -754,25 +794,26 @@ public actor AcpConnector {
 
     func release(_ taskId: String, sessionId: String) async {
         guard turns[sessionId] == nil, reverseOwner[sessionId] == nil else { return }
-        await store.releaseLive(taskId)
+        await store.releaseLive(taskId, ownerToken: liveOwnerToken)
         // 兜底：分发器在 start / interrupt 返回之后才处理所有权（同 `PiConnector.complete`）。
         // 这一轮若恰好在"回执已返回、分发器还没 claim"的空当里结束，上面那次 release 会先于 claim。
         // 直接拿着 store：`stop()` 之后 hub 会丢掉这个连接器，补放仍要执行。连接器还在时先问它
         // 期间有没有新一轮（新一轮自己拿着所有权，不能替它放）。
         let store = self.store
-        Task { [weak self] in
+        Task { [weak self, liveOwnerToken] in
             try? await Task.sleep(for: .seconds(AcpConnector.releaseRetryDelay))
             if let self {
                 await self.releaseIfIdle(taskId, sessionId: sessionId)
             } else {
-                await store.releaseLive(taskId)
+                await store.releaseLive(taskId, ownerToken: liveOwnerToken)
             }
         }
     }
 
     private func releaseIfIdle(_ taskId: String, sessionId: String) async {
-        guard turns[sessionId] == nil, reverseOwner[sessionId] == nil else { return }
-        await store.releaseLive(taskId)
+        guard turns[sessionId] == nil, reverseOwner[sessionId] == nil,
+              !preparing.contains(sessionId), loads[sessionId] == nil else { return }
+        await store.releaseLive(taskId, ownerToken: liveOwnerToken)
     }
 
     /// 会话不在当前进程里时载入它。同一会话并发的载入（续聊 + 读记录）共用一次。
@@ -855,6 +896,8 @@ public actor AcpConnector {
         if let injection { await registry.bind(injection.token, taskId: taskId) }
         guard reverseOwner[sessionId] == nil else { throw TakenOverByReverse() }
         if sessions[sessionId] == nil { sessions[sessionId] = state }
+        // resume 不重放交还期间由桌面写入的记录，原先完整的缓存也已过期。
+        sessions[sessionId]?.transcript.isComplete = false
         loaded.insert(sessionId)
     }
 
@@ -966,6 +1009,11 @@ public actor AcpConnector {
         }
         if let rpc = error as? JSONRPCError, AcpConnectorError.isSessionLockError(rpc) {
             return AcpConnectorError(.sessionBusyElsewhere, message: "这个会话正开在电脑上的 \(spec.name) 里")
+        }
+        if identity.source == .dsh, let rpc = error as? JSONRPCError,
+           let details = rpc.data?["details"]?.stringValue,
+           details.contains("uses log format"), details.contains("this harness reads only") {
+            return ConnectorError("这个会话由更新的 DeepSeek Harness 写入，请升级本机 dsh，或启动 DeepSeek Harness 桌面版后重试")
         }
         // 可能是进程退出（带 stderr）或 agent 自己的错误文本：照样给手机看，日志里不公开。
         return ConnectorError(Self.describe(error), containsPrivateDetail: true)

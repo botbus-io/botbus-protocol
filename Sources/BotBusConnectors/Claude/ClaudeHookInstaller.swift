@@ -13,7 +13,12 @@ public enum ClaudeHookInstaller {
     /// 认领自己条目的唯一凭据。脚本文件名里带着它，所以任何 `command` 含有它的条目都是我们写的，
     /// 就算用户把支持目录搬了也仍然认得出来。
     public static let marker = "botbus-claude-hook"
+    #if os(Windows)
+    /// Windows 上是 PowerShell 脚本（不依赖 Git Bash 里有没有 curl / sed），经 `powershell.exe -File` 调用。
+    public static let scriptName = "botbus-claude-hook.ps1"
+    #else
     public static let scriptName = "botbus-claude-hook.sh"
+    #endif
 
     /// 要挂的事件。`matcher` 一律为空串——按 spec，过滤放在 Agent 侧做。
     public static let events: [ClaudeHookEvent.Kind] = [
@@ -97,8 +102,17 @@ public enum ClaudeHookInstaller {
 
     /// 支持目录里有空格（`Application Support`），命令行必须带引号。
     /// 路径里的单引号按 shell 的老办法转义，免得拼出一条能被注入的命令。
+    ///
+    /// Windows：Claude Code 可能经 Git Bash 也可能经 cmd 跑这条命令，两边都认的写法是绝对路径的 `powershell.exe`
+    /// 加双引号包住的脚本路径（Windows 路径里不可能有 `"`；双引号里的 `\` 在 bash 里也原样保留）。
     static func command(_ scriptPath: String) -> String {
-        "'" + scriptPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        #if os(Windows)
+        let system = ProcessInfo.processInfo.environment["SystemRoot"] ?? "C:\\Windows"
+        let powershell = system + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+        return "\"\(powershell)\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"\(scriptPath)\""
+        #else
+        return "'" + scriptPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        #endif
     }
 
     // MARK: - 文件读写
@@ -196,7 +210,9 @@ public enum ClaudeHookInstaller {
         let url = scriptURL(in: supportDirectory)
         try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
         try Data(script.utf8).write(to: url, options: .atomic)
+        #if !os(Windows)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        #endif
         return url.path
     }
 
@@ -211,6 +227,7 @@ public enum ClaudeHookInstaller {
     /// 密钥文件是一行 curl 配置，交给 `curl --config`：密钥不进命令行（同机别的用户 `ps` 看得见 argv）。
     /// 文件不在（老版本 Agent 在跑）就不带头，macOS 上的服务端照样收。
     /// `-f`：非 2xx（例如 403）一律当作 Agent 没意见，错误 body 不会被当成 hook 输出吐给 Claude Code。
+    #if !os(Windows)
     static let script = """
     #!/bin/sh
     # BotBus 的 Claude Code hook（脚本版本 \(scriptVersion)）。由 app 写入，可以整份删掉。
@@ -242,4 +259,65 @@ public enum ClaudeHookInstaller {
     [ -n "$RESPONSE" ] && printf '%s' "$RESPONSE"
     exit 0
     """
+    #else
+    /// Windows 版：同样三条硬要求。只用 Windows 自带的 PowerShell 5.1 与 .NET，不依赖 curl。
+    ///
+    /// - 负载按原始字节读 stdin、按原始字节写 stdout：`[Console]::In` 会按控制台代码页解码，中文会坏。
+    /// - 密钥文件是那一行 curl 配置（与 macOS / Linux 同一个文件），这里解析出头的值带上。
+    /// - 非 2xx（例如 403）`GetResponse()` 直接抛异常，落进 catch，什么也不输出——与 `curl -f` 一样。
+    /// - 脚本内容只用 ASCII：PowerShell 5.1 按 ANSI 代码页读没有 BOM 的脚本。
+    static let script = """
+    # BotBus Claude Code hook (script version \(scriptVersion)). Written by BotBus; safe to delete.
+    # Forwards the hook payload to the local BotBus agent and prints its answer back to Claude Code.
+    # Always exits 0: this runs inside Claude Code's main loop and must never make it fail.
+    $ErrorActionPreference = 'Stop'
+    try {
+        $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
+        $portFile = Join-Path $dir '\(LocalHookServer.portFileName)'
+        if (-not (Test-Path -LiteralPath $portFile)) { exit 0 }
+        $port = [int]((Get-Content -LiteralPath $portFile -Raw | ConvertFrom-Json).port)
+        if ($port -le 0) { exit 0 }
+
+        $stdin = [Console]::OpenStandardInput()
+        $buffer = New-Object System.IO.MemoryStream
+        $stdin.CopyTo($buffer)
+        $payload = $buffer.ToArray()
+        $text = [System.Text.Encoding]::UTF8.GetString($payload)
+        # Only the "wait for the phone" hook is worth waiting for (30 minutes); 3 seconds for the rest.
+        $timeout = 3
+        if ($text.Contains('"\(ClaudeHookEvent.Kind.permissionRequest.rawValue)"')) { $timeout = 1800 }
+
+        $request = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$port/hooks/claude")
+        $request.Method = 'POST'
+        $request.ContentType = 'application/json'
+        $request.Proxy = $null
+        $request.Timeout = $timeout * 1000
+        $request.ReadWriteTimeout = $timeout * 1000
+        $secretFile = Join-Path $dir '\(LocalHookServer.SharedSecret.defaultFileName)'
+        if (Test-Path -LiteralPath $secretFile) {
+            $line = Get-Content -LiteralPath $secretFile -Raw
+            if ($line -match '\(LocalHookServer.SharedSecret.headerName):\\s*([^"\\s]+)') {
+                $request.Headers.Add('\(LocalHookServer.SharedSecret.headerName)', $Matches[1])
+            }
+        }
+        $request.ContentLength = $payload.Length
+        $body = $request.GetRequestStream()
+        $body.Write($payload, 0, $payload.Length)
+        $body.Close()
+
+        $response = $request.GetResponse()
+        $answer = New-Object System.IO.MemoryStream
+        $response.GetResponseStream().CopyTo($answer)
+        $response.Close()
+        # An empty answer means "no opinion": Claude Code falls back to its own permission prompt.
+        if ($answer.Length -gt 0) {
+            $out = [Console]::OpenStandardOutput()
+            $out.Write($answer.ToArray(), 0, [int]$answer.Length)
+            $out.Flush()
+        }
+    } catch {
+    }
+    exit 0
+    """
+    #endif
 }

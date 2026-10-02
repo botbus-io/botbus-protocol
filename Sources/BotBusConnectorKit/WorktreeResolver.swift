@@ -134,13 +134,21 @@ public final class WorktreeResolver: @unchecked Sendable {
 
     /// Claude app 的 `<仓库>/.claude/worktrees/<名字>` → `<仓库>`，`…/<名字>/<子目录>` → `<仓库>/<子目录>`。只看路径。
     public static func resolveByShape(_ path: String) -> String? {
-        guard let marker = path.range(of: claudeWorktreesMarker, options: .backwards),
-              marker.upperBound < path.endIndex, marker.lowerBound > path.startIndex else { return nil }
+        #if os(Windows)
+        // Windows 上的路径多半是 `C:\repo\.claude\worktrees\x`；两种分隔符都认，结果沿用原来的写法。
+        let found = path.range(of: claudeWorktreesMarker, options: .backwards)
+            ?? path.range(of: claudeWorktreesMarker.replacingOccurrences(of: "/", with: "\\"), options: .backwards)
+        let separators: Set<Character> = ["/", "\\"]
+        #else
+        let found = path.range(of: claudeWorktreesMarker, options: .backwards)
+        let separators: Set<Character> = ["/"]
+        #endif
+        guard let marker = found, marker.upperBound < path.endIndex, marker.lowerBound > path.startIndex else { return nil }
         let repository = String(path[..<marker.lowerBound])
         let rest = path[marker.upperBound...]
-        guard let slash = rest.firstIndex(of: "/") else { return repository }
+        guard let slash = rest.firstIndex(where: { separators.contains($0) }) else { return repository }
         let subpath = normalized(String(rest[rest.index(after: slash)...]))
-        return subpath.isEmpty || subpath == "/" ? repository : repository + "/" + subpath
+        return subpath.isEmpty || subpath == "/" ? repository : repository + String(rest[slash]) + subpath
     }
 
     /// 路径里有一层 `worktrees` 时，从 `path` 往上找第一个 `.git`（不越过那层 `worktrees`），按它判断。
@@ -157,7 +165,7 @@ public final class WorktreeResolver: @unchecked Sendable {
             if fileManager.fileExists(atPath: dotGit.path, isDirectory: &isDirectory) {
                 // 第一个 `.git` 就决定了：是目录说明在普通仓库里（或 worktree 里嵌着的另一个仓库），不再往上找。
                 guard !isDirectory.boolValue, let root = mainRepository(dotGitFile: dotGit) else { return nil }
-                return climbed.isEmpty ? root : root + "/" + climbed.reversed().joined(separator: "/")
+                return climbed.isEmpty ? root : PlatformPath.join(root, climbed.reversed().joined(separator: String(PlatformPath.separator)))
             }
             climbed.append(directory.lastPathComponent)
             directory = directory.deletingLastPathComponent()
@@ -178,20 +186,31 @@ public final class WorktreeResolver: @unchecked Sendable {
         let gitdirPath = line.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
         guard !gitdirPath.isEmpty else { return nil }
         let base = dotGitFile.deletingLastPathComponent()
-        let gitdir = (gitdirPath.hasPrefix("/") ? URL(fileURLWithPath: gitdirPath, isDirectory: true)
+        let gitdir = (PlatformPath.isAbsolute(gitdirPath) ? URL(fileURLWithPath: gitdirPath, isDirectory: true)
                                                 : base.appendingPathComponent(gitdirPath, isDirectory: true)).standardizedFileURL
         // submodule 指向 `.git/modules/<名字>`；bare 仓库的公共目录不叫 `.git`，没有"主仓库目录"可归。
         let worktrees = gitdir.deletingLastPathComponent()
         let commonDir = worktrees.deletingLastPathComponent()
         guard worktrees.lastPathComponent == "worktrees", commonDir.lastPathComponent == ".git" else { return nil }
+        #if os(Windows)
+        // git 在 Windows 上写 `C:/…`，Claude / Codex 报的工作目录是 `C:\…`：统一成反斜杠，项目才对得上。
+        let root = PlatformPath.normalized(normalized(commonDir.deletingLastPathComponent().path))
+        return root.isEmpty || PlatformPath.isRoot(root) ? nil : root
+        #else
         let root = normalized(commonDir.deletingLastPathComponent().path)
         return root.isEmpty || root == "/" ? nil : root
+        #endif
     }
 
-    /// 去掉首尾空白与末尾的 `/`。
+    /// 去掉首尾空白与末尾的 `/`（Windows 上 `\` 也算，盘符根 `C:\` 保留）。
     public static func normalized(_ path: String) -> String {
         var path = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        #if os(Windows)
+        while path.count > 3 || (path.count > 1 && !path.dropFirst().hasPrefix(":")),
+              path.hasSuffix("/") || path.hasSuffix("\\") { path.removeLast() }
+        #else
         while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+        #endif
         return path
     }
 

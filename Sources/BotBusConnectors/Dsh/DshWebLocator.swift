@@ -35,28 +35,36 @@ public protocol DshProcessListing: Sendable {
 public struct DshWebInstance: Hashable, Sendable {
     public var pid: Int32
     public var ports: [Int]
+    public var isDesktopHost = false
 
     public var endpoints: [DshWebEndpoint] { ports.map(DshWebEndpoint.init(port:)) }
 }
 
-/// 找本机正在跑的 `dsh web`（spec「DshWebLink」）：命令行里有 dsh 入口（`dsh` 可执行文件或 `@deepseek-ai/dsh/lib/bin.js`），
+/// 找本机正在跑的 `dsh web` 或 Electron 的 `dsh-desktop-host/lib/index.js`（同一套已鉴权 web API）：命令行里有 dsh 入口（`dsh` 可执行文件或 `@deepseek-ai/dsh/lib/bin.js`），
 /// 子命令是 `web`（或 `--profile web`）；环境里的 `DSH_HOME` 没设、或与我们用的主目录相同；再读它在回环地址上监听的端口。
 ///
-/// 纯逻辑（`isDshWeb`、`usesHome`）与枚举（`DshProcessListing`）分开，前者单测。多个实例时按 pid 升序给出，调用方取第一个能连上的。
+/// 纯逻辑（`isDshWeb`、`usesHome`）与枚举（`DshProcessListing`）分开，前者单测。桌面优先，同类按 pid 升序，调用方取第一个能连上的。
 public enum DshWebLocator {
     public static func locate(paths: DshPaths, listing: any DshProcessListing = SystemDshProcessListing()) -> [DshWebInstance] {
         listing.processes()
             .filter { isDshWeb(arguments: $0.arguments) && usesHome(environment: $0.environment, paths: paths) }
-            .sorted { $0.pid < $1.pid }
+            .sorted {
+                let left = isDesktopHost(arguments: $0.arguments)
+                let right = isDesktopHost(arguments: $1.arguments)
+                return left == right ? $0.pid < $1.pid : left
+            }
             .compactMap { process in
                 let ports = listing.listeningPorts(pid: process.pid)
-                return ports.isEmpty ? nil : DshWebInstance(pid: process.pid, ports: ports)
+                return ports.isEmpty ? nil : DshWebInstance(pid: process.pid, ports: ports,
+                    isDesktopHost: isDesktopHost(arguments: process.arguments))
             }
     }
 
     /// 命令行是不是 `dsh web`。入口之后的参数里：`--profile web` / `--profile=web`，或者第一个不以 `-` 开头的参数是 `web`。
     /// `npm exec @deepseek-ai/dsh web` 这种包名参数不算入口（它是 npm，不监听端口）。
     public static func isDshWeb(arguments: [String]) -> Bool {
+        // Electron 的桌面宿主也运行同一套已鉴权 web API。CLI 包装器 cli.js 不监听，不能认成宿主。
+        if isDesktopHost(arguments: arguments) { return true }
         guard let entry = arguments.firstIndex(where: isDshEntry) else { return false }
         let rest = Array(arguments[(entry + 1)...])
         for (index, argument) in rest.enumerated() {
@@ -71,6 +79,10 @@ public enum DshWebLocator {
             return argument == "web"
         }
         return false
+    }
+
+    static func isDesktopHost(arguments: [String]) -> Bool {
+        arguments.contains { $0.hasSuffix("/@deepseek-ai/dsh-desktop-host/lib/index.js") }
     }
 
     static func isDshEntry(_ argument: String) -> Bool {

@@ -3,6 +3,35 @@ import BotBusProtocol
 @testable import BotBusConnectorKit
 @testable import BotBusConnectors
 
+final class DshToolsPromptTests: XCTestCase {
+    func testIdleContextPipeKeepsOnlyOneCompleteCredentialRecord() async throws {
+        #if !os(Windows)
+        let context = try DshToolsContext(injection: AgentToolsInjection(
+            configuration: AgentToolsConfiguration(cliPath: "/bin/sh", toolsURL: "http://127.0.0.1:1234"),
+            token: "synthetic-token"))
+        try await Task.sleep(for: .milliseconds(800))
+        let reader = try FileHandle(forReadingFrom: URL(fileURLWithPath: context.path))
+        let data = reader.availableData
+        try reader.close()
+        await context.shutdown()
+        XCTAssertEqual(data.filter { $0 == 10 }.count, 1, "空闲时不能累积多条 JSON；CLI 的下次读取不能从半条记录开始")
+        XCTAssertEqual(data.last, 10)
+        #endif
+    }
+
+    func testOnlyBotBusWebMessagesHideTheAppendedCLIContext() {
+        let text = "分享网页\n\n<botbus-cli-context>\nCLI instructions\n</botbus-cli-context>"
+        func event(_ rpcId: String) -> DshSessionEvent {
+            DshSessionEvent(json: DshFixture.event("user/message", 1,
+                ["id": "u1", "content": [["type": "text", "text": .string(text)]],
+                 "source": ["kind": "user", "rpcId": .string(rpcId)]]))!
+        }
+        XCTAssertEqual(event("botbus-tools-test").text, "分享网页")
+        XCTAssertEqual(event("user-rpc").text, text)
+        XCTAssertEqual(DshTranscriptParser.entries(from: [event("botbus-tools-test")]).first?.message.text, "分享网页")
+    }
+}
+
 /// dsh 会话日志的形状照真实 0.1.5-rc.3 的日志抄的，内容全是编的。
 enum DshFixture {
     static let header: JSONValue = ["type": "session", "version": 3, "id": "sess-1", "createdAt": 1_790_485_686_415,

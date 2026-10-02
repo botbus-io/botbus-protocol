@@ -38,12 +38,19 @@ public struct DesktopResumeCommand: Hashable, Sendable {
 
 public enum DesktopResume {
     /// 按任务来源拼命令。`executable` 是该 Agent 的 CLI；Pi 另要会话记录文件（续聊只认绝对路径，见 `PiConnector`）。
-    /// 返回 nil = 拼不出来（id 不带来源前缀、Pi 找不到记录文件、ACP agent）。
+    /// 返回 nil = 拼不出来（id 不带来源前缀、Pi 找不到记录文件、未适配终端接续的 ACP agent）。
     public static func command(for task: TaskRecord, executable: String,
                                piSessionFile: String? = nil) -> DesktopResumeCommand? {
         let prefix = "\(task.source.rawValue):"
         guard task.id.hasPrefix(prefix) else { return nil }
-        let native = String(task.id.dropFirst(prefix.count))
+        let native: String
+        if task.source == .acp {
+            guard task.connectorId == "opencode", let parsed = AcpTaskID.parse(task.id),
+                  parsed.connectorId == "opencode" else { return nil }
+            native = parsed.sessionId
+        } else {
+            native = String(task.id.dropFirst(prefix.count))
+        }
         guard !native.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
         let directory = task.workingDirectory
         let arguments: [String]
@@ -62,10 +69,12 @@ public enum DesktopResume {
         case .openclaw:
             arguments = ["tui", "--session", native]
             pathDirectories = AgentBinary.pathDirectories(for: executable)
-        case .acp, .dsh:
+        case .acp:
+            arguments = ["--session", native]
+            pathDirectories = AgentBinary.pathDirectories(for: executable)
+        case .dsh:
             // dsh（0.1.5-rc.3）没有能核实的接续方式：网页端前端没有按会话的地址（打开只能进首页再在列表里点），
             // `dsh --profile tui --resume` 只是帮助里的示例，随包的 profile 模板（acp / web / headless / sdk / sdk-minimal）里没有交互终端。先不拼。
-            // ACP 没有通用的「交互模式接上某条会话」的命令行，各家不一样；第一期不拼。
             return nil
         }
         return DesktopResumeCommand(executable: executable, arguments: arguments, workingDirectory: directory,
@@ -85,7 +94,10 @@ public enum DesktopResume {
             executable = PiPaths.detectPiBinary()
             let native = String(task.id.dropFirst("\(TaskSource.pi.rawValue):".count))
             piSessionFile = PiSessionReader(paths: PiPaths()).sessionFile(for: native)?.path
-        case .acp, .dsh:
+        case .acp:
+            guard task.connectorId == "opencode" else { return nil }
+            executable = OpenCodeSessionReader.detectBinary()
+        case .dsh:
             return nil
         }
         guard let executable else { return nil }

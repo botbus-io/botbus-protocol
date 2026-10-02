@@ -16,7 +16,7 @@ public struct AgentToolsConfiguration: Sendable, Hashable {
 
     /// CLI 真的在那儿且可执行、地址非空。每次注入前现查：app 被挪走或 CLI 被删了就别往 agent 手里塞一个坏路径。
     public var isUsable: Bool {
-        !toolsURL.isEmpty && !cliPath.isEmpty && FileManager.default.isExecutableFile(atPath: cliPath)
+        !toolsURL.isEmpty && !cliPath.isEmpty && PlatformPath.isExecutableFile(cliPath)
     }
 }
 

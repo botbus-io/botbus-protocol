@@ -2,6 +2,12 @@ import BotBusConnectorKit
 /// Finds the Codex subcommand after global options. The desktop currently passes
 /// `-c <override>` before `app-server`, so inspecting the first argument misses it.
 public enum CodexBridgeInvocation {
+    /// Helper settings also reach desktop tools. Their app-servers must not publish
+    /// a descriptor or replace the connection owned by the main desktop app.
+    public static func shouldBridge(_ arguments: [String], parentBundleIdentifier: String?) -> Bool {
+        parentBundleIdentifier == "com.openai.codex" && isAppServer(arguments)
+    }
+
     private static let valueOptions: Set<String> = [
         "-c", "--config", "--enable", "--disable", "--remote",
         "--remote-auth-token-env", "-i", "--image", "-m", "--model",

@@ -17,7 +17,19 @@ public struct OutsideProjectRule: Sendable, Equatable {
 
     /// 主目录下本身不算项目的那几个目录。
     public static let homeSubdirectories = ["Desktop", "Downloads", "Documents"]
+    #if os(Windows)
+    /// Windows：系统盘根与临时目录（`normalized` 已统一成 `\`，比较时不分大小写）。
+    public static let systemDirectories: [String] = {
+        let environment = ProcessInfo.processInfo.environment
+        var directories = [(environment["SystemDrive"] ?? "C:") + "\\"]
+        for key in ["TEMP", "TMP"] {
+            if let value = environment[key], !value.isEmpty { directories.append(normalized(value, home: "")) }
+        }
+        return directories
+    }()
+    #else
     public static let systemDirectories = ["/", "/tmp", "/private/tmp"]
+    #endif
 
     public init(homeDirectory: String = NSHomeDirectory(), agentWorkspaces: [TaskSource: String] = [:],
                 projectsRoot: String? = nil) {
@@ -30,20 +42,26 @@ public struct OutsideProjectRule: Sendable, Equatable {
     public func contains(_ path: String) -> Bool {
         let home = Self.normalized(homeDirectory, home: "")
         let path = Self.normalized(path, home: home)
-        if path.isEmpty || Self.systemDirectories.contains(path) { return true }
+        if path.isEmpty || Self.systemDirectories.contains(where: { PlatformPath.same($0, path) }) { return true }
         if !home.isEmpty {
-            if path == home { return true }
-            if Self.homeSubdirectories.contains(where: { path == home + "/" + $0 }) { return true }
+            if PlatformPath.same(path, home) { return true }
+            if Self.homeSubdirectories.contains(where: { PlatformPath.same(path, PlatformPath.join(home, $0)) }) { return true }
         }
         let others = Array(agentWorkspaces.values) + (projectsRoot.map { [$0] } ?? [])
-        return others.contains { !$0.isEmpty && Self.normalized($0, home: home) == path }
+        return others.contains { !$0.isEmpty && PlatformPath.same(Self.normalized($0, home: home), path) }
     }
 
     /// 去掉首尾空白与末尾的 `/`，开头的 `~` 按规则里的主目录展开（不读进程环境，测试才能注入）。根目录 `/` 保持原样。
+    /// Windows 上分隔符统一成 `\`（盘符根 `C:\` 保持原样）。
     public static func normalized(_ path: String, home: String) -> String {
         var path = path.trimmingCharacters(in: .whitespacesAndNewlines)
         if !home.isEmpty, path == "~" || path.hasPrefix("~/") { path = home + path.dropFirst() }
+        #if os(Windows)
+        if !home.isEmpty, path.hasPrefix("~\\") { path = home + path.dropFirst() }
+        return path.isEmpty ? path : PlatformPath.normalized(path)
+        #else
         while path.count > 1, path.hasSuffix("/") { path.removeLast() }
         return path
+        #endif
     }
 }

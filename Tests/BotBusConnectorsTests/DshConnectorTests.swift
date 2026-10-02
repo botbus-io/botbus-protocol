@@ -16,6 +16,9 @@ final class FakeDshWeb: @unchecked Sendable {
     let answers = Locked<[JSONValue]>([])
     let cancels = Locked<[String]>([])
     let pages = Locked<Int>(0)
+    let adoptions = Locked<[JSONValue]>([])
+    let workspacePaths = Locked<[String]>([])
+    let adoptionFailures = Locked<Int>(0)
     /// `$events/result` 的回应（默认成功）。
     let answerError = Locked<String?>(nil)
 
@@ -24,6 +27,21 @@ final class FakeDshWeb: @unchecked Sendable {
         http.respond = { [unowned self] method, body in
             let args = body.path("payload", "args")
             switch method {
+            case "workspace/create":
+                self.workspacePaths.withLock { $0.append(args?.path("request", "path")?.stringValue ?? "") }
+                return Self.ok(["workspace": ["workspaceId": "workspace-1"], "created": false])
+            case "session/create":
+                let request = args?["request"] ?? .null
+                self.adoptions.withLock { $0.append(request) }
+                let fail = self.adoptionFailures.withLock { count in
+                    if count == 0 { return false }
+                    count -= 1
+                    return true
+                }
+                if fail {
+                    return (200, ["result": ["ok": false, "error": ["code": "session/busy", "message": "writer busy"]]])
+                }
+                return Self.ok(["sessionId": request["sessionId"] ?? .null])
             case "session/list": return Self.ok(["items": .array(self.sessions.current)])
             case "session/prompt":
                 self.prompts.withLock { $0.append(args?["request"] ?? .null) }
@@ -143,9 +161,12 @@ final class DshTimers: @unchecked Sendable {
 
 private struct OneProcess: DshProcessListing {
     var home: URL?
+    var desktop = false
     func processes() -> [DshProcessInfo] {
         guard let home else { return [] }
-        return [DshProcessInfo(pid: 4242, arguments: ["node", "/x/node_modules/.bin/dsh", "web", "--port", "3181"],
+        let arguments = desktop ? ["Electron", "/x/@deepseek-ai/dsh-desktop-host/lib/index.js"]
+            : ["node", "/x/node_modules/.bin/dsh", "web", "--port", "3181"]
+        return [DshProcessInfo(pid: 4242, arguments: arguments,
                                environment: ["HOME": "/Users/nobody", "DSH_HOME": home.path])]
     }
     func listeningPorts(pid: Int32) -> [Int] { pid == 4242 ? [3181] : [] }
@@ -216,7 +237,8 @@ final class DshConnectorTests: XCTestCase {
 
     private func makeHarness(listing: any DshProcessListing, installation: DshInstallation?,
                              behavior: FakeAcpBehavior = FakeAcpBehavior(),
-                             webPlans: [FakeTransport.Plan] = []) async -> Harness {
+                             webPlans: [FakeTransport.Plan] = [], tools: AgentToolsConfiguration? = nil,
+                             contexts: TaskContextRegistry = TaskContextRegistry()) async -> Harness {
         let registry = ConnectorRegistry(descriptors: [ConnectorDescriptor.dsh(paths: { [home] in DshPaths(home: home) },
                                                                                installation: { installation })])
         let store = TaskStore(identity: AgentIdentity(agentId: "agent-1", name: "Mac", appVersion: "1.0"), connectors: registry)
@@ -232,6 +254,7 @@ final class DshConnectorTests: XCTestCase {
         let tick = Self.timing.tick
         let connector = DshConnector(
             store: store, paths: DshPaths(home: home), installation: { installation }, launcher: queue.factory,
+            tools: { tools }, registry: contexts,
             http: web.http, webSocket: web.transport, listing: listing,
             loadSecret: { _ in SymmetricKey(data: Data(0..<32)) },
             transcriptRunner: { _, _, _ in throw ConnectorError("测试里不跑 node") },
@@ -349,7 +372,95 @@ final class DshConnectorTests: XCTestCase {
 
     // MARK: - 新建与续聊（ACP）
 
-    func testStartGoesThroughAcpAndFollowUpStaysInProcess() async throws {
+    func testCompletedPhoneTurnReleasesAcpWriterAndHistoryReadsDesktopContinuation() async throws {
+        let behavior = FakeAcpBehavior()
+        behavior.capabilities = Self.resumeOnly
+        let h = await makeHarness(listing: OneProcess(home: nil), installation: installed, behavior: behavior)
+        await h.connector.start()
+        let outcome = try await h.connector.start(projectPath: project, prompt: "手机首轮", images: [])
+        await assertEventually { await h.task(outcome.taskId)?.status == .completed }
+        await assertEventually { await h.connector.acp.isInProcess(taskId: outcome.taskId) == false }
+        try writeSession("sess-1", events: [Self.userMessage("电脑续聊", seq: 1, at: Date()),
+                                             Self.reply("电脑的新回复", seq: 2, at: Date())], modified: Date())
+        let history = try await h.connector.transcript(taskId: outcome.taskId, limit: 40)
+        XCTAssertEqual(history.entries.map(\.message.text), ["电脑续聊", "电脑的新回复"])
+        await h.connector.stop()
+    }
+
+    func testImmediateIdleTimeoutKeepsActiveTurnAndConcurrentSessionPreparation() async throws {
+        let turn = Gate()
+        let preparation = Gate()
+        addTeardownBlock { turn.open(); preparation.open() }
+        let behavior = FakeAcpBehavior()
+        behavior.capabilities = Self.resumeOnly
+        behavior.onPrompt = { _, _ in await turn.wait(); return "end_turn" }
+        let h = await makeHarness(listing: OneProcess(home: nil), installation: installed, behavior: behavior)
+        await h.connector.start()
+        let first = try await h.connector.start(projectPath: project, prompt: "第一轮", images: [])
+        await assertEventually { behavior.methods().contains("session/prompt") }
+        await h.connector.tick()
+        let running = await h.connector.acp.isInProcess(taskId: first.taskId)
+        XCTAssertTrue(running)
+        behavior.onNewSession = { await preparation.wait() }
+        let second = Task { try await h.connector.start(projectPath: project, prompt: "另一会话", images: []) }
+        await assertEventually { behavior.methods().filter { $0 == "session/new" }.count == 2 }
+        turn.open()
+        await assertEventually { await h.task(first.taskId)?.status == .completed }
+        let preparingProcess = await h.connector.acp.isRunning
+        XCTAssertTrue(preparingProcess, "仍在处理 session/new 时不能退出进程")
+        preparation.open()
+        let other = try await second.value
+        await assertEventually { await h.task(other.taskId)?.status == .completed }
+        await assertEventually { await h.connector.acp.isRunning == false }
+        await h.connector.stop()
+    }
+
+    func testAcpDelayedReleaseDoesNotReleaseNextWebTurn() async throws {
+        let behavior = FakeAcpBehavior()
+        behavior.capabilities = Self.resumeOnly
+        let h = await makeHarness(listing: OneProcess(home: home), installation: installed, behavior: behavior)
+        h.web.sessions.withLock { $0 = [FakeDshWeb.summary("sess-1", cwd: project, updatedAt: Date())] }
+        await h.connector.start()
+        await connectWeb(h)
+        let outcome = try await h.connector.start(projectPath: project, prompt: "手机首轮", images: [])
+        await assertEventually { await h.task(outcome.taskId)?.status == .completed }
+        h.web.emit("api-session/status", ["sess-1", true])
+        await assertEventually { h.web.streamId("session/follow", sessionId: "sess-1") != nil }
+        h.web.follow("sess-1", ["type": "snapshot", "header": ["id": "sess-1"], "cursor": 1,
+                                "hasMore": false, "records": [FakeDshWeb.event("turn/start", seq: 1, at: Date(), ["turn": 2])]])
+        await assertEventually { await h.isLiveAndRunning(outcome.taskId) }
+        h.web.events(["type": "waterfall", "event": "approval/request", "eventId": "next-approval", "agentId": "sess-1",
+                      "request": ["toolName": "bash", "callId": "next", "reason": "下一轮的审批"]])
+        await assertEventually { await h.task(outcome.taskId)?.status == .waitingApproval }
+        try await Task.sleep(for: .seconds(AcpConnector.releaseRetryDelay + 0.1))
+        await h.connector.tick()
+        let owner = await h.store.owner(of: outcome.taskId)
+        let task = await h.task(outcome.taskId)
+        XCTAssertEqual(owner, .live)
+        XCTAssertEqual(task?.status, .waitingApproval)
+        XCTAssertEqual(task?.pendingRequest?.id, "next-approval")
+        await h.connector.stop()
+    }
+
+    func testResumeAfterHandoffInvalidatesPreviouslyCompleteTranscript() async throws {
+        let behavior = FakeAcpBehavior()
+        behavior.capabilities = Self.resumeOnly
+        let h = await makeHarness(listing: OneProcess(home: nil), installation: installed, behavior: behavior)
+        await h.connector.start()
+        let first = try await h.connector.start(projectPath: project, prompt: "手机首轮", images: [])
+        await assertEventually { await h.connector.acp.isInProcess(taskId: first.taskId) == false }
+        let gate = Gate()
+        addTeardownBlock { gate.open() }
+        behavior.onPrompt = { _, _ in await gate.wait(); return "end_turn" }
+        _ = try await h.connector.followUp(taskId: first.taskId, prompt: "电脑续聊后手机接上", images: [])
+        await assertEventually { behavior.methods().filter { $0 == "session/prompt" }.count == 2 }
+        let cached = await h.connector.acp.completeTranscript(taskId: first.taskId, limit: 40)
+        XCTAssertNil(cached, "resume 不重放桌面期间的历史，不能认为旧缓存完整")
+        gate.open()
+        await h.connector.stop()
+    }
+
+    func testStartGoesThroughAcpAndFollowUpResumesAfterHandoff() async throws {
         let behavior = FakeAcpBehavior()
         behavior.capabilities = Self.resumeOnly
         let h = await makeHarness(listing: OneProcess(home: nil), installation: installed, behavior: behavior)
@@ -362,19 +473,94 @@ final class DshConnectorTests: XCTestCase {
         XCTAssertEqual(record?.source, .dsh)
         XCTAssertEqual(h.queue.requests.current.first?.environment["DSH_HOME"], home.path)
         XCTAssertEqual(h.queue.requests.current.first?.arguments, ["--profile", "acp"])
+        await assertEventually { await h.connector.acp.isInProcess(taskId: outcome.taskId) == false }
 
         _ = try await h.connector.followUp(taskId: "dsh:sess-1", prompt: "再来", images: [])
         await assertEventually { h.behavior.methods().filter { $0 == "session/prompt" }.count == 2 }
-        XCTAssertFalse(h.behavior.methods().contains("session/resume"), "在进程里的会话直接 prompt")
+        XCTAssertTrue(h.behavior.methods().contains("session/resume"), "交还后重新接上同一个会话")
         XCTAssertTrue(h.web.prompts.current.isEmpty)
-
-        // 读记录：内存里齐全，不读盘、不问 web。
+        await assertEventually { await h.connector.acp.isInProcess(taskId: outcome.taskId) == false }
+        try writeSession("sess-1", events: [Self.userMessage("你好", seq: 1, at: Date()),
+                                             Self.reply("好的", seq: 2, at: Date())])
+        // 交还之后的记录从持久层读取。
         let (entries, _) = try await h.connector.transcript(taskId: "dsh:sess-1", limit: 40)
         XCTAssertEqual(entries.first?.message.text, "你好")
         do {
             _ = try await h.connector.start(projectPath: project, prompt: "图", images: [URL(fileURLWithPath: "/tmp/x.png")])
             XCTFail("不收图")
         } catch {}
+        await h.connector.stop()
+    }
+
+    func testNewPhoneSessionJoinsDesktopWorkspaceOnlyAfterAcpReleasesWriter() async throws {
+        let gate = Gate()
+        addTeardownBlock { gate.open() }
+        let behavior = FakeAcpBehavior()
+        behavior.capabilities = Self.resumeOnly
+        behavior.onPrompt = { _, _ in await gate.wait(); return "end_turn" }
+        let h = await makeHarness(listing: OneProcess(home: home, desktop: true), installation: installed, behavior: behavior)
+        h.web.sessions.withLock { $0 = [FakeDshWeb.summary("desktop-old", cwd: project, updatedAt: Date())] }
+        await h.connector.start()
+        await connectWeb(h)
+        let outcome = try await h.connector.start(projectPath: project, prompt: "手机新会话", images: [])
+        await assertEventually { behavior.methods().contains("session/prompt") }
+        await h.connector.tick()
+        XCTAssertTrue(h.web.adoptions.current.isEmpty, "首轮运行时不能让桌面争抢 ACP 写锁")
+        gate.open()
+        await assertEventually { await h.connector.acp.isInProcess(taskId: outcome.taskId) == false }
+        await h.connector.tick()
+        await assertEventually { h.web.adoptions.current.count == 1 }
+        XCTAssertEqual(h.web.adoptions.current, [["sessionId": "sess-1", "workspaceId": "workspace-1"]])
+        XCTAssertEqual(h.web.workspacePaths.current, [try XCTUnwrap(TranscriptFileRefs.realPath(project))], "按真实 cwd 接入工作区")
+        XCTAssertNil(h.web.streamId("session/follow", sessionId: "sess-1"), "接入空闲会话不打开历史 follow")
+        await h.connector.tick()
+        XCTAssertEqual(h.web.adoptions.current.count, 1, "不重复接入，也不载入其他桌面会话")
+        await h.connector.stop()
+    }
+
+    func testDesktopHandoffRetriesBusyWriterWithoutFailingCompletedPhoneTask() async throws {
+        let behavior = FakeAcpBehavior()
+        behavior.capabilities = Self.resumeOnly
+        let h = await makeHarness(listing: OneProcess(home: home, desktop: true), installation: installed, behavior: behavior)
+        h.web.adoptionFailures.withLock { $0 = 1 }
+        await h.connector.start()
+        await connectWeb(h)
+        let outcome = try await h.connector.start(projectPath: project, prompt: "手机新会话", images: [])
+        await assertEventually { h.web.adoptions.current.count == 2 }
+        let record = await h.task(outcome.taskId)
+        XCTAssertEqual(record?.status, .completed)
+        await h.connector.tick()
+        XCTAssertEqual(h.web.adoptions.current.count, 2)
+        await h.connector.stop()
+    }
+
+    func testStandaloneWebDoesNotAdoptPhoneSessionIntoDesktopWorkspace() async throws {
+        let behavior = FakeAcpBehavior()
+        behavior.capabilities = Self.resumeOnly
+        let h = await makeHarness(listing: OneProcess(home: home), installation: installed, behavior: behavior)
+        await h.connector.start()
+        await connectWeb(h)
+        let outcome = try await h.connector.start(projectPath: project, prompt: "手机新会话", images: [])
+        await assertEventually { await h.connector.acp.isInProcess(taskId: outcome.taskId) == false }
+        await h.connector.tick()
+        XCTAssertTrue(h.web.adoptions.current.isEmpty)
+        XCTAssertTrue(h.web.workspacePaths.current.isEmpty)
+        await h.connector.stop()
+    }
+
+    func testDesktopHandoffUsesSameRealDirectoryAsAcpForSymlinkProject() async throws {
+        let alias = root.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(atPath: alias.path, withDestinationPath: project)
+        let real = try XCTUnwrap(TranscriptFileRefs.realPath(project))
+        let behavior = FakeAcpBehavior()
+        behavior.capabilities = Self.resumeOnly
+        let h = await makeHarness(listing: OneProcess(home: home, desktop: true), installation: installed, behavior: behavior)
+        await h.connector.start()
+        await connectWeb(h)
+        _ = try await h.connector.start(projectPath: alias.path, prompt: "软链接项目", images: [])
+        await assertEventually { h.web.adoptions.current.count == 1 }
+        XCTAssertEqual(behavior.params.current["session/new"]?["cwd"]?.stringValue, real)
+        XCTAssertEqual(h.web.workspacePaths.current, [real], "桌面严格比较 session header cwd 与工作区 realpath")
         await h.connector.stop()
     }
 
@@ -436,6 +622,119 @@ final class DshConnectorTests: XCTestCase {
     }
 
     // MARK: - web
+
+    func testWebFollowUpSuppliesPrivateCLIContextAndReusesTheTaskToken() async throws {
+        #if os(Windows)
+        throw XCTSkip("DSH CLI context pipes require POSIX")
+        #else
+        let contexts = TaskContextRegistry()
+        let tools = AgentToolsConfiguration(cliPath: "/bin/sh", toolsURL: "http://127.0.0.1:1234")
+        let h = await makeHarness(listing: OneProcess(home: home), installation: installed,
+                                  tools: tools, contexts: contexts)
+        h.web.sessions.withLock { $0 = [FakeDshWeb.summary("s-desk", cwd: project, updatedAt: Date())] }
+        await h.connector.start()
+        await connectWeb(h)
+        let before = await contexts.token(for: "dsh:s-desk")
+        XCTAssertNil(before, "观察电脑会话不能签发工具凭据")
+
+        _ = try await h.connector.followUp(taskId: "dsh:s-desk", prompt: "分享网页", images: [])
+        let prompt = try XCTUnwrap(h.web.prompts.current.first?["content"]?[0]?["text"]?.stringValue)
+        XCTAssertTrue(prompt.contains("BOTBUS_CONTEXT_PIPE="), "网页续聊需要可调用的 CLI 上下文")
+        let issued = await contexts.token(for: "dsh:s-desk")
+        let token = try XCTUnwrap(issued)
+        XCTAssertFalse(prompt.contains(token), "任务 token 不进提示词 / 会话记录")
+        let pipe = try XCTUnwrap(prompt.components(separatedBy: "BOTBUS_CONTEXT_PIPE='").dropFirst().first?
+            .components(separatedBy: "'").first)
+        let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: pipe))
+        let data = handle.availableData
+        try handle.close()
+        let line = try XCTUnwrap(data.split(separator: 10).first)
+        let environment = try JSONDecoder().decode([String: String].self, from: Data(line))
+        XCTAssertEqual(environment[AgentToolsInjection.taskTokenVariable], token)
+        XCTAssertEqual(environment[AgentToolsInjection.toolsURLVariable], tools.toolsURL)
+        let bound = await contexts.taskId(for: token)
+        XCTAssertEqual(bound, "dsh:s-desk")
+        _ = try await h.connector.followUp(taskId: "dsh:s-desk", prompt: "再分享文件", images: [])
+        let reused = await contexts.token(for: "dsh:s-desk")
+        XCTAssertEqual(reused, token)
+        await h.connector.stop()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: pipe))
+        #endif
+    }
+
+    func testConcurrentWebFollowUpsShareOneLiveCLIContext() async throws {
+        #if !os(Windows)
+        let contexts = TaskContextRegistry()
+        let tools = AgentToolsConfiguration(cliPath: "/bin/sh", toolsURL: "http://127.0.0.1:1234")
+        let h = await makeHarness(listing: OneProcess(home: home), installation: installed,
+                                  tools: tools, contexts: contexts)
+        h.web.sessions.withLock { $0 = [FakeDshWeb.summary("s-desk", cwd: project, updatedAt: Date())] }
+        await h.connector.start()
+        await connectWeb(h)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<20 {
+                group.addTask { _ = try await h.connector.followUp(taskId: "dsh:s-desk", prompt: "分享", images: []) }
+            }
+            try await group.waitForAll()
+        }
+        let count = await contexts.tokenCount
+        XCTAssertEqual(count, 1, "同任务并发续聊不能签发多份凭据")
+        let paths = Set(h.web.prompts.current.compactMap { request in
+            request["content"]?[0]?["text"]?.stringValue?.components(separatedBy: "BOTBUS_CONTEXT_PIPE='")
+                .dropFirst().first?.components(separatedBy: "'").first
+        })
+        XCTAssertEqual(paths.count, 1)
+        XCTAssertTrue(paths.allSatisfy { FileManager.default.fileExists(atPath: $0) })
+        // 凭据淘汰后，换掉旧管道的 shutdown 也会让出 actor；并发续聊仍只能建一份。
+        for i in 0..<TaskContextRegistry.maxTokens { _ = await contexts.issue(for: "other-\(i)") }
+        let promptCount = h.web.prompts.current.count
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<20 {
+                group.addTask { _ = try await h.connector.followUp(taskId: "dsh:s-desk", prompt: "再分享", images: []) }
+            }
+            try await group.waitForAll()
+        }
+        let replacementPaths = Set(h.web.prompts.current.dropFirst(promptCount).compactMap { request in
+            request["content"]?[0]?["text"]?.stringValue?.components(separatedBy: "BOTBUS_CONTEXT_PIPE='")
+                .dropFirst().first?.components(separatedBy: "'").first
+        })
+        XCTAssertEqual(replacementPaths.count, 1)
+        XCTAssertTrue(replacementPaths.allSatisfy { FileManager.default.fileExists(atPath: $0) })
+        XCTAssertTrue(paths.allSatisfy { !FileManager.default.fileExists(atPath: $0) })
+        await h.connector.stopSubprocesses()
+        XCTAssertTrue(replacementPaths.allSatisfy { !FileManager.default.fileExists(atPath: $0) })
+        await h.connector.stop()
+        #endif
+    }
+
+    func testUnpairInvalidatesSuspendedWebToolsContextCreation() async throws {
+        #if !os(Windows)
+        let entered = Locked(false)
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+        let contexts = TaskContextRegistry(generateToken: {
+            entered.withLock { $0 = true }
+            _ = gate.wait(timeout: .now() + 5)
+            return "synthetic-dsh-token"
+        })
+        let tools = AgentToolsConfiguration(cliPath: "/bin/sh", toolsURL: "http://127.0.0.1:1234")
+        let h = await makeHarness(listing: OneProcess(home: home), installation: installed,
+                                  tools: tools, contexts: contexts)
+        h.web.sessions.withLock { $0 = [FakeDshWeb.summary("s-desk", cwd: project, updatedAt: Date())] }
+        await h.connector.start()
+        await connectWeb(h)
+        let follow = Task { try await h.connector.followUp(taskId: "dsh:s-desk", prompt: "分享", images: []) }
+        await assertEventually { entered.current }
+        await h.connector.stopSubprocesses()
+        gate.signal()
+        do {
+            _ = try await follow.value
+            XCTFail("解除配对后不能补建管道、继续下发提示词")
+        } catch {}
+        XCTAssertTrue(h.web.prompts.current.isEmpty)
+        await h.connector.stop()
+        #endif
+    }
 
     func testWebListFollowsRunningSessionsAndSettles() async throws {
         let now = Date()

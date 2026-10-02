@@ -425,11 +425,32 @@ final class DshWebLocatorTests: XCTestCase {
         XCTAssertTrue(DshWebLocator.usesHome(environment: [:], paths: mine))
     }
 
+    func testDesktopHostIsLocatedWithoutAcceptingCliOrOtherHomes() {
+        let host = "/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/index.js"
+        let cli = host.replacingOccurrences(of: "index.js", with: "cli.js")
+        let listing = FakeListing(list: [
+            DshProcessInfo(pid: 1, arguments: ["Electron", host, "/runtime", "/project"], environment: ["HOME": "/Users/me"]),
+            DshProcessInfo(pid: 2, arguments: ["Electron", host], environment: ["DSH_HOME": "/other"]),
+            DshProcessInfo(pid: 3, arguments: ["Electron", cli, "--profile", "acp"], environment: ["HOME": "/Users/me"]),
+        ], ports: [1: [19387], 2: [19388], 3: [19389]])
+        XCTAssertEqual(DshWebLocator.locate(paths: paths, listing: listing), [DshWebInstance(pid: 1, ports: [19387], isDesktopHost: true)])
+    }
+
     private struct FakeListing: DshProcessListing {
         var list: [DshProcessInfo]
         var ports: [Int32: [Int]]
         func processes() -> [DshProcessInfo] { list }
         func listeningPorts(pid: Int32) -> [Int] { ports[pid] ?? [] }
+    }
+
+    func testDesktopHostIsPreferredOverOlderStandaloneWebInSameHome() {
+        let listing = FakeListing(list: [
+            DshProcessInfo(pid: 1, arguments: ["dsh", "web"], environment: ["HOME": "/Users/me"]),
+            DshProcessInfo(pid: 9, arguments: ["Electron", "/x/@deepseek-ai/dsh-desktop-host/lib/index.js"],
+                           environment: ["HOME": "/Users/me"]),
+        ], ports: [1: [3181], 9: [19387]])
+        let found = DshWebLocator.locate(paths: DshPaths(home: URL(fileURLWithPath: "/Users/me/.dsh")), listing: listing)
+        XCTAssertEqual(found.map(\.pid), [9, 1])
     }
 
     func testLocateFiltersAndSortsByPid() {
@@ -461,6 +482,8 @@ final class DshWebLocatorTests: XCTestCase {
         XCTAssertNil(SystemDshProcessListing.parseProcArgs([1, 0, 0]))
     }
 
+    // Windows 上还没有进程与端口枚举（`SystemDshProcessListing` 返回空，退回磁盘扫描）。
+    #if !os(Windows)
     /// 真实枚举能跑通（本进程一定在列表里）；不看别的进程的内容。
     func testSystemListingSeesThisProcess() {
         let me = getpid()
@@ -477,6 +500,7 @@ final class DshWebLocatorTests: XCTestCase {
         defer { Task { await server.stop() } }
         XCTAssertTrue(SystemDshProcessListing().listeningPorts(pid: getpid()).contains(Int(port)))
     }
+    #endif
 
     /// Linux 的 `/proc/net/tcp{,6}`：只要 LISTEN、inode 对得上、本地地址是回环或全零的。
     func testParsesProcNetTCP() {
