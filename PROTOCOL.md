@@ -174,7 +174,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 | GET | /client/snapshot?since=N | client | | 200 SealedSnapshot；304 无变化（最多挂 25 秒）；401 |
 | GET | /client/ws?since=N | client | `Upgrade: websocket` | 101，之后推送 ClientFrame（见「WebSocket 帧」）；401；403 角色不符；426 缺 `Upgrade: websocket` |
 | POST | /client/commands | client | SealedCommand | 202 `{commandId, delivered}`；400 格式错（含 2.x 的明文命令）；404 `agentId` 不属于本 Pair；413 单条超过 16 KiB；503 该 Agent 的离线队列已满（50 条） |
-| POST | /client/devices | client | `{token, platform: ios\|watchos\|android, environment: sandbox\|production, sealedName}`（3.0：设备名是密文，AAD `client`；Android 固定传 `production`，FCM 不使用该字段） | 204；400 格式错或 token 超过 4096 字符；409 已有 10 台设备 |
+| POST | /client/devices | client | `{token, platform: ios\|watchos\|android, environment: sandbox\|production, sealedName}`（3.0：设备名是密文，AAD `client`；Android 固定传 `production`，FCM 不使用该字段） | 204；iOS / Android 登记时将名称密文同步到所属手机凭据，供 `/pair/clients` 与 `/agent/devices` 显示改名；手表不覆盖手机名。400 格式错或 token 超过 4096 字符；409 已有 10 台设备 |
 | DELETE | /client/devices/:token | client | | 204；400 token 百分号编码非法 |
 | PUT | /agent/artifacts/:artifactId | agent，按 agentId 每小时 120 次 | 密封字节，`Content-Type: application/octet-stream`（3.0） | 201 ArtifactUploadResponse `{id, size, expiresAt}`；400 id 格式错或缺 `Content-Type`；415 不是 octet-stream（明文不落 Relay）；409 该 id 已被别的 Agent 占用（本 Agent 尚未被认领也是 409）；413 超过 10 MiB；429 限速。同一 Agent 重传同一 id 即覆盖并重新计 TTL |
 | GET | /client/artifacts/:agentId/:artifactId | client（该电脑须属于本 Pair） | | 200 存下的（密封）字节 + 原 `Content-Type`（3.0 起总是 octet-stream）+ `Cache-Control: private, max-age=86400`（另带 `X-Content-Type-Options: nosniff`、`Content-Security-Policy: sandbox`）；404 不存在、已过期或不属于该电脑 |

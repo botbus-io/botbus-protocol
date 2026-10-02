@@ -89,7 +89,8 @@ public actor TaskStore {
     /// 实时写入（`upsert`）不看这里。`performSetAcpConnectorEnabled` 关掉时也立刻摘掉。
     private var syncedAcpConnectors: Set<String> = []
     /// 只记非默认值：不在表里就是 `.observer`。
-    private var owners: [String: TaskOwner] = [:]
+    private struct LiveOwnership { var token: UUID? }
+    private var owners: [String: LiveOwnership] = [:]
     /// `releaseLive` 之后的交接宽限期，见 `liveHandoffGrace`。
     private var handoffDeadlines: [String: Date] = [:]
     private var eventContinuation: AsyncStream<Event>.Continuation?
@@ -175,7 +176,9 @@ public actor TaskStore {
             self.phoneStarted = PhoneTaskArchive.trimmed(PhoneTaskArchive.load(from: phoneTasksURL),
                                                          limit: Self.maxPhoneStartedTasks)
         }
-        if let autoApproveURL { self.autoApproveProjects = AutoApproveArchive.load(from: autoApproveURL) }
+        if let autoApproveURL {
+            self.autoApproveProjects = Set(AutoApproveArchive.load(from: autoApproveURL).map(PlatformPath.canonical))
+        }
         if let hiddenTasksURL {
             self.hidden = HiddenTaskArchive.trimmed(HiddenTaskArchive.load(from: hiddenTasksURL))
         }
@@ -240,7 +243,7 @@ public actor TaskStore {
     public func autoApproveProject(forWorkingDirectory path: String) -> String? {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let project = worktrees.projectRoot(for: trimmed) ?? trimmed
+        let project = PlatformPath.canonical(worktrees.projectRoot(for: trimmed) ?? trimmed)
         return outsideProjects.contains(project) ? nil : project
     }
 
@@ -248,6 +251,7 @@ public actor TaskStore {
     /// 项目只随快照更新，任务上的 `autoApprove` 也一并带过去。值没变时什么都不做。
     @discardableResult
     public func setAutoApprove(_ enabled: Bool, project: String) -> [Event] {
+        let project = PlatformPath.canonical(project)
         guard !project.isEmpty, autoApproveProjects.contains(project) != enabled else { return [] }
         if enabled { autoApproveProjects.insert(project) } else { autoApproveProjects.remove(project) }
         if let autoApproveURL { AutoApproveArchive.save(autoApproveProjects, to: autoApproveURL) }
@@ -258,7 +262,9 @@ public actor TaskStore {
     }
 
     /// 这个项目开着自动批准没有。Mac 菜单与测试用；连接器用 `autoApproves(taskId:workingDirectory:)`。
-    public func isAutoApproveEnabled(project: String) -> Bool { autoApproveProjects.contains(project) }
+    public func isAutoApproveEnabled(project: String) -> Bool {
+        autoApproveProjects.contains(PlatformPath.canonical(project))
+    }
 
     /// 连接器遇到审批时问：这个任务所在的项目开着自动批准没有。store 里有这个任务就看它盖过章的 `autoApprove`；
     /// 还没有（新任务的第一轮，连接器还没 upsert）就按工作目录归到项目再查。
@@ -310,14 +316,15 @@ public actor TaskStore {
 
     // MARK: - 所有权
 
-    public func owner(of id: String) -> TaskOwner { owners[id] ?? .observer }
+    public func owner(of id: String) -> TaskOwner { owners[id] == nil ? .observer : .live }
 
     /// 把一个 id 交给实时数据源：从此 `reconcile` 对它既不 upsert 也不 remove。
     /// 允许在任务还不存在时先声明（`startTask` 先 claim 再等第一条实时数据）。
-    public func claimLive(_ id: String) {
+    public func claimLive(_ id: String, ownerToken: UUID? = nil) {
         // 手机合并并结束过的会话（协议 3.4）：连接器照旧 claim（Claude 的 `publish`），这里不给它挂所有权。
         guard hidden[id] == nil else { return }
-        owners[id] = .live
+        // 分发器的临时 claim 不覆盖连接器的身份；连接器交接时用自己的 token 替换。
+        if ownerToken != nil || owners[id] == nil { owners[id] = LiveOwnership(token: ownerToken) }
         handoffDeadlines.removeValue(forKey: id)
     }
 
@@ -325,8 +332,11 @@ public actor TaskStore {
     /// 期间"观察没报这个 id"不算它消失——SQLite 往往要几轮才追上实时数据，
     /// 少了这段宽限，命令一结束任务就会先被摘掉、下一轮再冒出来，手机上看到的就是闪一下。
     /// 观察真的报到它（或宽限到期）才算交接完成。
-    public func releaseLive(_ id: String) {
-        guard owners.removeValue(forKey: id) == .live, tasks[id] != nil else { return }
+    public func releaseLive(_ id: String, ownerToken: UUID? = nil) {
+        // 延迟补放仍能收掉分发器晚到的无 token claim，但不能释放已经交给另一条实时通道的任务。
+        guard let current = owners[id], current.token == nil || current.token == ownerToken else { return }
+        owners.removeValue(forKey: id)
+        guard tasks[id] != nil else { return }
         handoffDeadlines[id] = now().addingTimeInterval(Self.liveHandoffGrace)
     }
 
@@ -441,6 +451,8 @@ public actor TaskStore {
         flushHiddenTasks()
         if artifactsByTask.removeValue(forKey: id) != nil { scheduleArtifactSave() }
         guard tasks[id] != nil else {
+            owners.removeValue(forKey: id)
+            handoffDeadlines.removeValue(forKey: id)
             clearSystemPermission(for: id)
             let events = [Event.taskRemoved(id)]
             publish(events)
@@ -466,6 +478,15 @@ public actor TaskStore {
     }
 
     public func task(id: String) -> TaskRecord? { tasks[id] }
+
+    /// 项目只有 worktree 里的子目录时，新建命令可使用已知的真实目录。只给启用、未隐藏的会话，不猜路径。
+    public func worktreeDirectories(forProject path: String) -> [String] {
+        let project = PlatformPath.canonical(path)
+        return Array(Set(tasks.values.compactMap { task in
+            guard task.projectPath == project, isEnabled(task.source), hidden[task.id] == nil else { return nil }
+            return task.worktreePath
+        })).sorted()
+    }
 
     /// 把一个不改变任务状态的事件推进事件流。目前只有 `taskMessages`——它是一次查询的结果，
     /// 不属于任何任务的状态，所以不走 upsert，也不该影响对账。
@@ -792,11 +813,12 @@ public actor TaskStore {
     /// `outsideProject` 同理，由本机规则决定，只写 true 或 nil（协议要求在项目里时省略这个键）。
     /// worktree（协议 2.7）也在这里：`projectPath` 换成主仓库，真实工作目录挪进 `worktreePath`。
     /// 工作目录取 `worktreePath ?? projectPath`，所以对盖过章的记录再盖一次结果不变。
+    /// 路径一律换成 `PlatformPath.canonical`：Windows 上同一个目录的两种写法不能在手机上成两个项目。
     private func stamped(_ task: TaskRecord) -> TaskRecord {
         let artifacts = artifactList(for: task.id)
         let systemPermission = task.status == .failed ? systemPermissionsByTask[task.id] : nil
-        let workingDirectory = task.workingDirectory
-        let root = worktrees.projectRoot(for: workingDirectory)
+        let workingDirectory = PlatformPath.canonical(task.workingDirectory)
+        let root = worktrees.projectRoot(for: workingDirectory).map(PlatformPath.canonical)
         let projectPath = root ?? workingDirectory
         let projectName = root.map(Self.lastPathComponent) ?? task.projectName
         let worktreePath = root == nil ? nil : workingDirectory
@@ -820,10 +842,12 @@ public actor TaskStore {
 
     /// 连接器报的最近项目里也有 worktree 目录，同样归到主仓库；`mergedProjects()` 再按主仓库去重。
     private func stamped(_ project: Project) -> Project {
-        let root = worktrees.projectRoot(for: project.path)
-        guard project.agentId != identity.agentId || root != nil else { return project }
+        let path = PlatformPath.canonical(project.path)
+        let root = worktrees.projectRoot(for: path).map(PlatformPath.canonical)
+        guard project.agentId != identity.agentId || root != nil || project.path != path else { return project }
         var copy = project
         copy.agentId = identity.agentId
+        copy.path = path
         if let root {
             copy.path = root
             copy.name = Self.lastPathComponent(root)

@@ -18,6 +18,7 @@ final class ClaudeFollowUpQueueTests: XCTestCase {
     /// （prompt 取自 stdin 第一行的 user 消息）。
     /// init 行晚 0.3 秒才吐，让第二条续聊正好落在"已起进程、还没拿到 id"的空当里；prompt 含 slow 时这一轮跑 1.5 秒。
     private func fakeClaude(in directory: URL) throws -> URL {
+        try skipPOSIXScriptOnWindows()
         let log = directory.appendingPathComponent("calls.log").path
         let url = directory.appendingPathComponent("claude")
         let script = """

@@ -150,6 +150,12 @@ public actor LocalHookServer {
                 .appendingPathComponent(".local/share", isDirectory: true)
         }
         return base.appendingPathComponent("botbus", isDirectory: true)
+        #elseif os(Windows)
+        // `%LOCALAPPDATA%\BotBus`：不放 Roaming，漫游配置文件不该把一台电脑的配对与存档带到另一台上。
+        let local = ProcessInfo.processInfo.environment["LOCALAPPDATA"].flatMap { $0.isEmpty ? nil : $0 }
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("AppData\\Local", isDirectory: true)
+        return local.appendingPathComponent("BotBus", isDirectory: true)
         #else
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")

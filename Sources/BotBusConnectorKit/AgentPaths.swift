@@ -8,6 +8,42 @@ import Foundation
 public enum AgentBinary {
     /// 常见的全局安装目录。npm / pnpm / bun / volta / Homebrew / uv / pipx 都会落在其中之一。
     /// nvm 的目录带版本号，单独展开（见 `nvmBinDirectories`）。
+    #if os(Windows)
+    /// Windows：原生安装器（`~\.local\bin`，Claude Code 的 `claude.exe` 在这）、npm 全局（`%APPDATA%\npm`，`.cmd` 包装）、
+    /// winget 的链接目录、scoop、bun、volta、pnpm、Node 官方安装包。Windows 上后台进程是用户会话里起的，
+    /// 拿得到用户的 PATH，所以最后再把 PATH 里的目录也试一遍（见 `detect`）。
+    public static var commonDirectories: [String] {
+        let environment = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let appData = environment["APPDATA"] ?? home + "\\AppData\\Roaming"
+        let localAppData = environment["LOCALAPPDATA"] ?? home + "\\AppData\\Local"
+        let programFiles = environment["ProgramFiles"] ?? "C:\\Program Files"
+        return [
+            home + "\\.local\\bin",
+            appData + "\\npm",
+            localAppData + "\\Microsoft\\WinGet\\Links",
+            home + "\\scoop\\shims",
+            home + "\\.bun\\bin",
+            localAppData + "\\Volta\\bin",
+            localAppData + "\\pnpm",
+            programFiles + "\\nodejs",
+        ]
+    }
+
+    /// nvm-windows 把当前版本链接到 `NVM_SYMLINK`（默认 `C:\Program Files\nodejs`，已在上面），不再逐个版本展开。
+    public static func nvmBinDirectories(fileManager: FileManager = .default) -> [String] {
+        ProcessInfo.processInfo.environment["NVM_SYMLINK"].map { [$0] } ?? []
+    }
+
+    /// 按候选目录找一个可执行文件（带 `.exe` / `.cmd` 后缀地试）；`extra` 排在最前，PATH 里的目录排在最后。
+    public static func detect(_ name: String, extra: [String] = [],
+                              fileManager: FileManager = .default) -> String? {
+        let path = PlatformPath.searchPath(in: ProcessInfo.processInfo.environment).map(PlatformPath.splitSearchPath) ?? []
+        let directories = extra.map { ($0 as NSString).expandingTildeInPath } + commonDirectories
+            + nvmBinDirectories(fileManager: fileManager) + path
+        return PlatformPath.findExecutable(name, in: directories, fileManager: fileManager)
+    }
+    #else
     public static let commonDirectories = [
         "~/.local/bin",
         "/opt/homebrew/bin",
@@ -36,6 +72,7 @@ public enum AgentBinary {
             .map { (($0 as NSString).expandingTildeInPath as NSString).appendingPathComponent(name) }
             .first { fileManager.isExecutableFile(atPath: $0) }
     }
+    #endif
 
     /// 子进程环境：继承本进程，把可执行文件所在目录（以及它软链接指向的目录）放到 PATH 最前，再叠上 `extra`。
     ///
@@ -45,8 +82,14 @@ public enum AgentBinary {
                                    base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
         var environment = base
         let directories = pathDirectories(for: executable)
+        #if os(Windows)
+        let existing = PlatformPath.splitSearchPath(PlatformPath.searchPath(in: base) ?? "")
+        PlatformPath.setSearchPath(PlatformPath.joinSearchPath(directories + existing.filter { !directories.contains($0) }),
+                                   in: &environment)
+        #else
         let existing = (base["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin").split(separator: ":").map(String.init)
         environment["PATH"] = (directories + existing.filter { !directories.contains($0) }).joined(separator: ":")
+        #endif
         return environment.merging(extra) { _, injected in injected }
     }
 

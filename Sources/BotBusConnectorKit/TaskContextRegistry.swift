@@ -42,6 +42,14 @@ public actor TaskContextRegistry {
         return token
     }
 
+    /// 已知任务的手机续聊：复用 / 签发 / 绑定在同一次 actor 调用内完成，避免并发轮次各签一份。
+    public func issue(for taskId: String) -> String {
+        if let existing = tokenByTask[taskId] { return existing }
+        let token = issue()
+        bind(token, taskId: taskId)
+        return token
+    }
+
     /// 把 token 绑到任务上。只认本实例签发过的 token；可以重复绑定（Claude `--resume` 分支出新 session 时
     /// 同一个 token 改绑到新 id，旧 id 仍能用 `token(for:)` 查回它）。返回是否生效。
     @discardableResult

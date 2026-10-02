@@ -83,7 +83,10 @@ public struct DshSessionEvent: Hashable, Sendable {
     /// 不含 `reasoning` 与 `tool-call`）。别的事件为 nil。
     public var text: String? {
         switch type {
-        case "user/message": return Self.texts(data["content"])
+        case "user/message":
+            return Self.texts(data["content"]).map {
+                DshToolsContext.visibleText($0, requestId: data.path("source", "rpcId")?.stringValue)
+            }
         case "assistant/message": return Self.texts(data.path("message", "content"))
         default: return nil
         }

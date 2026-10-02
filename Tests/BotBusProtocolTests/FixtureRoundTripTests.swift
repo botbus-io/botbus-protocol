@@ -14,10 +14,13 @@ final class FixtureRoundTripTests: XCTestCase {
     /// 从本文件路径向上找到仓库根目录下的 protocol-fixtures。
     static let fixturesDir: URL = {
         var url = URL(fileURLWithPath: #filePath)
-        while url.path != "/" {
+        // 到根目录（`/` 或 Windows 的 `C:\`）时再删一级路径不再变，就停。
+        while true {
             let candidate = url.appendingPathComponent("protocol-fixtures")
             if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
-            url.deleteLastPathComponent()
+            let parent = url.deletingLastPathComponent()
+            if parent.path == url.path { break }
+            url = parent
         }
         fatalError("protocol-fixtures not found above \(#filePath)")
     }()

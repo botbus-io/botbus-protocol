@@ -233,7 +233,7 @@ public actor CodexDesktopBridgeHost {
     private func publishIfReady() {
         guard router.ready, !published, let port else { return }
         let descriptor = CodexBridgeDescriptor(port: Int(port), token: token,
-                                               pid: getpid(), parentPID: getppid(), instance: instance)
+                                               pid: PlatformProcess.currentPID, parentPID: PlatformProcess.parentPID, instance: instance)
         do {
             let data = try JSONEncoder().encode(descriptor)
             let url = directory.appendingPathComponent("connection.json")

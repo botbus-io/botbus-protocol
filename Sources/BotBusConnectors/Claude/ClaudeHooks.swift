@@ -10,8 +10,14 @@ public struct ClaudePaths: Sendable {
         self.claudeHome = claudeHome
     }
 
+    /// Linux / Windows 上认 Claude Code 自己的 `CLAUDE_CONFIG_DIR`（后台进程拿得到用户的环境变量；Mac 的 GUI 进程拿不到，照旧）。
     public static var defaultClaudeHome: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
+        #if !canImport(Darwin)
+        if let custom = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], PlatformPath.isAbsolute(custom) {
+            return URL(fileURLWithPath: custom, isDirectory: true)
+        }
+        #endif
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
     }
 
     public var settingsFile: URL { claudeHome.appendingPathComponent("settings.json") }
@@ -37,9 +43,72 @@ public struct ClaudePaths: Sendable {
     ]
 
     public static func detectClaudeBinary(fileManager: FileManager = .default) -> String? {
-        knownBinaries
-            .map { ($0 as NSString).expandingTildeInPath }
-            .first { fileManager.isExecutableFile(atPath: $0) }
+        #if os(Windows)
+        // Windows：原生安装器的 `~\.local\bin\claude.exe` 优先，其次 npm 全局的 `claude.cmd`、winget、PATH（见 `AgentBinary`），
+        // 都没有再用 Claude 桌面 app 自带的那份。
+        if let binary = AgentBinary.detect("claude", fileManager: fileManager) { return binary }
+        for root in desktopClaudeCodeRoots(fileManager: fileManager) {
+            if let binary = newestVersionedBinary(in: root, executable: "claude.exe", fileManager: fileManager) { return binary }
+        }
+        return nil
+        #else
+        // 原生安装器与 Homebrew 的固定位置优先；再按常见全局目录与 nvm 找（npm 全局装的 `claude` 也是原生程序，
+        // 不靠 node）；都没有时 macOS 用 Claude 桌面 app 自带的那份。
+        if let known = knownBinaries.map({ ($0 as NSString).expandingTildeInPath })
+            .first(where: { fileManager.isExecutableFile(atPath: $0) }) {
+            return known
+        }
+        if let binary = AgentBinary.detect("claude", fileManager: fileManager) { return binary }
+        #if os(macOS)
+        return newestVersionedBinary(in: desktopClaudeCodeRoot, executable: desktopClaudeCodeExecutable, fileManager: fileManager)
+        #else
+        return nil
+        #endif
+        #endif
+    }
+
+    #if os(macOS)
+    /// Claude 桌面 app 把 Claude Code 解到 `~/Library/Application Support/Claude/claude-code/<版本>/claude.app`，
+    /// 每个版本一个目录。只装了桌面 app 的 Mac 靠它才有 `claude`；登录态与桌面 app 分开（同 Windows），
+    /// 没登录过要先用它 `claude auth login`。
+    static var desktopClaudeCodeRoot: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Claude/claude-code", isDirectory: true).path
+    }
+
+    static let desktopClaudeCodeExecutable = "claude.app/Contents/MacOS/claude"
+    #endif
+
+    #if os(Windows)
+    /// Claude 桌面 app 把 Claude Code 解到 `%APPDATA%\Claude\claude-code\<版本>\claude.exe`，每个版本一个目录。
+    /// Microsoft Store（MSIX）版的 `%APPDATA%` 是虚拟化的，真实位置在 `%LOCALAPPDATA%\Packages\Claude_<发布者>\LocalCache\Roaming`。
+    /// 只装了桌面 app 的电脑靠它才有 `claude`；它的登录态与桌面 app 分开，没登录过要先用它 `claude auth login`。
+    static func desktopClaudeCodeRoots(fileManager: FileManager) -> [String] {
+        let environment = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let appData = environment["APPDATA"] ?? home + "\\AppData\\Roaming"
+        let localAppData = environment["LOCALAPPDATA"] ?? home + "\\AppData\\Local"
+        let packages = localAppData + "\\Packages"
+        let storeRoots = ((try? fileManager.contentsOfDirectory(atPath: packages)) ?? [])
+            .filter { $0.hasPrefix("Claude_") }
+            .sorted()
+            .map { packages + "\\" + $0 + "\\LocalCache\\Roaming\\Claude\\claude-code" }
+        return [appData + "\\Claude\\claude-code"] + storeRoots
+    }
+    #endif
+
+    /// `root` 下按版本号命名的子目录（`2.1.284`）里，挑版本最高、带 `executable` 的那个。名字不是点分数字的目录不算。
+    static func newestVersionedBinary(in root: String, executable: String, fileManager: FileManager = .default) -> String? {
+        let versions = ((try? fileManager.contentsOfDirectory(atPath: root)) ?? []).compactMap { name -> (name: String, parts: [Int])? in
+            let parts = name.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) }
+            guard !parts.contains(nil) else { return nil }
+            return (name, parts.compactMap { $0 })
+        }
+        for version in versions.sorted(by: { $1.parts.lexicographicallyPrecedes($0.parts) }) {
+            let candidate = ((root as NSString).appendingPathComponent(version.name) as NSString).appendingPathComponent(executable)
+            if PlatformPath.isExecutableFile(candidate, fileManager: fileManager) { return candidate }
+        }
+        return nil
     }
 }
 

@@ -8,7 +8,12 @@ final class UnixSocketTests: XCTestCase {
     override func setUp() {
         super.setUp()
         // sockaddr_un 的路径上限约 104 字节：用 /tmp 下的短名（所在目录必须是自己的真目录）。
+        #if os(Windows)
+        // Windows 的 AF_UNIX 路径上限 108 字节：用户临时目录下的短名。
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("bb-\(UUID().uuidString.prefix(8))").path
+        #else
         directory = "/tmp/bb-\(UUID().uuidString.prefix(8))"
+        #endif
     }
 
     override func tearDown() {

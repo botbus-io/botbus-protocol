@@ -131,7 +131,7 @@ public enum TranscriptFileRefs {
     /// 项目目录的真实路径。必须是存在的目录，且不能太宽（见 `isAcceptableProjectRoot`）。
     public static func projectRoot(_ projectPath: String) -> String? {
         let trimmed = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("/"), let real = realPath(trimmed),
+        guard PlatformPath.isAbsolute(trimmed), let real = realPath(trimmed),
               isAcceptableProjectRoot(real, home: currentHome) else { return nil }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: real, isDirectory: &isDirectory), isDirectory.boolValue else {
@@ -144,9 +144,23 @@ public enum TranscriptFileRefs {
     /// 项目根就成了整个用户目录，`~/Documents/合同.pdf`、`~/Desktop/证件.jpg` 全都"在项目里"。
     /// `/System/Volumes/Data` 一组是 firmlink 的另一侧，同样装着 `/Users`。`/tmp`、`/var` 本身是软链接，
     /// realpath 之后不会原样出现，列着只为规则一眼看全。
+    #if os(Windows)
+    /// Windows：盘符根本身由 `isRoot` 拦；这里是系统盘上装着所有人数据或系统文件的几处。
+    public static let broadRoots: [String] = {
+        let environment = ProcessInfo.processInfo.environment
+        let drive = environment["SystemDrive"] ?? "C:"
+        var roots = [drive + "\\Users", drive + "\\Windows", drive + "\\Program Files", drive + "\\Program Files (x86)",
+                     drive + "\\ProgramData"]
+        for key in ["TEMP", "TMP", "APPDATA", "LOCALAPPDATA"] {
+            if let value = environment[key], !value.isEmpty { roots.append(value) }
+        }
+        return roots
+    }()
+    #else
     public static let broadRoots = ["/", "/Users", "/System", "/System/Volumes/Data", "/System/Volumes/Data/Users",
                              "/Volumes", "/private", "/private/var", "/private/tmp", "/tmp", "/var", "/Library",
                              "/Applications", "/opt", "/usr"]
+    #endif
 
     /// 当前用户 home 的真实路径。realpath 失败（几乎不会）就用原样，照样挡得住。
     private static var currentHome: String {
@@ -158,9 +172,10 @@ public enum TranscriptFileRefs {
     /// home 下的子目录、`/private/var/folders/...` 的临时目录、`/Volumes/盘/项目` 都照常可用。
     /// 按路径组件比，`/Users/alice2` 不是 `/Users/alice` 的祖先。
     public static func isAcceptableProjectRoot(_ realRoot: String, home: String) -> Bool {
-        guard realRoot.hasPrefix("/") else { return false }
+        guard PlatformPath.isAbsolute(realRoot) else { return false }
         return !(broadRoots + [home]).contains { forbidden in
-            forbidden == realRoot || realRoot == "/" || forbidden.hasPrefix(realRoot + "/")
+            PlatformPath.same(forbidden, realRoot) || PlatformPath.isRoot(realRoot)
+                || PlatformPath.isInside(forbidden, root: realRoot)
         }
     }
 
@@ -173,17 +188,16 @@ public enum TranscriptFileRefs {
             absolute = FileManager.default.homeDirectoryForCurrentUser.path + trimmed.dropFirst()
         } else if trimmed.hasPrefix("~") {
             return nil
-        } else if trimmed.hasPrefix("/") {
+        } else if PlatformPath.isAbsolute(trimmed) {
             absolute = trimmed
         } else {
-            absolute = root + "/" + trimmed
+            absolute = PlatformPath.join(root, trimmed)
         }
         // realpath 同时挡住三种逃逸：`../`、指向项目外的软链接、以及不存在的文件（返回 nil）。
         // 前缀按路径组件比：带上结尾的 `/`，`/proj` 不会匹配 `/proj2/x.png`。
-        guard let real = realPath(absolute), real.hasPrefix(root + "/") else { return nil }
+        guard let real = realPath(absolute), let relative = PlatformPath.relativePath(of: real, under: root) else { return nil }
         // 只看项目根以下的各段：项目本身放在 `~/.work/` 之类的点目录里是用户的选择，不该因此整个用不了。
-        let relative = real.dropFirst(root.count + 1)
-        guard !relative.split(separator: "/").contains(where: { $0.hasPrefix(".") }) else { return nil }
+        guard !PlatformPath.components(String(relative)).contains(where: { $0.hasPrefix(".") }) else { return nil }
         // 扩展名按真实文件判断：项目里一个叫 `a.png` 的软链接指向 `notes.txt` 也不认。
         guard extensions.contains((real as NSString).pathExtension.lowercased()),
               regularFileSize(real) != nil else { return nil }
@@ -199,9 +213,14 @@ public enum TranscriptFileRefs {
 
     /// POSIX `realpath`：解析全部软链接与 `.`/`..`，不存在就 nil。
     /// 不用 `URL.resolvingSymlinksInPath()`：它会把 `/private/var` 改写成 `/var`，路径不存在时还原样返回。
+    /// Windows：`GetFinalPathNameByHandleW`（同样解析 junction / 符号链接，不存在就 nil）。
     public static func realPath(_ path: String) -> String? {
+        #if os(Windows)
+        return Win32.finalPath(path)
+        #else
         guard let resolved = realpath(path, nil) else { return nil }
         defer { free(resolved) }
         return String(cString: resolved)
+        #endif
     }
 }

@@ -3,6 +3,18 @@ import XCTest
 @testable import BotBusConnectors
 
 final class CodexBridgeInvocationTests: XCTestCase {
+    func testAuxiliaryAppServersCannotReplaceDesktopBridge() {
+        let arguments = ["-c", "features.code_mode_host=true", "app-server"]
+        XCTAssertTrue(CodexBridgeInvocation.shouldBridge(arguments, parentBundleIdentifier: "com.openai.codex"))
+        XCTAssertFalse(CodexBridgeInvocation.shouldBridge(arguments, parentBundleIdentifier: nil))
+        XCTAssertFalse(CodexBridgeInvocation.shouldBridge(arguments, parentBundleIdentifier: "com.openai.codex.computer-use"))
+        XCTAssertFalse(CodexBridgeInvocation.shouldBridge(arguments, parentBundleIdentifier: "com.apple.Terminal"))
+    }
+
+    func testDesktopNonAppServerInvocationStillPassesThrough() {
+        XCTAssertFalse(CodexBridgeInvocation.shouldBridge(["exec", "app-server"], parentBundleIdentifier: "com.openai.codex"))
+    }
+
     func testDesktopInvocationWithLeadingConfigOverridesUsesBridge() {
         let arguments = [
             "-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled",

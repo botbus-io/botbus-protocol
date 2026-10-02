@@ -3,6 +3,8 @@ import Foundation
 import Glibc
 #elseif canImport(Musl)
 import Musl
+#elseif canImport(WinSDK)
+import WinSDK
 #endif
 
 extension FileHandle {
@@ -122,6 +124,29 @@ private final class PollingReadability: @unchecked Sendable {
         }
     }
 
+    #if os(Windows)
+    /// Windows 没有 `poll`：用 `PeekNamedPipe` 看管道里有没有数据（不取走），有数据或写端已关（`ERROR_BROKEN_PIPE`，
+    /// 即 EOF）才调 handler——与 POSIX 那份一样，handler 里的 `availableData` 不会阻塞，摘掉 handler 之后也不会再多调一次。
+    /// 不是管道的句柄 Peek 不了：退回直接调 handler，由 `availableData` 自己等。
+    private func run() {
+        let pipe = handle._handle
+        while !retire() {
+            var available: DWORD = 0
+            if PeekNamedPipe(pipe, nil, 0, nil, &available, nil) {
+                guard available > 0 else {
+                    Thread.sleep(forTimeInterval: Double(Self.pollInterval) / 4000)
+                    continue
+                }
+            } else if GetLastError() != DWORD(ERROR_BROKEN_PIPE), GetFileType(pipe) == DWORD(FILE_TYPE_PIPE) {
+                // 句柄已经坏了（被关掉）：`availableData` 在坏句柄上会直接崩，不再回调，静静退出。
+                _ = retire(force: true)
+                return
+            }
+            guard let handler = currentHandler() else { continue }
+            handler(handle)
+        }
+    }
+    #else
     private func run() {
         let descriptor = handle.fileDescriptor
         while !retire() {
@@ -143,5 +168,6 @@ private final class PollingReadability: @unchecked Sendable {
             handler(handle)
         }
     }
+    #endif
 }
 #endif

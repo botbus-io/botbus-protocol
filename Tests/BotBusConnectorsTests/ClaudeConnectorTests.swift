@@ -23,6 +23,7 @@ final class ClaudeConnectorTests: XCTestCase {
 
     /// 只会回答 `--help` 的假 `claude`：连接器从这里读强度，读到了才报模型列表。
     private func fakeClaudeWithHelp() throws -> String {
+        try skipPOSIXScriptOnWindows()
         let binary = FileManager.default.temporaryDirectory.appendingPathComponent("claude-help-\(UUID().uuidString)")
         addTeardownBlock { try? FileManager.default.removeItem(at: binary) }
         try "#!/bin/sh\nprintf '%s\\n' '  --effort <level>  Effort level (low, medium, high, xhigh, max)'\n"

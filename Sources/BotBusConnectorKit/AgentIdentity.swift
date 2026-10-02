@@ -22,7 +22,11 @@ public struct AgentIdentity: Hashable, Sendable {
     }
 
     /// 用户看得懂的电脑名；拿不到时退回主机名并去掉 `.local` 后缀。
+    /// Windows 上 Foundation 的 `localizedName` 是 nil、`hostName` 是 "localhost"，改问系统（保留设置里写的大小写）。
     public static func localComputerName() -> String {
+        #if os(Windows)
+        if let name = Win32.computerName(), !name.isEmpty { return name }
+        #endif
         if let localized = Host.current().localizedName, !localized.isEmpty { return localized }
         let host = ProcessInfo.processInfo.hostName
         return host.hasSuffix(".local") ? String(host.dropLast(".local".count)) : host
@@ -54,4 +58,9 @@ public struct HostIdentity: Sendable, Equatable {
     /// 手机要 ≥ 3.5（认得 `platform: "linux"`）。
     public static let linux = HostIdentity(platform: .linux, capabilities: HostCapabilities(remoteControl: false, previews: false),
                                            minClientProtocol: "3.5")
+    /// Windows 首版：远程操作不做；预览要托管 dev server（进程组）与 WebSocket 代理，本期也不做。
+    /// 手机要 ≥ 3.5（认得 `platform: "windows"`）。
+    public static let windows = HostIdentity(platform: .windows,
+                                             capabilities: HostCapabilities(remoteControl: false, previews: false),
+                                             minClientProtocol: "3.5")
 }

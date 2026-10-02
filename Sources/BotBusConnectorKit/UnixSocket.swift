@@ -1,3 +1,5 @@
+#if !os(Windows)
+// Windows 的同名实现（Winsock 的 AF_UNIX + 线程）在 `UnixSocket+Windows.swift`。
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -437,3 +439,4 @@ public final class UnixSocketConnection: @unchecked Sendable {
     }
     #endif
 }
+#endif // !os(Windows)

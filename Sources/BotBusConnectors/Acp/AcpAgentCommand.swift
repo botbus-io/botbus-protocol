@@ -84,7 +84,7 @@ public enum AcpAgentCommand {
         }
         for agent in result.agents {
             let enabled = overrides[agent.id] ?? agent.defaultEnabled
-            let origin = agent.origin == .manifest ? "清单" : "注册表"
+            let origin = agent.origin == .builtin ? "内置" : (agent.origin == .manifest ? "清单" : "注册表")
             let launch = agent.executable.map { ([$0] + agent.arguments).joined(separator: " ") }
                 ?? "（没有启动命令，只能经反向扩展接入）"
             context.output("\(agent.id)\t\(agent.name)\t\(origin)\t\(enabled ? "已启用" : "已停用")\t\(launch)")

@@ -166,30 +166,29 @@ final class ClaudeHookInstallerTests: XCTestCase {
         let hooks = try XCTUnwrap(try read()["hooks"] as? [String: Any])
         let matchers = try XCTUnwrap(hooks["Stop"] as? [[String: Any]])
         let command = try XCTUnwrap(((matchers[0]["hooks"] as? [[String: Any]])?.first)?["command"] as? String)
+        #if os(Windows)
+        // Windows：绝对路径的 powershell.exe 加 `-File "<脚本>"`，路径整体在双引号里（Git Bash 与 cmd 都这么拆）。
+        let script = ClaudeHookInstaller.scriptURL(in: support).path
+        XCTAssertTrue(command.hasPrefix("\"") && command.contains("powershell.exe\""), command)
+        XCTAssertTrue(command.hasSuffix("-File \"\(script)\""), "带空格的路径必须整体加引号：\(command)")
+        #else
         XCTAssertTrue(command.hasPrefix("'") && command.hasSuffix("'"), "带空格的路径必须整体加引号：\(command)")
+        #endif
         XCTAssertTrue(command.contains("Application Support"))
         XCTAssertTrue(command.contains(ClaudeHookInstaller.marker))
     }
 
     func testScriptIsExecutableAndNeverFails() throws {
         try ClaudeHookInstaller.install(paths: paths, supportDirectory: support)
-        let script = ClaudeHookInstaller.scriptURL(in: support)
-        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: script.path))
+        #if !os(Windows)
+        // Windows 的 hook 是经 powershell.exe 调的 .ps1，本身不是可执行文件。
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: ClaudeHookInstaller.scriptURL(in: support).path))
+        #endif
 
         // 端口文件不在 = Agent 没跑。脚本必须安静地 exit 0，不能把 Claude Code 卡住或弄失败。
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = [script.path]
-        let input = Pipe()
-        let output = Pipe()
-        process.standardInput = input
-        process.standardOutput = output
-        try process.run()
-        input.fileHandleForWriting.write(Data(#"{"hook_event_name":"Stop","session_id":"s1"}"#.utf8))
-        try input.fileHandleForWriting.close()
-        process.waitUntilExit()
-        XCTAssertEqual(process.terminationStatus, 0, "Agent 不在时脚本也必须 exit 0")
-        XCTAssertTrue(output.fileHandleForReading.readDataToEndOfFile().isEmpty, "没有意见时不该有输出")
+        let result = try runScript(payload: #"{"hook_event_name":"Stop","session_id":"s1"}"#)
+        XCTAssertEqual(result.status, 0, "Agent 不在时脚本也必须 exit 0")
+        XCTAssertTrue(result.output.isEmpty, "没有意见时不该有输出")
     }
 
     // MARK: - hook 密钥（v2 脚本）
@@ -222,6 +221,18 @@ final class ClaudeHookInstallerTests: XCTestCase {
     exit 0
     """
 
+    #if os(Windows)
+    /// Windows 版脚本：读同一个密钥文件、带同一个头；负载按原始字节进出；只有 ASCII（PowerShell 5.1 按 ANSI 读脚本）。
+    func testScriptSendsSecretHeaderWithoutPuttingItOnTheCommandLine() {
+        let script = ClaudeHookInstaller.script
+        XCTAssertTrue(script.contains("script version \(ClaudeHookInstaller.scriptVersion)"))
+        XCTAssertTrue(script.contains(LocalHookServer.SharedSecret.defaultFileName), "读服务端写的密钥文件")
+        XCTAssertTrue(script.contains("Headers.Add('\(LocalHookServer.SharedSecret.headerName)'"))
+        XCTAssertTrue(script.contains("OpenStandardInput") && script.contains("OpenStandardOutput"), "按字节读写，不经控制台代码页")
+        XCTAssertFalse(script.contains("curl -"), "不调 curl（密钥文件名里的 .curlrc 不算）")
+        XCTAssertTrue(script.unicodeScalars.allSatisfy(\.isASCII), "脚本只能有 ASCII")
+    }
+    #else
     func testScriptSendsSecretHeaderWithoutPuttingItOnTheCommandLine() {
         let script = ClaudeHookInstaller.script
         XCTAssertTrue(script.contains("脚本版本 \(ClaudeHookInstaller.scriptVersion)"))
@@ -230,6 +241,7 @@ final class ClaudeHookInstallerTests: XCTestCase {
         XCTAssertTrue(script.contains("curl -sS -f "), "非 2xx 当作没意见，错误 body 不吐给 Claude Code")
         XCTAssertFalse(script.contains("WatchCrew"))
     }
+    #endif
 
     /// 装过 v1 脚本、settings 已是全套的机器：只把脚本换成新版，settings 一个字节不动。
     func testUpgradeRewritesAnOutdatedScriptOnly() throws {
@@ -243,7 +255,9 @@ final class ClaudeHookInstallerTests: XCTestCase {
         XCTAssertTrue(try ClaudeHookInstaller.upgradeIfNeeded(paths: paths, supportDirectory: support))
         XCTAssertTrue(ClaudeHookInstaller.isScriptCurrent(in: support))
         XCTAssertEqual(try String(contentsOf: scriptURL, encoding: .utf8), ClaudeHookInstaller.script)
+        #if !os(Windows)
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: scriptURL.path))
+        #endif
         XCTAssertEqual(try Data(contentsOf: paths.settingsFile), settingsBefore, "只换脚本，不重写 settings")
         XCTAssertFalse(try ClaudeHookInstaller.upgradeIfNeeded(paths: paths, supportDirectory: support), "已是新版就不再动")
     }
@@ -320,6 +334,10 @@ final class ClaudeHookInstallerTests: XCTestCase {
         XCTAssertNotNil(seen.current[0])
         XCTAssertNil(seen.current[1], "没有密钥文件就不带头")
 
+        // v1 老脚本是 sh 写的，只存在于 macOS / Linux 上。
+        #if os(Windows)
+        return
+        #endif
         // 还没升级的 v1 脚本：从不带头，兼容模式下照收；必须带的模式下 403 且输出为空（不会把错误当 hook 输出）。
         try Data(Self.versionOneScript.utf8).write(to: ClaudeHookInstaller.scriptURL(in: support))
         let legacy = try runScript(payload: #"{"hook_event_name":"Stop"}"#)
@@ -340,8 +358,15 @@ final class ClaudeHookInstallerTests: XCTestCase {
     /// 跑支持目录里的脚本，stdin 喂 hook 负载，返回退出码与 stdout。
     private func runScript(payload: String) throws -> (status: Int32, output: String) {
         let process = Process()
+        #if os(Windows)
+        let system = ProcessInfo.processInfo.environment["SystemRoot"] ?? "C:\\Windows"
+        process.executableURL = URL(fileURLWithPath: system + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+        process.arguments = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+                             ClaudeHookInstaller.scriptURL(in: support).path]
+        #else
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = [ClaudeHookInstaller.scriptURL(in: support).path]
+        #endif
         let input = Pipe()
         let output = Pipe()
         process.standardInput = input

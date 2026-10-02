@@ -25,6 +25,7 @@ final class DshPathsTests: XCTestCase {
     }
 
     private func executable(_ relative: String) throws -> String {
+        try skipPOSIXScriptOnWindows()
         let url = root.appendingPathComponent(relative)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("#!/bin/sh\n".utf8).write(to: url)
@@ -90,7 +91,7 @@ final class DshPathsTests: XCTestCase {
         try addNpxPackage(hash: "bbb", version: "0.1.5-rc.3")
         let node = try executable("bin/node")
         let installation = DshPaths.detectInstallation(locate: { _ in nil }, npxRoot: root.appendingPathComponent("npx"),
-                                                       nodeCandidates: [node], nodeVersion: { _ in DshVersion("24.0.0") })
+                                                       desktopBundles: [], nodeCandidates: [node], nodeVersion: { _ in DshVersion("24.0.0") })
         XCTAssertEqual(installation?.kind, .npxCache)
         XCTAssertEqual(installation?.executable, node)
         XCTAssertEqual(installation?.node, node)
@@ -110,7 +111,34 @@ final class DshPathsTests: XCTestCase {
         try addNpxPackage(hash: "bbb", version: "0.1.5-rc.3")
         let node = try executable("bin/node")
         XCTAssertNil(DshPaths.detectInstallation(locate: { _ in nil }, npxRoot: root.appendingPathComponent("npx"),
-                                                 nodeCandidates: [node], nodeVersion: { _ in DshVersion("18.0.0") }))
+                                                 desktopBundles: [], nodeCandidates: [node], nodeVersion: { _ in DshVersion("18.0.0") }))
+    }
+
+    func testDesktopBundledCliWinsOverOlderNpxAndPath() throws {
+        let bundle = root.appendingPathComponent("DeepSeek Harness.app")
+        let script = try executable("DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh")
+        let info = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "com.deepseek.dsh",
+                                                                        "CFBundleShortVersionString": "0.2.0-rc.2"],
+                                                        format: .xml, options: 0)
+        try info.write(to: bundle.appendingPathComponent("Contents/Info.plist"))
+        try addNpxPackage(hash: "old", version: "0.1.5-rc.3")
+        let old = try executable("old/dsh")
+        let node = try executable("bin/node")
+        let installation = DshPaths.detectInstallation(locate: { _ in old }, npxRoot: root.appendingPathComponent("npx"),
+                                                       desktopBundles: [bundle], nodeCandidates: [node],
+                                                       nodeVersion: { _ in DshVersion("24.0.0") })
+        XCTAssertEqual(installation?.executable, script)
+        XCTAssertEqual(installation?.version, "0.2.0-rc.2")
+        XCTAssertEqual(installation?.acpArguments, ["--profile", "acp"])
+    }
+
+    func testMissingDesktopCliFallsBackToNpx() throws {
+        try addNpxPackage(hash: "only", version: "0.1.5-rc.3")
+        let node = try executable("bin/node")
+        let installation = DshPaths.detectInstallation(locate: { _ in nil }, npxRoot: root.appendingPathComponent("npx"),
+                                                       desktopBundles: [root.appendingPathComponent("Missing.app")],
+                                                       nodeCandidates: [node], nodeVersion: { _ in DshVersion("24.0.0") })
+        XCTAssertEqual(installation?.kind, .npxCache)
     }
 
     func testBinaryOnPathWinsAndPrefersNodeBesideIt() throws {
@@ -120,7 +148,7 @@ final class DshPathsTests: XCTestCase {
         let other = try executable("other/node")
         let installation = DshPaths.detectInstallation(locate: { $0 == "dsh" ? dsh : nil },
                                                        npxRoot: root.appendingPathComponent("npx"),
-                                                       nodeCandidates: [other], nodeVersion: { _ in DshVersion("23.8.0") })
+                                                       desktopBundles: [], nodeCandidates: [other], nodeVersion: { _ in DshVersion("23.8.0") })
         XCTAssertEqual(installation?.kind, .binary)
         XCTAssertEqual(installation?.executable, dsh)
         XCTAssertEqual(installation?.acpArguments, ["--profile", "acp"])

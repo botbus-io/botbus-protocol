@@ -197,10 +197,18 @@ public actor AcpHub: MultiAgentConnector, MessageReader {
         guard refreshTask == nil, !isShutDown else { return }
         refreshTask = Task { [weak self] in
             while !Task.isCancelled {
+                await self?.refreshLocalSessions()
                 await self?.refreshLists(now: Date())
                 guard self != nil else { return }
-                try? await Task.sleep(for: .seconds(AcpHub.listInterval))
+                try? await Task.sleep(for: .seconds(5))
             }
+        }
+    }
+
+    public func refreshLocalSessions() async {
+        guard !isShutDown else { return }
+        for (id, connector) in connectors where isActive(id) {
+            await connector.refreshLocalSessions()
         }
     }
 
@@ -210,7 +218,8 @@ public actor AcpHub: MultiAgentConnector, MessageReader {
         for (id, connector) in connectors where isActive(id) {
             let running = await connector.isRunning
             let last = lastListRefresh[id] ?? .distantPast
-            guard running || now.timeIntervalSince(last) >= Self.idleListInterval else { continue }
+            let interval = running ? Self.listInterval : Self.idleListInterval
+            guard now.timeIntervalSince(last) >= interval else { continue }
             // 上面的 await 期间这个 agent 可能已经被删掉、换掉、停用、藏起来，或者 app 开始退出了。
             guard !isShutDown, connectors[id] === connector, isActive(id) else { continue }
             lastListRefresh[id] = now

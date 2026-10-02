@@ -84,6 +84,7 @@ final class ClaudeModelsTests: XCTestCase {
     }
 
     func testClaudeReportsOnlyEffortsSupportedByInstalledCLI() throws {
+        try skipPOSIXScriptOnWindows()
         let binary = FileManager.default.temporaryDirectory.appendingPathComponent("claude-help-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: binary) }
         try "#!/bin/sh\nprintf '%s\\n' '  --effort <level>  Effort level (low, medium, high, max)'\n"

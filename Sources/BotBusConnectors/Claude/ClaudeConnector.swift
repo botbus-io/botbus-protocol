@@ -33,7 +33,13 @@ public actor ClaudeConnector: TaskConnector {
     static let maxSessions = 200
     /// 等 `claude -p` 吐出 `system/init`（里面才有 session id）的上限。
     /// 命令回执只表示"后端已接受"，不该为了它等一整轮。
+    /// Windows 上放宽到 60 秒：只装了 Claude 桌面版的电脑用它自带的 claude.exe，桌面版同时开着一堆会话时，
+    /// 从起进程到 init 实测要 15–20 秒（4 核虚拟机，含 SessionStart hook），20 秒的上限会让手机上的新任务白白失败。
+    #if os(Windows)
+    static let sessionIDTimeout: TimeInterval = 60
+    #else
     static let sessionIDTimeout: TimeInterval = 20
+    #endif
     /// `claude` 一行 init 都没吐就退出了（参数不认、没登录……）。新建时认它来决定要不要去掉 `--name` 重起。
     static let exitedWithoutSessionID = ConnectorError("claude 退出了，没有拿到 session id")
     /// 标题上限，对齐协议里 Claude 取首条 prompt 截断 80 字。
@@ -1045,7 +1051,7 @@ public actor ClaudeConnector: TaskConnector {
             // 桌面上用户自己开的会话不是我们的子进程，发不了信号。
             throw ConnectorError("这个会话是在电脑上启动的，只能在电脑上中断")
         }
-        kill(process.processIdentifier, SIGINT)
+        PlatformProcess.interrupt(process.processIdentifier)
         // 中断就是不要了：排在后面的续聊一并作废，不在这一轮退出后又自己跑起来。
         queued.removeValue(forKey: sessionID)
         if let session = sessions[sessionID] { releaseHold(for: session) }

@@ -129,6 +129,9 @@ extension LocalHookServer {
     static func prepareSupportDirectory(_ directory: URL) throws {
         #if canImport(Darwin)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #elseif os(Windows)
+        // Windows 没有权限位：换成只给本人的 DACL。
+        try Win32.makePrivateDirectory(directory)
         #else
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
@@ -141,6 +144,10 @@ extension LocalHookServer {
     /// 原子写一个 0600 的文件：临时文件一创建就是 0600（`O_EXCL | O_NOFOLLOW`，不经过默认 umask 的窗口），
     /// 写完 rename 过去。rename 替换的是目录项本身，目标是符号链接也不会顺着写到别处。
     static func writePrivateFile(_ data: Data, to url: URL) throws {
+        #if os(Windows)
+        // 临时文件建出来就带着只给本人的 DACL，写完 MoveFileExW 覆盖过去。
+        try Win32.writePrivateFile(data, to: url)
+        #else
         let temporary = url.deletingLastPathComponent()
             .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString)").path
         let descriptor = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
@@ -166,5 +173,6 @@ extension LocalHookServer {
             unlink(temporary)
             throw POSIXError(POSIXErrorCode(rawValue: failure) ?? .EIO)
         }
+        #endif
     }
 }

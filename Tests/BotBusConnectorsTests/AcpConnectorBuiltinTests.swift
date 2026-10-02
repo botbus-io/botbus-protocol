@@ -88,7 +88,7 @@ final class AcpConnectorBuiltinTests: XCTestCase {
     func testFollowUpResumesWhenAgentOnlyHasResume() async throws {
         let behavior = FakeAcpBehavior()
         behavior.capabilities = Self.resumeOnly
-        let tools = AgentToolsConfiguration(cliPath: "/bin/sh", toolsURL: "http://127.0.0.1:1")
+        let tools = AgentToolsConfiguration(cliPath: anyExecutablePath, toolsURL: "http://127.0.0.1:1")
         let h = await AcpHarness.make(behavior: behavior, tools: tools, identity: .builtin(.dsh))
         await h.store.upsert(dshRecord("session-old", cwd: project))
         let outcome = try await h.connector.followUp(taskId: "dsh:session-old", prompt: "继续", images: [])
@@ -98,7 +98,8 @@ final class AcpConnectorBuiltinTests: XCTestCase {
         XCTAssertEqual(h.behavior.methods(), ["initialize", "session/resume", "session/prompt"])
         let params = h.behavior.params.withLock { $0["session/resume"] }
         XCTAssertEqual(params?["sessionId"], "session-old")
-        XCTAssertEqual(params?["cwd"]?.stringValue, project)
+        // 续聊的 cwd 取 store 盖过章的工作目录（Windows 上是 `C:\…` 写法）。
+        XCTAssertEqual(params?["cwd"]?.stringValue, PlatformPath.canonical(project))
         XCTAssertEqual(params?["mcpServers"]?[0]?["name"], "botbus")
         let record = await h.task("dsh:session-old")
         XCTAssertEqual(record?.lastMessage, "好的")
@@ -155,6 +156,24 @@ final class AcpConnectorBuiltinTests: XCTestCase {
         behavior.resumeError = nil
         _ = try await h.connector.followUp(taskId: "dsh:session-old", prompt: "继续", images: [])
         await assertEventually { await h.task("dsh:session-old")?.status == .completed }
+    }
+
+    func testNewerDshLogFormatHasActionableErrorWithoutPrivatePath() async throws {
+        let behavior = FakeAcpBehavior()
+        behavior.capabilities = Self.resumeOnly
+        behavior.resumeError = JSONRPCError(code: -32603, message: "Internal error", data: [
+            "details": "session old uses log format v4, but this harness reads only v3: the log was written by a newer harness — upgrade the harness to open it (raw log: /private/session.v4.jsonl.zstd)",
+        ])
+        let h = await AcpHarness.make(behavior: behavior, identity: .builtin(.dsh))
+        await h.store.upsert(dshRecord("old", cwd: project))
+        do {
+            _ = try await h.connector.followUp(taskId: "dsh:old", prompt: "继续", images: [])
+            XCTFail("旧 harness 不能续聊新日志")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("升级"), error.localizedDescription)
+            XCTAssertFalse(error.localizedDescription.contains("/private"))
+        }
+        XCTAssertFalse(behavior.methods().contains("session/prompt"))
     }
 
     /// 其他 -32603 照旧是普通错误。
