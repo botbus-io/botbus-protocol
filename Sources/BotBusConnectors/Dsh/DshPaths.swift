@@ -191,7 +191,7 @@ extension DshPaths {
         return version
     }
 
-    private static let nodeVersionMemo = DshLockedValue<[String: DshVersion?]>([:])
+    private static let nodeVersionMemo = LockedValue<[String: DshVersion?]>([:])
 
     /// 跑 `<node> --version`（`v24.1.0`），3 秒超时。失败返回 nil。
     public static let probeNodeVersion: @Sendable (String) -> DshVersion? = { node in
@@ -249,8 +249,8 @@ public final class DshInstallationProbe: @unchecked Sendable {
     }
 }
 
-/// 加锁的一个值（本文件里的静态缓存用）。
-final class DshLockedValue<Value>: @unchecked Sendable {
+/// 加锁的一个值（本包里的静态缓存用：dsh 的探测、`ClaudePaths` 的版本号）。
+final class LockedValue<Value>: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Value
 
