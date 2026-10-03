@@ -5,7 +5,7 @@ import Foundation
 /// 一行一个 JSON 对象。这里只关心三件事：
 /// - `{"type":"system","subtype":"init","session_id":…}` —— 会话 id，命令回执等的就是它；
 /// - `{"type":"assistant","message":{"content":[{"type":"text","text":…}]}}` —— 留最后一段文本；
-/// - `{"type":"result",…}` —— 一轮结束，`is_error`/`subtype` 说明成没成。
+/// - `{"type":"result",…}` —— 一轮结束，`is_error`/`subtype` 说明成没成，报错时 `result` 是错误原文。
 ///
 /// 另外 `--permission-prompt-tool stdio` 时 claude 经 stdout 发 `control_request`（要不要放行一个工具）
 /// 与 `control_cancel_request`，原样交给 `onControl`，回答由调用方写进 stdin。
@@ -18,6 +18,9 @@ public final class StreamJSONReader: @unchecked Sendable {
         public var lastText: String?
         /// `result` 行报了错，或者根本没等到 `result`。
         public var failed: Bool
+        /// 报错的 `result` 行（`is_error: true`）自带的原文，例如 "Not logged in · Please run /login"。
+        /// 失败诊断（协议 3.7）只看它：`lastText` 可能是 agent 自己说的最后一段话。
+        public var errorText: String?
     }
 
     private let handle: FileHandle
@@ -25,6 +28,7 @@ public final class StreamJSONReader: @unchecked Sendable {
     private var buffer = Data()
     private var sessionID: String?
     private var lastText: String?
+    private var errorText: String?
     private var sawResult = false
     private var failed = false
     private var finished = false
@@ -92,7 +96,7 @@ public final class StreamJSONReader: @unchecked Sendable {
         handle.finishPortableReading()
         callback = finishedCallback
         // 一行 `result` 都没见到就当失败：正常结束一定有它。
-        result = Result(sessionID: sessionID, lastText: lastText, failed: failed || !sawResult)
+        result = Result(sessionID: sessionID, lastText: lastText, failed: failed || !sawResult, errorText: errorText)
         lock.unlock()
         callback?(result)
     }
@@ -131,7 +135,10 @@ public final class StreamJSONReader: @unchecked Sendable {
                 let subtype = (object["subtype"] as? String) ?? "success"
                 if isError || subtype != "success" { failed = true }
                 // `result` 行自带最终文本时用它，比累计的最后一段更准。
-                if let text = object["result"] as? String, !text.isEmpty { lastText = text }
+                if let text = object["result"] as? String, !text.isEmpty {
+                    lastText = text
+                    if isError { errorText = text }
+                }
                 sawResultLine = true
             case "control_request", "control_cancel_request":
                 controls.append((Data(line), sessionID))

@@ -105,6 +105,29 @@ public actor TaskStore {
     private var systemPermissionInspections: [String: (id: UUID, task: Task<Void, Never>)] = [:]
     private var systemPermissionNotifications: [String: Date] = [:]
 
+    /// 失败后读一次工作目录（协议 3.7 的 `projectMissing` / `folderAccessDenied`）。nil = 不探测（测试默认）。
+    private let directoryProbe: DirectoryProbe?
+    /// 手机发起、进程由 BotBus 起的那一轮：分发器在命令被接受后记下，这一轮结束（离开 running / 等待）时消费。
+    /// 只有这样的轮次失败才探测——终端或桌面版里跑失败的，进程不是 BotBus 起的，BotBus 的读权限说明不了什么。
+    private var botbusTurns: Set<String> = []
+    /// 每条任务结束过几轮（离开 running / 等待，和消费 `botbusTurns` 同一处）。分发器调连接器之前读一次，
+    /// 记 `botbusTurns` 时拿来比：变了说明这一轮在记下之前就结束了，见 `markBotBusTurn(_:endsBefore:)`。
+    /// 只增不减，任务从 store 里拿掉时才忘。
+    private var turnEnds: [String: TurnEnds] = [:]
+
+    private struct TurnEnds {
+        var count = 0
+        /// 最近一次结束时允不允许推通知（静默基线、静默写入时不探测）。
+        var notifyAllowed = false
+    }
+    /// 连接器 / 观察者报的失败原因。**和 `tasks` 分开存**：一轮结束后所有权交还观察者（Codex），观察者再报同一条
+    /// failed 时不带诊断，不能把连接器认出的原因冲掉。进来的 failed 带诊断就记下（新的盖旧的），不带就不动，
+    /// 离开 failed 时撤掉；外发的 `diagnosis` 只由 `stamped(_:)` 从这里与 `directoryDiagnoses` 取。
+    private var connectorDiagnoses: [String: FailureDiagnosis] = [:]
+    /// 失败后探测得到的诊断，和 `systemPermissionsByTask` 一样只属于当前这次 failed。
+    private var directoryDiagnoses: [String: FailureDiagnosis] = [:]
+    private var directoryInspections: [String: (id: UUID, task: Task<Void, Never>)] = [:]
+
     /// 任务 id → 产物（新的在前、≤ `TaskRecord.maxArtifacts`）。**和 `tasks` 分开存**：
     /// 连接器与观察者根本不知道产物这回事，它们的 upsert / reconcile 带来的记录没有 `artifacts`，
     /// 由 `stamped(_:)` 在写入与外发时统一合并，所以谁也覆盖不掉它。任务还不在 store 里时也照样记着，
@@ -157,6 +180,7 @@ public actor TaskStore {
                 worktrees: WorktreeResolver = WorktreeResolver(),
                 systemPermissionInspector: SystemPermissionInspector? = nil,
                 systemPermissionInspectionTimeout: TimeInterval = 10,
+                directoryProbe: DirectoryProbe? = nil,
                 now: @escaping @Sendable () -> Date = { Date() }) {
         self.identity = identity
         self.host = host
@@ -172,6 +196,7 @@ public actor TaskStore {
         self.artifactSaveDelay = artifactSaveDelay
         self.systemPermissionInspector = systemPermissionInspector
         self.systemPermissionInspectionTimeout = systemPermissionInspectionTimeout
+        self.directoryProbe = directoryProbe
         self.now = now
         if let artifactsURL {
             let loaded = ArtifactArchive.load(from: artifactsURL, now: now())
@@ -195,6 +220,13 @@ public actor TaskStore {
         guard identity.agentId != agentId else { return }
         identity.agentId = agentId
         _ = clearSystemPermissionDiagnostics()
+        for inspection in directoryInspections.values { inspection.task.cancel() }
+        directoryInspections.removeAll()
+        directoryDiagnoses.removeAll()
+        // `connectorDiagnoses` 不清：连接器认出的原因（额度用完、没登录……）是任务自己的事实，与配对无关；
+        // 一个不会再被 upsert 的失败任务，清了就再没人把提示补回来。
+        // 轮数（`turnEnds`）不清：任务还在，分发器手里可能正拿着换之前读的数。
+        botbusTurns.removeAll()
         tasks = tasks.mapValues { stamped($0) }
         projectsBySource = projectsBySource.mapValues { $0.map { stamped($0) } }
     }
@@ -203,6 +235,25 @@ public actor TaskStore {
     public func setSystemPermissionInspector(_ inspector: SystemPermissionInspector?) {
         systemPermissionInspector = inspector
         publish(clearSystemPermissionDiagnostics())
+    }
+
+    /// 这条任务结束过几轮（见 `turnEnds`）。分发器在调连接器之前读，新建的任务是 0。
+    public func turnEndCount(_ taskId: String) -> Int {
+        turnEnds[taskId]?.count ?? 0
+    }
+
+    /// 分发器在 `startTask` / `followUp` 被接受、这一轮的进程由 BotBus 起时调用（见 `botbusTurns`）。
+    /// `endsBefore` 是调连接器之前读的 `turnEndCount`：之后已经有一轮结束，说明这一轮在记下之前就跑完了——
+    /// 失败了就现在读目录，不留标记，免得它被之后的轮次（可能是终端里的）消费。
+    public func markBotBusTurn(_ taskId: String, endsBefore: Int) {
+        guard let ended = turnEnds[taskId], ended.count > endsBefore else {
+            botbusTurns.insert(taskId)
+            return
+        }
+        guard ended.notifyAllowed, let task = tasks[taskId], task.status == .failed, isEnabled(task),
+              connectorDiagnoses[taskId] == nil, directoryDiagnoses[taskId] == nil,
+              directoryInspections[taskId] == nil else { return }
+        scheduleDirectoryInspection(for: taskId, path: task.workingDirectory)
     }
 
     // MARK: - 不在项目中（协议 2.6）
@@ -374,7 +425,8 @@ public actor TaskStore {
         let enabled = isEnabled(source)
         // 项目先盖章：已删 worktree 按同名归回主仓库时，要先见过这一轮报上来的项目目录。
         let mineProjects = enabled ? incomingProjects.map { stamped($0) } : []
-        let mine = enabled ? incoming.filter { $0.source == source && isEnabled($0) }.map { stamped($0) } : []
+        // 任务在 `apply` 里盖章：先记下观察者报的失败原因（`connectorDiagnoses`），再盖。
+        let mine = enabled ? incoming.filter { $0.source == source && isEnabled($0) } : []
 
         let firstSync = !syncedSources.contains(source)
         // 禁用期间不留基线：重新启用后的第一次对账仍是静默的，不会把积压状态一次性推成通知。
@@ -405,7 +457,7 @@ public actor TaskStore {
                 handoffDeadlines.removeValue(forKey: id)
             }
             tasks.removeValue(forKey: id)
-            clearSystemPermission(for: id)
+            forgetFailureState(for: id)
             lastNotified.removeValue(forKey: id)
             owners.removeValue(forKey: id)
             events.append(.taskRemoved(id))
@@ -426,7 +478,7 @@ public actor TaskStore {
     ///   例如 OpenClaw 每次连上 Gateway 的首屏——那是基线，不是变化，逐条推送会把几十条旧会话一次性发到手机上。
     public func upsert(_ task: TaskRecord, notify: Bool = true) -> [Event] {
         guard isEnabled(task) else { return [] }
-        let events = apply(stamped(task), notifyAllowed: notify)
+        let events = apply(task, notifyAllowed: notify)
         publish(events)
         return events
     }
@@ -434,7 +486,7 @@ public actor TaskStore {
     /// 显式删除，同时把所有权与交接状态一并清掉。
     @discardableResult
     public func remove(id: String) -> [Event] {
-        clearSystemPermission(for: id)
+        forgetFailureState(for: id)
         guard tasks.removeValue(forKey: id) != nil else { return [] }
         lastNotified.removeValue(forKey: id)
         owners.removeValue(forKey: id)
@@ -458,7 +510,7 @@ public actor TaskStore {
         guard tasks[id] != nil else {
             owners.removeValue(forKey: id)
             handoffDeadlines.removeValue(forKey: id)
-            clearSystemPermission(for: id)
+            forgetFailureState(for: id)
             let events = [Event.taskRemoved(id)]
             publish(events)
             return events
@@ -544,7 +596,7 @@ public actor TaskStore {
                 owners.removeValue(forKey: taskId)
                 handoffDeadlines.removeValue(forKey: taskId)
                 lastNotified.removeValue(forKey: taskId)
-                clearSystemPermission(for: taskId)
+                forgetFailureState(for: taskId)
                 events.append(.taskRemoved(taskId))
             }
         }
@@ -823,6 +875,8 @@ public actor TaskStore {
     private func stamped(_ task: TaskRecord) -> TaskRecord {
         let artifacts = artifactList(for: task.id)
         let systemPermission = task.status == .failed ? systemPermissionsByTask[task.id] : nil
+        // 不看进来的 `task.diagnosis`：连接器带的已在 `apply` 里记进 `connectorDiagnoses`，盖过章的再盖一次结果不变。
+        let diagnosis = task.status == .failed ? (connectorDiagnoses[task.id] ?? directoryDiagnoses[task.id]) : nil
         let workingDirectory = PlatformPath.canonical(task.workingDirectory)
         let root = worktrees.projectRoot(for: workingDirectory).map(PlatformPath.canonical)
         let projectPath = root ?? workingDirectory
@@ -833,11 +887,12 @@ public actor TaskStore {
         guard task.agentId != identity.agentId || task.artifacts != artifacts || task.outsideProject != outside
                 || task.projectPath != projectPath || task.projectName != projectName
                 || task.worktreePath != worktreePath || task.systemPermission != systemPermission
-                || task.autoApprove != autoApprove else { return task }
+                || task.autoApprove != autoApprove || task.diagnosis != diagnosis else { return task }
         var copy = task
         copy.agentId = identity.agentId
         copy.artifacts = artifacts
         copy.systemPermission = systemPermission
+        copy.diagnosis = diagnosis
         copy.outsideProject = outside
         copy.autoApprove = autoApprove
         copy.projectPath = projectPath
@@ -865,19 +920,22 @@ public actor TaskStore {
         (path as NSString).lastPathComponent
     }
 
-    private func apply(_ task: TaskRecord, notifyAllowed: Bool) -> [Event] {
+    /// `incoming` 是连接器 / 观察者报上来、还没盖章的记录：先记下它带的失败原因，再盖章写入。
+    private func apply(_ incoming: TaskRecord, notifyAllowed: Bool) -> [Event] {
         // id 必须带来源前缀，否则不同来源会在同一个字典键上互相覆盖。
         // 这里不能 assertionFailure：upsert 是 public，Debug 构建下一个畸形 id 就会 trap 打死菜单栏进程；
         // 记一条告警后丢弃即可，宁可少一条任务也不要整个 Agent 消失。
-        guard task.id.hasPrefix("\(task.source.rawValue):") else {
-            Self.log.warning("丢弃 id 前缀不匹配的任务：\(task.id, privacy: .public)，应以 \(task.source.rawValue, privacy: .public): 开头")
+        guard incoming.id.hasPrefix("\(incoming.source.rawValue):") else {
+            Self.log.warning("丢弃 id 前缀不匹配的任务：\(incoming.id, privacy: .public)，应以 \(incoming.source.rawValue, privacy: .public): 开头")
             return []
         }
         // 手机合并并结束过的会话（协议 3.4）：观察器与连接器再报上来也不收。
-        guard hidden[task.id] == nil else { return [] }
+        guard hidden[incoming.id] == nil else { return [] }
+        captureConnectorDiagnosis(incoming)
+        let task = stamped(incoming)
         let previous = tasks[task.id]
         guard previous != task else { return [] }
-        if task.status != .failed { clearSystemPermission(for: task.id) }
+        if task.status != .failed { clearFailureDiagnostics(for: task.id) }
         tasks[task.id] = task
         if task.origin == .watch { rememberPhoneStarted(task.id) }
         var events: [Event] = [.taskUpdated(task)]
@@ -889,12 +947,42 @@ public actor TaskStore {
         if notifyAllowed, task.status == .failed, previous?.status != .failed {
             scheduleSystemPermissionInspection(for: task.id)
         }
+        // 一轮结束（从 running / 等待里出来）时记一笔，并消费「BotBus 起的这一轮」；失败且连接器没认出原因时读一次工作目录。
+        let active: Set<TaskStatus> = [.running, .waitingApproval, .waitingInput]
+        if !active.contains(task.status), previous.map({ active.contains($0.status) }) ?? true {
+            turnEnds[task.id, default: TurnEnds()].count += 1
+            turnEnds[task.id]?.notifyAllowed = notifyAllowed
+            let botbusTurn = botbusTurns.remove(task.id) != nil
+            if notifyAllowed, botbusTurn, task.status == .failed, connectorDiagnoses[task.id] == nil {
+                scheduleDirectoryInspection(for: task.id, path: task.workingDirectory)
+            }
+        }
         return events
     }
 
-    private func clearSystemPermission(for taskId: String) {
+    /// 连接器 / 观察者报的失败原因：failed 带诊断就记（新的盖旧的），failed 不带不动，离开 failed 撤掉。
+    private func captureConnectorDiagnosis(_ incoming: TaskRecord) {
+        guard incoming.status == .failed else {
+            connectorDiagnoses.removeValue(forKey: incoming.id)
+            return
+        }
+        if let diagnosis = incoming.diagnosis { connectorDiagnoses[incoming.id] = diagnosis }
+    }
+
+    /// 失败后诊断（授权弹窗、连接器认出的原因、目录探测）只属于当前这次 failed：重试、删除时一起清掉。
+    private func clearFailureDiagnostics(for taskId: String) {
         systemPermissionInspections.removeValue(forKey: taskId)?.task.cancel()
         systemPermissionsByTask.removeValue(forKey: taskId)
+        connectorDiagnoses.removeValue(forKey: taskId)
+        directoryInspections.removeValue(forKey: taskId)?.task.cancel()
+        directoryDiagnoses.removeValue(forKey: taskId)
+    }
+
+    /// 任务从 store 里拿掉（删除、隐藏、对账消失、停用）：失败诊断与「BotBus 起的这一轮」的记账一起清掉。
+    private func forgetFailureState(for taskId: String) {
+        clearFailureDiagnostics(for: taskId)
+        botbusTurns.remove(taskId)
+        turnEnds.removeValue(forKey: taskId)
     }
 
     private func clearSystemPermissionDiagnostics() -> [Event] {
@@ -930,6 +1018,25 @@ public actor TaskStore {
             events.append(.notify(notification))
         }
         publish(events)
+    }
+
+    private func scheduleDirectoryInspection(for taskId: String, path: String) {
+        guard let probe = directoryProbe else { return }
+        let id = UUID()
+        let inspection = Task { [weak self] in
+            let diagnosis = await probe.diagnose(path)
+            await self?.finishDirectoryInspection(diagnosis, taskId: taskId, inspectionId: id)
+        }
+        directoryInspections[taskId] = (id, inspection)
+    }
+
+    private func finishDirectoryInspection(_ diagnosis: FailureDiagnosis?, taskId: String, inspectionId: UUID) {
+        guard directoryInspections[taskId]?.id == inspectionId else { return }
+        directoryInspections.removeValue(forKey: taskId)
+        guard let diagnosis, let task = tasks[taskId], task.status == .failed, connectorDiagnoses[taskId] == nil,
+              isEnabled(task) else { return }
+        directoryDiagnoses[taskId] = diagnosis
+        publish(restamp(taskId))
     }
 
     /// 命令在创建任务之前失败时也提醒手机。没有任务 ID 的通知仍可展示；点开只进入 App 首页。

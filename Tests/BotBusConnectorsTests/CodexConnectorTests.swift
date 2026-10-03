@@ -593,6 +593,32 @@ final class CodexConnectorTests: XCTestCase {
         await teardown(rig)
     }
 
+    /// 协议 3.7：上一轮额度用完的原因只属于那一次 failed；新一轮开始后再因 systemError 失败，不能还挂着旧原因。
+    func testNewTurnDropsThePreviousFailureDiagnosis() async throws {
+        let rig = await makeRig()
+        _ = try await rig.connector.start(projectPath: "/tmp/project", prompt: "跑一下")
+        rig.process.deliver(object: ["method": "turn/started",
+                                     "params": ["threadId": "thread-1", "turn": ["id": "turn-1"]]])
+        rig.process.deliver(object: ["method": "turn/completed",
+                                     "params": ["threadId": "thread-1",
+                                                "turn": ["id": "turn-1", "status": "failed",
+                                                         "error": ["message": "You've hit your usage limit.",
+                                                                   "codexErrorInfo": "usageLimitExceeded"]]]])
+        await assertEventually { await self.task(rig)?.status == .failed }
+        let limited = try await requireTask(rig)
+        XCTAssertEqual(limited.diagnosis, .usageLimit())
+
+        rig.process.deliver(object: ["method": "turn/started",
+                                     "params": ["threadId": "thread-1", "turn": ["id": "turn-2"]]])
+        await assertEventually { await self.task(rig)?.status == .running }
+        rig.process.deliver(object: ["method": "thread/status/changed",
+                                     "params": ["threadId": "thread-1", "status": ["type": "systemError"]]])
+        await assertEventually { await self.task(rig)?.status == .failed }
+        let failedAgain = try await requireTask(rig)
+        XCTAssertNil(failedAgain.diagnosis)
+        await teardown(rig)
+    }
+
     func testStaleApproveIsRejectedWithReasonInsteadOfHanging() async throws {
         let rig = await makeRig()
         _ = try await rig.connector.start(projectPath: "/tmp/project", prompt: "跑一下")

@@ -31,10 +31,22 @@ public actor CommandDispatcher {
     private struct DispatchFailure: Error {
         let message: String
         let taskId: String?
+        /// 协议 3.7：`onTask` 包着的连接器错误带的失败原因。
+        var diagnosis: FailureDiagnosis?
+        /// 分发器自己的检查拒掉的（不是 `onTask` 包着的连接器、图片下载等错误）：这种失败不读目录。
+        var rejectedByDispatcher = true
+
         init(_ message: String, taskId: String? = nil) {
             self.message = message
             self.taskId = taskId
         }
+    }
+
+    /// `run` 的结果：受影响的 taskId；这条命令开了一轮由 BotBus 起进程的新轮次时（协议 3.7），
+    /// 再带上调连接器之前这条任务结束过几轮（`TaskStore.turnEndCount`，新建是 0）。
+    private struct RunResult {
+        var taskId: String?
+        var botbusTurnEndsBefore: Int?
     }
 
     /// 去重表里的一条。存的是执行中的 `Task` 而不是结果：重复命令统一 `await` 它的值——
@@ -71,6 +83,7 @@ public actor CommandDispatcher {
     /// 新建命令还没有 taskId，用真实 cwd 与 worktree 合并互斥。
     private var activeStartDirectories: [String: Int] = [:]
     private var remoteControl: (any RemoteControlling)?
+    private let directoryProbe: DirectoryProbe?
     private var systemPermissionInspector: SystemPermissionInspector?
     private let systemPermissionInspectionTimeout: TimeInterval
     private var systemPermissionGeneration = 0
@@ -88,6 +101,7 @@ public actor CommandDispatcher {
                 worktrees: (any WorktreeManaging)? = nil,
                 systemPermissionInspector: SystemPermissionInspector? = nil,
                 systemPermissionInspectionTimeout: TimeInterval = 10,
+                directoryProbe: DirectoryProbe? = nil,
                 now: @escaping @Sendable () -> Date = { Date() }) {
         self.store = store
         self.attachments = attachments
@@ -97,6 +111,7 @@ public actor CommandDispatcher {
         self.worktrees = worktrees
         self.systemPermissionInspector = systemPermissionInspector
         self.systemPermissionInspectionTimeout = systemPermissionInspectionTimeout
+        self.directoryProbe = directoryProbe
         self.now = now
         var byKind: [ConnectorKind: any TaskConnector] = [:]
         for connector in connectors where byKind[connector.kind] == nil { byKind[connector.kind] = connector }
@@ -221,8 +236,11 @@ public actor CommandDispatcher {
                 return CommandResult(commandId: command.id, ok: true, finishedAt: timestamp(),
                                      artifactId: artifact.id)
             }
-            let taskId = try await run(command)
-            return CommandResult(commandId: command.id, ok: true, taskId: taskId, finishedAt: timestamp())
+            let accepted = try await run(command)
+            if let taskId = accepted.taskId, let endsBefore = accepted.botbusTurnEndsBefore {
+                await store.markBotBusTurn(taskId, endsBefore: endsBefore)
+            }
+            return CommandResult(commandId: command.id, ok: true, taskId: accepted.taskId, finishedAt: timestamp())
         } catch {
             let failure = error as? DispatchFailure
             let message = failure?.message ?? Self.describe(error)
@@ -234,6 +252,16 @@ public actor CommandDispatcher {
             }
             var result = CommandResult(commandId: command.id, ok: false, error: Self.truncate(message),
                                        taskId: failure?.taskId ?? Self.targetTaskId(command), finishedAt: timestamp())
+            // 协议 3.7：连接器认出了原因就用它的；没认出、又不是分发器自己的检查拒掉的新建 / 续聊，进程由 BotBus 起时
+            // 读一次项目目录。除了连接器的错误，图片下载、建 worktree 失败也走到这里：读一次无害，只有目录真的不在、
+            // 真的读不了时才给结论。
+            result.diagnosis = failure?.diagnosis ?? (error as? any FailureDiagnosing)?.diagnosis
+            if result.diagnosis == nil, failure?.rejectedByDispatcher != true, !(error is CancellationError),
+               command.kind == .startTask || command.kind == .followUp,
+               let directoryProbe, connectorRunsUnderBotBus(command),
+               let directory = await probeDirectory(for: command) {
+                result.diagnosis = await directoryProbe.diagnose(directory)
+            }
             // 只在写入任务失败后检查；读历史/取文件、审批、中断及目标电脑错误都不触发。
             if (command.kind == .startTask || command.kind == .followUp), !(error is CancellationError),
                !Task.isCancelled, command.agentId == (await store.identity.agentId),
@@ -282,8 +310,8 @@ public actor CommandDispatcher {
         return target.path
     }
 
-    /// 成功时返回受影响的 taskId。抛出的一切由 `execute` 兜住。
-    private func run(_ command: Command) async throws -> String? {
+    /// 成功时返回受影响的 taskId（见 `RunResult`）。抛出的一切由 `execute` 兜住。
+    private func run(_ command: Command) async throws -> RunResult {
         switch command.kind {
         case .startTask:
             guard let payload = command.startTask else { throw DispatchFailure("缺少 startTask 载荷") }
@@ -328,10 +356,7 @@ public actor CommandDispatcher {
             // 项目身份是主仓库对应的子目录，它可能只存在于 worktree。仅能唯一定位时才使用现存 cwd。
             if payload.newProject == nil, !projectPath.isEmpty,
                !FileManager.default.fileExists(atPath: projectPath) {
-                let candidates = await store.worktreeDirectories(forProject: projectPath).filter { path in
-                    var directory: ObjCBool = false
-                    return FileManager.default.fileExists(atPath: path, isDirectory: &directory) && directory.boolValue
-                }
+                let candidates = await existingWorktreeDirectories(forProject: projectPath)
                 if candidates.count > 1 {
                     throw DispatchFailure("这个项目只在多个 worktree 中存在，请在其中一个会话里继续聊天")
                 }
@@ -393,7 +418,8 @@ public actor CommandDispatcher {
             // `TaskStore.liveHandoffGrace` 那段宽限——SQLite 还没落盘时它不会被当成"消失了"。
             await store.claimLive(taskId)
             if !outcome.retainsLiveOwnership { await store.releaseLive(taskId) }
-            return taskId
+            return RunResult(taskId: taskId,
+                             botbusTurnEndsBefore: outcome.runsUnderBotBus && connector.runsUnderBotBus ? 0 : nil)
         case .followUp:
             guard let payload = command.followUp else { throw DispatchFailure("缺少 followUp 载荷") }
             // 协议 2.7：worktree 里的会话只在原来的 worktree 里续聊。它已经被删掉时直接说清楚，
@@ -416,40 +442,46 @@ public actor CommandDispatcher {
                     autoApproveProject = task.projectPath
                 }
             }
-            return try await onTask(payload.taskId) { connector in
+            var endsBefore = 0
+            let turn = try await onTask(payload.taskId) { connector in
                 // 连接器可用、任务在本机之后、这一轮开始之前落地；这一轮失败也不回滚。
                 if let autoApprove = payload.autoApprove, let project = autoApproveProject {
                     await self.store.setAutoApprove(autoApprove, project: project)
                 }
                 // 下载放在 onTask 里：失败时由它交还所有权、带上 taskId。
                 let images = try await self.receiveImages(command, payload.attachments, kind: connector.kind)
+                // 协议 3.7：紧挨着调连接器读，之后结束的才可能是这一轮。
+                endsBefore = await self.store.turnEndCount(payload.taskId)
                 return try await connector.followUp(taskId: payload.taskId, prompt: payload.prompt, images: images,
                                                     selection: ModelSelection(payload))
             }
+            // Claude 对桌面会话续聊会分支出新 session：新任务还没结束过任何一轮。
+            let before = turn.taskId == payload.taskId ? endsBefore : 0
+            return RunResult(taskId: turn.taskId, botbusTurnEndsBefore: turn.runsUnderBotBus ? before : nil)
         case .approve:
             guard let payload = command.approve else { throw DispatchFailure("缺少 approve 载荷") }
-            return try await onTask(payload.taskId) { connector in
+            return RunResult(taskId: try await onTask(payload.taskId) { connector in
                 try await connector.approve(taskId: payload.taskId, requestId: payload.requestId,
                                             decision: payload.decision, answers: payload.answers)
-            }
+            }.taskId)
         case .interrupt:
             guard let payload = command.interrupt else { throw DispatchFailure("缺少 interrupt 载荷") }
-            return try await onTask(payload.taskId) { connector in
+            return RunResult(taskId: try await onTask(payload.taskId) { connector in
                 try await connector.interrupt(taskId: payload.taskId)
-            }
+            }.taskId)
         case .fetchMessages:
             guard let payload = command.fetchMessages else { throw DispatchFailure("缺少 fetchMessages 载荷") }
             try await fetchMessages(payload)
-            return payload.taskId
+            return RunResult(taskId: payload.taskId)
         case .fetchFile:
             guard let payload = command.fetchFile else { throw DispatchFailure("缺少 fetchFile 载荷") }
             try await fetchFile(payload)
-            return payload.taskId
+            return RunResult(taskId: payload.taskId)
         case .mergeWorktree:
             guard let payload = command.mergeWorktree else { throw DispatchFailure("缺少 mergeWorktree 载荷") }
-            return try await mergeWorktree(payload)
+            return RunResult(taskId: try await mergeWorktree(payload))
         case .setConnectorEnabled, .fetchChanges, .remoteControl:
-            return nil // 走不到：execute 已经先分出去了。
+            return RunResult() // 走不到：execute 已经先分出去了。
         }
     }
 
@@ -721,9 +753,10 @@ public actor CommandDispatcher {
     }
 
     /// 针对已有任务的三条命令共用的骨架：解析前缀 → 找连接器 → 确认任务在本机 →
-    /// 认领所有权 → 执行 → 无论成败都交还。
+    /// 认领所有权 → 执行 → 无论成败都交还。返回实际的 taskId，以及这一轮的进程是不是 BotBus 起的（协议 3.7）。
     private func onTask(_ taskId: String,
-                        _ body: (any TaskConnector) async throws -> ConnectorOutcome) async throws -> String {
+                        _ body: (any TaskConnector) async throws -> ConnectorOutcome) async throws
+        -> (taskId: String, runsUnderBotBus: Bool) {
         guard let source = TaskSource(taskId: taskId), let kind = ConnectorKind(source) else {
             throw DispatchFailure("无法识别的任务 id：\(taskId)", taskId: taskId)
         }
@@ -757,12 +790,21 @@ public actor CommandDispatcher {
             for id in touched where !(outcome.retainsLiveOwnership && id == resulting) {
                 await store.releaseLive(id)
             }
-            return resulting
+            return (resulting, outcome.runsUnderBotBus && connector.runsUnderBotBus)
         } catch {
             // 失败路径同样要交还，否则这个 id 会永远躲开只读观察，任务卡在最后一个已知状态。
             await store.releaseLive(taskId)
             if error is CancellationError { throw error }
-            throw DispatchFailure(Self.describe(error), taskId: taskId)
+            var failure = DispatchFailure(Self.describe(error), taskId: taskId)
+            if let inner = error as? DispatchFailure {
+                failure.diagnosis = inner.diagnosis
+                failure.rejectedByDispatcher = inner.rejectedByDispatcher
+            } else {
+                // 连接器（或图片下载）的错误：原因带上，失败后可以读目录（见 `execute`）。
+                failure.diagnosis = (error as? any FailureDiagnosing)?.diagnosis
+                failure.rejectedByDispatcher = false
+            }
+            throw failure
         }
     }
 
@@ -771,6 +813,50 @@ public actor CommandDispatcher {
     /// 和 `ManagedWorktree.path` 同一种写法，直接比前缀，见 `ManagedWorktree.contains`。
     private func isMerging(taskId: String, workingDirectory: String) -> Bool {
         merging[taskId] != nil || merging.values.contains { $0.contains(workingDirectory) }
+    }
+
+    /// 这条新建 / 续聊落到的连接器是不是自己起 agent 进程（`TaskConnector.runsUnderBotBus`）。
+    private func connectorRunsUnderBotBus(_ command: Command) -> Bool {
+        let source: TaskSource?
+        switch command.kind {
+        case .startTask: source = command.startTask?.source
+        case .followUp: source = command.followUp.flatMap { TaskSource(taskId: $0.taskId) }
+        default: source = nil
+        }
+        guard let source, let kind = ConnectorKind(source), let connector = connectors[kind] else { return false }
+        return connector.runsUnderBotBus
+    }
+
+    /// 项目子目录在哪些 worktree 里真的存在（只在 worktree 里有、主仓库那份不在时，新建用它们）。
+    private func existingWorktreeDirectories(forProject path: String) async -> [String] {
+        await store.worktreeDirectories(forProject: path).filter { path in
+            var directory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: path, isDirectory: &directory) && directory.boolValue
+        }
+    }
+
+    /// 失败后要读的目录：新建是手机选的项目（新建项目与「不在项目中」不读——前者刚由本机建出来，后者在主目录），
+    /// 续聊是任务的工作目录。
+    private func probeDirectory(for command: Command) async -> String? {
+        switch command.kind {
+        case .startTask:
+            guard let payload = command.startTask, payload.newProject == nil else { return nil }
+            let path = payload.projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !path.isEmpty else { return nil }
+            // 项目子目录只在 worktree 里有：连接器是在那个 worktree 里跑的（见 `run`），读主仓库那份只会误报「不在了」，
+            // 所以唯一的候选就读它；多个候选 `run` 已拒绝猜测，这里同样不下结论。
+            if !FileManager.default.fileExists(atPath: path) {
+                let candidates = await existingWorktreeDirectories(forProject: path)
+                if candidates.count > 1 { return nil }
+                if let candidate = candidates.first { return candidate }
+            }
+            return path
+        case .followUp:
+            guard let taskId = command.followUp?.taskId else { return nil }
+            return await store.task(id: taskId)?.workingDirectory
+        default:
+            return nil
+        }
     }
 
     private func connector(for kind: ConnectorKind) throws -> any TaskConnector {

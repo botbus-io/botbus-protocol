@@ -60,6 +60,7 @@ const SCHEMA: Record<string, ZodType> = {
   "command-merge-worktree.json": P.SealedCommand,
   "event-command-result-changes.json": P.SealedEvent,
   "event-command-result-system-permission.json": P.SealedEvent,
+  "event-command-result-diagnosis.json": P.SealedEvent,
   "event-command-result.json": P.SealedEvent,
   "event-notify-done.json": P.SealedEvent,
   "event-notify-failed.json": P.SealedEvent,
@@ -112,6 +113,7 @@ const SCHEMA: Record<string, ZodType> = {
   "task-waiting-input.json": P.SealedTask,
   "task-with-artifacts.json": P.SealedTask,
   "task-with-system-permission.json": P.SealedTask,
+  "task-with-diagnosis.json": P.SealedTask,
 };
 
 /** 明文帧只在 `plain/` 里用来对照：线上只有密封帧。 */
@@ -146,6 +148,7 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "task-with-system-permission.json": P.Task,
   "task-acp.json": P.Task,
   "task-with-model.json": P.Task,
+  "task-with-diagnosis.json": P.Task,
   "artifact-image.json": P.Artifact,
   "artifact-video.json": P.Artifact,
   "command-start-task.json": P.Command,
@@ -176,6 +179,7 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "event-task-removed.json": P.Event,
   "event-command-result.json": P.Event,
   "event-command-result-system-permission.json": P.Event,
+  "event-command-result-diagnosis.json": P.Event,
   "event-command-result-changes.json": P.Event,
   "event-notify.json": P.Event,
   "event-notify-done.json": P.Event,
@@ -223,9 +227,9 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
 describe("fixture 目录与对照表一一对应", () => {
   it("每个 valid fixture 都在 SCHEMA / PLAIN_SCHEMA 表里，且表里没有已删除的文件", () => {
     expect([...validFixtures.keys()].sort()).toEqual(Object.keys(SCHEMA).sort());
-    expect(validFixtures.size).toBe(77);
+    expect(validFixtures.size).toBe(79);
     expect([...plainFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_SCHEMA).sort());
-    expect(plainFixtures.size).toBe(67);
+    expect(plainFixtures.size).toBe(69);
   });
   it("每个 invalid fixture 都在 MUST_REJECT / PLAIN_MUST_REJECT 表里", () => {
     expect([...invalidFixtures.keys()].sort()).toEqual(Object.keys(MUST_REJECT).sort());

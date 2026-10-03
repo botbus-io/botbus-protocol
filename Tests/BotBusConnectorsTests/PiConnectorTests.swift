@@ -97,10 +97,11 @@ final class PiConnectorTests: XCTestCase {
     private func makeConnector(store: TaskStore, launcher: FakePiLauncher,
                                tools: AgentToolsConfiguration? = nil,
                                registry: TaskContextRegistry = TaskContextRegistry(),
+                               directoryProbe: DirectoryProbe = .live(),
                                finished: Locked<Int> = Locked(0)) -> PiConnector {
         let paths = fixture.paths
         return PiConnector(store: store, paths: { paths }, binary: { "/fake/bin/pi" }, launcher: launcher,
-                           tools: { tools }, registry: registry,
+                           tools: { tools }, registry: registry, directoryProbe: directoryProbe,
                            onRunFinished: { finished.withLock { $0 += 1 } })
     }
 
@@ -217,7 +218,8 @@ final class PiConnectorTests: XCTestCase {
             _ = try await connector.start(projectPath: "/nonexistent/project", prompt: "hi")
             XCTFail("目录不存在应当报错")
         } catch {
-            XCTAssertTrue((error as? ConnectorError)?.message.hasPrefix("项目目录不存在") ?? false)
+            XCTAssertEqual((error as? ConnectorError)?.message, "项目目录不存在：/nonexistent/project")
+            XCTAssertEqual((error as? ConnectorError)?.diagnosis, .projectMissing)
         }
         let noBinary = PiConnector(store: store, binary: { nil }, launcher: launcher)
         do {
@@ -225,6 +227,51 @@ final class PiConnectorTests: XCTestCase {
             XCTFail("没有 pi 应当报错")
         } catch {}
         XCTAssertTrue(launcher.processes.current.isEmpty)
+    }
+
+    /// 协议 3.7：`pi` 沿用 BotBus 的文件夹授权，BotBus 读不了的目录不起进程，直接说清楚。
+    func testStartInUnreadableDirectoryReportsFolderAccess() async throws {
+        let store = makeStore()
+        let launcher = FakePiLauncher.emittingHeader(id: "s1")
+        let denied = DirectoryProbe(timeout: 1, access: { _ in .denied }, folder: { _ in .documents })
+        let connector = makeConnector(store: store, launcher: launcher, directoryProbe: denied)
+        do {
+            _ = try await connector.start(projectPath: projectDirectory.path, prompt: "hi")
+            XCTFail("读不了的目录应当报错")
+        } catch {
+            XCTAssertEqual((error as? ConnectorError)?.diagnosis, .folderAccessDenied(.documents))
+            XCTAssertEqual((error as? ConnectorError)?.message, "BotBus 没有权限读取项目目录：\(projectDirectory.path)")
+        }
+        XCTAssertTrue(launcher.processes.current.isEmpty)
+    }
+
+    /// 探测不下结论（同一目录还有读取没回来、或超时，返回 nil）时，不存在的目录照样不起进程；存在的照常起。
+    func testStartFallsBackToExistenceCheckWhenProbeIsInconclusive() async throws {
+        let store = makeStore()
+        let launcher = FakePiLauncher.emittingHeader(id: "s1")
+        let inconclusive = DirectoryProbe(timeout: 1, access: { _ in nil }, folder: { _ in .other })
+        let connector = makeConnector(store: store, launcher: launcher, directoryProbe: inconclusive)
+        do {
+            _ = try await connector.start(projectPath: "/nonexistent/project", prompt: "hi")
+            XCTFail("目录不存在应当报错")
+        } catch {
+            XCTAssertEqual((error as? ConnectorError)?.diagnosis, .projectMissing)
+            XCTAssertEqual((error as? ConnectorError)?.message, "项目目录不存在：/nonexistent/project")
+        }
+        // 指向普通文件也不是目录。
+        let file = projectDirectory.appendingPathComponent("not-a-directory")
+        try Data().write(to: file)
+        do {
+            _ = try await connector.start(projectPath: file.path, prompt: "hi")
+            XCTFail("不是目录应当报错")
+        } catch {
+            XCTAssertEqual((error as? ConnectorError)?.diagnosis, .projectMissing)
+        }
+        XCTAssertTrue(launcher.processes.current.isEmpty)
+
+        let outcome = try await connector.start(projectPath: projectDirectory.path, prompt: "hi")
+        XCTAssertEqual(outcome.taskId, "pi:s1")
+        XCTAssertEqual(launcher.processes.current.count, 1)
     }
 
     /// 整轮在 `start` 登记完之前就跑完了（首行之后立刻报错退出）：最终状态不能被随后的 running 盖掉，

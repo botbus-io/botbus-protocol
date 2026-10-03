@@ -19,6 +19,8 @@ import BotBusConnectorKit
 /// 退避（1、2、4……60 秒）重连，每次重读配置（用户可能刚改了 token 或端口）。
 public actor OpenClawConnector: TaskConnector {
     public nonisolated var kind: ConnectorKind { .openclaw }
+    /// 会话跑在 OpenClaw 的 gateway 里，不是 BotBus 起的进程。
+    public nonisolated var runsUnderBotBus: Bool { false }
 
     /// 连接器把运行期健康状况交给 app：app 转给 `ConnectorRegistry.reportRuntime` 并重发快照。
     public typealias HealthHandler = @Sendable (ConnectorInfo.Status, String?) async -> Void

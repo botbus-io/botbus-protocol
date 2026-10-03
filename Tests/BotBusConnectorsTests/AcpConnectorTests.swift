@@ -210,6 +210,28 @@ final class AcpConnectorTests: XCTestCase {
         }
     }
 
+    /// 协议 3.7：目录不在就报 projectMissing（原话不变）；自己起的 agent 进程沿用 BotBus 的文件夹授权，
+    /// BotBus 读不了的目录不拉起进程，直接报 folderAccessDenied。
+    func testStartChecksTheProjectDirectoryBeforeLaunching() async throws {
+        let h = await AcpHarness.make()
+        do {
+            _ = try await h.connector.start(projectPath: "/nonexistent/project", prompt: "x", images: [])
+            XCTFail("目录不存在应当报错")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "项目目录不存在：/nonexistent/project")
+            XCTAssertEqual((error as? ConnectorError)?.diagnosis, .projectMissing)
+        }
+        let denied = DirectoryProbe(timeout: 1, access: { _ in .denied }, folder: { _ in .desktop })
+        let blocked = await AcpHarness.make(directoryProbe: denied)
+        do {
+            _ = try await blocked.connector.start(projectPath: project, prompt: "x", images: [])
+            XCTFail("读不了的目录应当报错")
+        } catch {
+            XCTAssertEqual((error as? ConnectorError)?.diagnosis, .folderAccessDenied(.desktop))
+        }
+        XCTAssertTrue(blocked.queue.requests.current.isEmpty, "不该拉起 agent 进程")
+    }
+
     func testAuthRequiredReportsDegraded() async {
         let behavior = FakeAcpBehavior()
         behavior.newSessionError = JSONRPCError(code: AcpProtocol.authRequiredCode, message: "auth_required")
@@ -219,6 +241,7 @@ final class AcpConnectorTests: XCTestCase {
             XCTFail("应当失败")
         } catch {
             XCTAssertEqual(error.localizedDescription, "请在电脑上登录 My Agent")
+            XCTAssertEqual((error as? ConnectorError)?.diagnosis, .notSignedIn)
         }
         XCTAssertTrue(h.health.withLock { $0 }.contains { $0.0 == .degraded })
         XCTAssertEqual(h.handshakeFailures.current, 0, "要登录不是握手失败")

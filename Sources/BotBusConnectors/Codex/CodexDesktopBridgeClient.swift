@@ -14,6 +14,17 @@ public struct CodexBridgeProcessLauncher: CodexProcessLauncher {
     public func launch() throws -> any CodexProcessHandle {
         CodexBridgeProcessHandle(descriptor: descriptor)
     }
+
+    /// 连桥接回环端口的会话配置。不带 URLCache：`close()` 会取消挂着 `/poll` 的任务，带缓存的会话在
+    /// swift-corelibs-foundation 上可能因此 trap（见 `URLSessionDshHTTPTransport`）。
+    static func sessionConfiguration() -> URLSessionConfiguration {
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.timeoutIntervalForRequest = 28
+        config.timeoutIntervalForResource = 30
+        return config
+    }
 }
 
 private final class CodexBridgeProcessHandle: CodexProcessHandle, @unchecked Sendable {
@@ -58,10 +69,7 @@ private actor CodexBridgeRemoteState {
     init(descriptor: CodexBridgeDescriptor, continuation: AsyncStream<Data>.Continuation) {
         self.descriptor = descriptor
         self.continuation = continuation
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 28
-        config.timeoutIntervalForResource = 30
-        urlSession = URLSession(configuration: config)
+        urlSession = URLSession(configuration: CodexBridgeProcessLauncher.sessionConfiguration())
     }
 
     func send(_ message: JSONValue) async throws {

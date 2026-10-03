@@ -191,6 +191,130 @@ final class ClaudeConnectorTests: XCTestCase {
         let record = try await requireTask(store, "s1")
         XCTAssertEqual(record.status, .failed)
         XCTAssertEqual(record.lastMessage, "429 Too Many Requests")
+        XCTAssertEqual(record.diagnosis, .usageLimit())
+        // 下一轮开始时撤掉上一轮的原因。
+        await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/tmp/proj", "prompt": "再试"])
+        let retried = try await requireTask(store, "s1")
+        XCTAssertEqual(retried.status, .running)
+        XCTAssertNil(retried.diagnosis)
+    }
+
+    /// 一轮已经失败并认出原因（`finish` 从报错原文认的、或前一条 StopFailure）后，迟到的 StopFailure 类别认不出
+    /// （`unknown`、`server_error`）不能把连接器记的原因抹掉；认得出的照常换掉，新一轮之后的失败不继承。
+    /// 看连接器自己的记录：store 另存的一份在 failed 不带原因时不动，盖得住这个问题。
+    func testLateUnrecognisedStopFailureKeepsTheDiagnosis() async throws {
+        let store = makeStore()
+        let connector = makeConnector(store: store)
+        await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/tmp/proj", "prompt": "继续"])
+        await send(connector, ["hook_event_name": "StopFailure", "session_id": "s1", "cwd": "/tmp/proj",
+                               "error": "rate_limit", "error_details": "429 Too Many Requests"])
+        var kept = await connector.failureDiagnosis(for: "s1")
+        XCTAssertEqual(kept, .usageLimit())
+        await send(connector, ["hook_event_name": "StopFailure", "session_id": "s1", "cwd": "/tmp/proj",
+                               "error": "unknown", "error_details": "something odd"])
+        await send(connector, ["hook_event_name": "StopFailure", "session_id": "s1", "cwd": "/tmp/proj",
+                               "error": "server_error", "error_details": "500 Internal Server Error"])
+        kept = await connector.failureDiagnosis(for: "s1")
+        XCTAssertEqual(kept, .usageLimit())
+        let record = try await requireTask(store, "s1")
+        XCTAssertEqual(record.status, .failed)
+        XCTAssertEqual(record.lastMessage, "500 Internal Server Error")
+        XCTAssertEqual(record.diagnosis, .usageLimit())
+
+        await send(connector, ["hook_event_name": "StopFailure", "session_id": "s1", "cwd": "/tmp/proj",
+                               "error": "authentication_failed"])
+        let replaced = await connector.failureDiagnosis(for: "s1")
+        XCTAssertEqual(replaced, .notSignedIn)
+
+        await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/tmp/proj", "prompt": "再试"])
+        let cleared = await connector.failureDiagnosis(for: "s1")
+        XCTAssertNil(cleared)
+        await send(connector, ["hook_event_name": "StopFailure", "session_id": "s1", "cwd": "/tmp/proj", "error": "unknown"])
+        let nextTurn = await connector.failureDiagnosis(for: "s1")
+        XCTAssertNil(nextTurn)
+        let failed = try await requireTask(store, "s1")
+        XCTAssertEqual(failed.status, .failed)
+        XCTAssertNil(failed.diagnosis)
+    }
+
+    /// 失败时只看错误本身：agent 最后说的话里有「not logged in」「limit reached … resets」也不当成原因。
+    func testStopFailureDoesNotClassifyAgentProse() async throws {
+        let store = makeStore()
+        let connector = makeConnector(store: store)
+        await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/tmp/proj", "prompt": "查一下"])
+        await send(connector, ["hook_event_name": "StopFailure", "session_id": "s1", "cwd": "/tmp/proj",
+                               "error": "server_error", "error_details": "500 Internal Server Error",
+                               "last_assistant_message": "Users who are not logged in get a 401; the limit reached resets daily."])
+        let categorized = try await requireTask(store, "s1")
+        XCTAssertEqual(categorized.status, .failed)
+        XCTAssertNil(categorized.diagnosis)
+
+        await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s2", "cwd": "/tmp/proj", "prompt": "查一下"])
+        await send(connector, ["hook_event_name": "StopFailure", "session_id": "s2", "cwd": "/tmp/proj",
+                               "error_details": "API Error: 529 Overloaded",
+                               "last_assistant_message": "You've hit your limit on retries, so I stopped."])
+        let uncategorized = try await requireTask(store, "s2")
+        XCTAssertEqual(uncategorized.status, .failed)
+        XCTAssertNil(uncategorized.diagnosis)
+
+        await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s3", "cwd": "/tmp/proj", "prompt": "查一下"])
+        await send(connector, ["hook_event_name": "StopFailure", "session_id": "s3", "cwd": "/tmp/proj",
+                               "error_details": "Not logged in · Please run /login"])
+        let signedOut = try await requireTask(store, "s3")
+        XCTAssertEqual(signedOut.diagnosis, .notSignedIn)
+    }
+
+    /// 自己起的 `claude -p` 这一轮失败：只看报错的 `result` 行的原文，不看 agent 的最后一段话。
+    func testOwnTurnFailureClassifiesOnlyTheErrorResult() async throws {
+        try skipPOSIXScriptOnWindows()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("claude-fail-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        // prompt 含 prose：只说一段话就退出（没有 result 行）；否则回一行报错的 result。
+        let binary = directory.appendingPathComponent("claude")
+        try """
+        #!/bin/sh
+        if [ "$1" = "--help" ]; then exit 0; fi
+        prompt=$(head -n 1)
+        case "$prompt" in
+          *prose*)
+            echo '{"type":"system","subtype":"init","session_id":"prose"}'
+            echo '{"type":"assistant","message":{"content":[{"type":"text","text":"You are not logged in to the staging site, and the usage limit reached resets at 5pm."}]}}'
+            ;;
+          *)
+            echo '{"type":"system","subtype":"init","session_id":"error"}'
+            echo '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}'
+            ;;
+        esac
+        """.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        let store = makeStore()
+        let connector = ClaudeConnector(store: store, paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                        binary: { binary.path })
+        _ = try await connector.start(projectPath: directory.path, prompt: "prose please")
+        _ = try await connector.start(projectPath: directory.path, prompt: "fail please")
+        await assertEventually(timeout: 5) { await store.task(id: "claude:prose")?.status == .failed }
+        await assertEventually(timeout: 5) { await store.task(id: "claude:error")?.status == .failed }
+        let prose = try await requireTask(store, "prose")
+        XCTAssertNotNil(prose.lastMessage)
+        XCTAssertNil(prose.diagnosis)
+        let error = try await requireTask(store, "error")
+        XCTAssertEqual(error.diagnosis, .notSignedIn)
+        await connector.stop()
+    }
+
+    /// 在不存在的目录里新建：不起进程，直接报 projectMissing（旧手机看中文原话）。
+    func testStartInMissingDirectoryThrowsProjectMissing() async throws {
+        let store = makeStore()
+        let connector = makeConnector(store: store, binary: "/usr/bin/true")
+        let missing = FileManager.default.temporaryDirectory.appendingPathComponent("gone-\(UUID().uuidString)").path
+        do {
+            _ = try await connector.start(projectPath: missing, prompt: "hi")
+            XCTFail("目录不存在时应当报错")
+        } catch let error as ConnectorError {
+            XCTAssertEqual(error.diagnosis, .projectMissing)
+            XCTAssertEqual(error.message, "项目目录不存在：\(missing)")
+        }
     }
 
     // MARK: - 电脑上按停止

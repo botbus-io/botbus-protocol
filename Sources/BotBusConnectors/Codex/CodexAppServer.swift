@@ -1,5 +1,6 @@
 import Foundation
 import BotBusConnectorKit
+import BotBusProtocol
 #if canImport(os)
 import os
 #endif
@@ -129,6 +130,9 @@ public actor CodexAppServer {
     private var generation = 0
     private var live: Live?
     private var restartTask: Task<Void, Never>?
+    /// 协议 3.7：最近一次起子进程失败时错误带的原因（找不到 codex → `agentNotInstalled`），起成功就清掉。
+    /// 起不来时 `launchProcess` 只排重启，请求要到 `notRunning` 才失败，原因得挂在那上面才到得了手机。
+    private var launchFailureDiagnosis: FailureDiagnosis?
 
     private var nextRequestNumber: Int64 = 1
     private var inFlight: [CodexRequestID: PendingRequest] = [:]
@@ -228,7 +232,9 @@ public actor CodexAppServer {
         let handle: any CodexProcessHandle
         do {
             handle = try launcher.launch()
+            launchFailureDiagnosis = nil
         } catch {
+            launchFailureDiagnosis = (error as? any FailureDiagnosing)?.diagnosis
             Self.log.error("起 codex app-server 失败（第 \(mine, privacy: .public) 代）：\(String(describing: error), privacy: .public)")
             publish(.exited(CodexProcessExit(status: -1, reason: "无法启动 codex app-server"),
                             restartingIn: configuration.restartDelay))
@@ -324,7 +330,7 @@ public actor CodexAppServer {
     public func request(_ method: String, params: JSONValue? = nil,
                         timeout: TimeInterval? = nil) async throws -> JSONValue {
         try await waitForHandshake()
-        guard let live else { throw CodexAppServerError.notRunning() }
+        guard let live else { throw notRunning() }
         // 发过这条就等于本机在驱动这个线程：重启后要把它 resume 回来。
         if Self.threadControllingMethods.contains(method), let id = params?["threadId"]?.stringValue {
             markControlled(threadId: id)
@@ -341,7 +347,7 @@ public actor CodexAppServer {
     /// 发一条不需要应答的通知。
     public func notify(_ method: String, params: JSONValue? = nil) async throws {
         try await waitForHandshake()
-        guard let live else { throw CodexAppServerError.notRunning() }
+        guard let live else { throw notRunning() }
         try await send(.notification(method: method, params: params), live: live)
     }
 
@@ -360,7 +366,7 @@ public actor CodexAppServer {
         guard let request = serverRequests[key] else {
             throw CodexAppServerError(.unknownRequest, "没有挂起的 Codex 请求 \(key)")
         }
-        guard let live else { throw CodexAppServerError.notRunning() }
+        guard let live else { throw notRunning() }
         try await send(message(request.id), live: live)
         // 写成功才从表里摘：写失败时请求还挂着，上层可以重试。
         dropServerRequest(key)
@@ -430,8 +436,15 @@ public actor CodexAppServer {
 
     // MARK: - 请求对号
 
+    /// 没有活着的子进程：「还没就绪」，带上最近一次起不来的原因。
+    private func notRunning() -> CodexAppServerError {
+        var error = CodexAppServerError.notRunning()
+        error.diagnosis = launchFailureDiagnosis
+        return error
+    }
+
     private func waitForHandshake() async throws {
-        guard let handshake = live?.handshake else { throw CodexAppServerError.notRunning() }
+        guard let handshake = live?.handshake else { throw notRunning() }
         do {
             try await handshake.value
         } catch {
@@ -599,7 +612,7 @@ public actor CodexAppServer {
         switch notification {
         case .turnStarted(let threadId, _):
             touchThread(threadId) { $0.running = true }
-        case .turnCompleted(let threadId, let turnId, _, _):
+        case .turnCompleted(let threadId, let turnId, _, _, _):
             touchThread(threadId) { $0.running = false }
             // 轮次结束了，这一轮里还挂着的审批已经没人收，静默丢掉。
             discardServerRequests(threadId: threadId, turnId: turnId.isEmpty ? nil : turnId)

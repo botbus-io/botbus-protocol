@@ -124,6 +124,9 @@ public struct TaskRecord: Codable, Hashable, Sendable, Identifiable {
     /// 协议 3.3：这条会话所在的项目开了「自动批准」（同 `Project.autoApprove`）。只写 true，没开时整个键省略；
     /// 由 Agent 的 TaskStore 按 `projectPath` 附加，连接器与观察者不感知。
     public var autoApprove: Bool?
+    /// 协议 3.7：电脑对这次失败的诊断，只在 `status = failed` 时出现。连接器认出原因时带上，
+    /// 或由 Agent 的 TaskStore 在失败后探测工作目录得到（见 `DirectoryProbe`）。
+    public var diagnosis: FailureDiagnosis?
 
     /// 协议规定的单任务产物上限。
     public static let maxArtifacts = 10
@@ -134,7 +137,7 @@ public struct TaskRecord: Codable, Hashable, Sendable, Identifiable {
                 startedAt: String, updatedAt: String, artifacts: [Artifact]? = nil, outsideProject: Bool? = nil,
                 worktreePath: String? = nil, systemPermission: SystemPermissionNotice? = nil,
                 connectorId: String? = nil, model: String? = nil, effort: String? = nil,
-                autoApprove: Bool? = nil) {
+                autoApprove: Bool? = nil, diagnosis: FailureDiagnosis? = nil) {
         self.id = id
         self.agentId = agentId
         self.source = source
@@ -156,6 +159,7 @@ public struct TaskRecord: Codable, Hashable, Sendable, Identifiable {
         self.model = model
         self.effort = effort
         self.autoApprove = autoApprove
+        self.diagnosis = diagnosis
     }
 
     /// 会话实际的工作目录：在 worktree 里时是 worktree，否则就是项目路径。
@@ -169,7 +173,7 @@ public struct TaskRecord: Codable, Hashable, Sendable, Identifiable {
     private enum CodingKeys: String, CodingKey {
         case id, agentId, source, title, projectPath, projectName, status, lastMessage, pendingRequest, origin
         case controllable, startedAt, updatedAt, artifacts, outsideProject, worktreePath, systemPermission, connectorId
-        case model, effort, autoApprove
+        case model, effort, autoApprove, diagnosis
     }
 
     /// 字段照旧由合成的编码写出（nil 整键省略）；解码多一道校验：`connectorId` 只跟 `source = acp` 一起出现。
@@ -196,6 +200,7 @@ public struct TaskRecord: Codable, Hashable, Sendable, Identifiable {
         model = try container.decodeIfPresent(String.self, forKey: .model)
         effort = try container.decodeIfPresent(String.self, forKey: .effort)
         autoApprove = try container.decodeIfPresent(Bool.self, forKey: .autoApprove)
+        diagnosis = try container.decodeIfPresent(FailureDiagnosis.self, forKey: .diagnosis)
         if let model, !ModelOption.isValidId(model) {
             throw DecodingError.dataCorruptedError(forKey: .model, in: container, debugDescription: "invalid model id")
         }

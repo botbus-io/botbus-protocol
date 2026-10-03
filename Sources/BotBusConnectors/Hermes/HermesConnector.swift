@@ -51,6 +51,7 @@ public actor HermesConnector: TaskConnector {
     private let paths: @Sendable () -> HermesPaths
     private let binary: @Sendable () -> String?
     private let launcher: any HermesProcessLauncher
+    private let directoryProbe: DirectoryProbe
     private let now: @Sendable () -> Date
     private let tools: @Sendable () -> AgentToolsConfiguration?
     private let registry: TaskContextRegistry
@@ -76,6 +77,7 @@ public actor HermesConnector: TaskConnector {
                 paths: @escaping @Sendable () -> HermesPaths = { HermesPaths() },
                 binary: @escaping @Sendable () -> String? = { HermesPaths.detectHermesBinary() },
                 launcher: any HermesProcessLauncher = HermesSubprocessLauncher(),
+                directoryProbe: DirectoryProbe = .live(),
                 now: @escaping @Sendable () -> Date = { Date() },
                 tools: @escaping @Sendable () -> AgentToolsConfiguration? = { nil },
                 registry: TaskContextRegistry = TaskContextRegistry(),
@@ -84,6 +86,7 @@ public actor HermesConnector: TaskConnector {
         self.paths = paths
         self.binary = binary
         self.launcher = launcher
+        self.directoryProbe = directoryProbe
         self.now = now
         self.tools = tools
         self.registry = registry
@@ -302,10 +305,11 @@ public actor HermesConnector: TaskConnector {
     /// 起一个 `hermes chat -q …` 并**只等到 session id 出现就返回**；剩下的输出在后台接着读，用来把任务推进到结束。
     private func run(runID: UUID, arguments: [String], workingDirectory: String,
                      injection: AgentToolsInjection?) async throws -> (String, any HermesRunningProcess) {
-        guard let executable = binary() else { throw ConnectorError("本机没找到 hermes 可执行文件") }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: workingDirectory, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw ConnectorError("项目目录不存在：\(workingDirectory)")
+        guard let executable = binary() else {
+            throw ConnectorError("本机没找到 hermes 可执行文件", diagnosis: .agentNotInstalled)
+        }
+        if let diagnosis = await directoryProbe.diagnose(workingDirectory) {
+            throw ConnectorError.directory(diagnosis, path: workingDirectory)
         }
 
         let request = HermesLaunchRequest(

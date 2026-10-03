@@ -31,6 +31,8 @@ import BotBusConnectorKit
 /// 升级可能要跟着改：连不上就退回扫盘，不会弄坏 dsh。
 public actor DshConnector: TaskConnector {
     public nonisolated var kind: ConnectorKind { .dsh }
+    /// 网页端开着时会话跑在 DeepSeek Harness 自己的进程里，BotBus 的文件夹授权说明不了它。
+    public nonisolated var runsUnderBotBus: Bool { false }
 
     /// 运行期健康（web 拒绝登录、ACP 进程起不来之类）：app 转给 `ConnectorRegistry.reportRuntime` 并重发快照。
     public typealias HealthHandler = @Sendable (ConnectorInfo.Status, String?) async -> Void
@@ -288,7 +290,7 @@ public actor DshConnector: TaskConnector {
     public func start(projectPath: String, prompt: String, images: [URL]) async throws -> ConnectorOutcome {
         guard images.isEmpty else { throw ConnectorError("这个 Agent 暂不支持发图") }
         guard await syncAcpSpec() else {
-            throw ConnectorError("本机没找到 DeepSeek Harness 的可执行文件（dsh），没法从手机新建任务")
+            throw ConnectorError("本机没找到 DeepSeek Harness 的可执行文件（dsh），没法从手机新建任务", diagnosis: .agentNotInstalled)
         }
         // 桌面工作区以 realpath 存目录，adopt 严格比较 session header 的 cwd；两端必须使用同一写法。
         let cwd = TranscriptFileRefs.realPath(projectPath) ?? projectPath

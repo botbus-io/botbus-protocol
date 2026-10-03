@@ -85,7 +85,10 @@ public actor ClaudeConnector: TaskConnector {
         var projectPath: String
         var title: String
         var titleSource: TitleSource
-        var status: TaskStatus
+        var status: TaskStatus {
+            // 失败原因只属于这一次 failed：新一轮开始、正常收尾、中断都撤掉。
+            didSet { if status != .failed { failureDiagnosis = nil } }
+        }
         var origin: TaskOrigin
         var lastMessage: String?
         var pendingRequest: PendingRequest?
@@ -100,6 +103,9 @@ public actor ClaudeConnector: TaskConnector {
         /// 协议 3.2：手机选过的模型与思考强度。之后每次 `--resume` 都带上——`claude -p` 不记得上一轮的 `--model`。
         var chosenModel: String?
         var chosenEffort: String?
+        /// 协议 3.7：这一次 failed 的原因，在失败处由错误原文得出（StopFailure 的类别与详情、报错的 `result` 行、
+        /// 起不了进程的错误），不由 `lastMessage` 推——那可能是 agent 自己说的最后一段话。
+        var failureDiagnosis: FailureDiagnosis?
 
         /// 一轮正跑着：没有 hook 能保证把它收尾（中断不发 Stop），得盯着。
         var isMidTurn: Bool { status == .running || status == .waitingApproval }
@@ -108,6 +114,7 @@ public actor ClaudeConnector: TaskConnector {
     private let store: TaskStore
     private let paths: ClaudePaths
     private let binary: @Sendable () -> String?
+    private let directoryProbe: DirectoryProbe
     /// 本机 `claude --help` 认的强度；nil = CLI 不可用，不报 models。
     private var supportedEfforts: [String]?
     /// `supportedEfforts` 是哪一份 claude 报的（软链接解析到底的路径）。挑中的那份换了（升级、桌面 app
@@ -225,12 +232,14 @@ public actor ClaudeConnector: TaskConnector {
                 now: @escaping @Sendable () -> Date = { Date() },
                 tools: @escaping @Sendable () -> AgentToolsConfiguration? = { nil },
                 registry: TaskContextRegistry = TaskContextRegistry(),
+                directoryProbe: DirectoryProbe = .live(),
                 titleRetryDelays: [TimeInterval]? = nil,
                 turnEndCheckInterval: TimeInterval? = nil,
                 approvalTimeout: TimeInterval? = nil) {
         self.store = store
         self.paths = paths
         self.binary = binary
+        self.directoryProbe = directoryProbe
         let executable = binary()
         self.supportedEfforts = ClaudeModels.efforts(forBinary: executable)
         self.effortsBinary = executable.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
@@ -344,11 +353,16 @@ public actor ClaudeConnector: TaskConnector {
             }
         case .stopFailure:
             apply(event) { session, event in
+                // failed 再 failed 时 `status` 的 didSet 不撤原因；先记下是不是已经 failed，下面才分得清「留着」与「本来就没有」。
+                let wasFailed = session.status == .failed
                 session.status = .failed
                 session.pendingRequest = nil
                 if let text = (event.lastAssistantMessage ?? event.errorDetails ?? event.error)?.trimmed, !text.isEmpty {
                     session.lastMessage = String(text.prefix(Self.lastMessageLimit))
                 }
+                // 迟到的 StopFailure 类别认不出（`unknown`、`server_error`）时，不能抹掉 `finish` 已从报错原文认出的原因。
+                session.failureDiagnosis = ClaudeFailure.diagnosis(category: event.error, details: event.errorDetails)
+                    ?? (wasFailed ? session.failureDiagnosis : nil)
             }
         case .sessionEnd:
             return await endSession(event)
@@ -731,6 +745,9 @@ public actor ClaudeConnector: TaskConnector {
     /// 测试用：盯收尾标记的循环还在不在。
     var isCheckingTurnEndings: Bool { turnEndCheck != nil }
 
+    /// 测试用：连接器自己记的失败原因。`TaskStore` 另存了一份（failed 不带原因时不动它），从 store 看不出这里有没有被抹掉。
+    func failureDiagnosis(for sessionID: String) -> FailureDiagnosis? { sessions[sessionID]?.failureDiagnosis }
+
     // MARK: - 跟 app 起的标题
 
     /// 去 transcript 末尾取 Claude 起的标题。hook 路径上不碰文件：读取挪到后台，读到了再回 actor 改。
@@ -863,7 +880,8 @@ public actor ClaudeConnector: TaskConnector {
                    startedAt: session.startedAt,
                    updatedAt: session.updatedAt,
                    model: session.chosenModel ?? session.model,
-                   effort: session.chosenEffort)
+                   effort: session.chosenEffort,
+                   diagnosis: session.status == .failed ? session.failureDiagnosis : nil)
     }
 
     /// 见过的项目，按最近使用降序。`~/.claude/projects` 的目录名是把路径里的 `/` 换成 `-` 得到的，
@@ -955,7 +973,9 @@ public actor ClaudeConnector: TaskConnector {
             if !text.isEmpty, let asked = questionHolds[requestID]?.asked,
                await answerQuestion(requestID, sessionID: sessionID,
                                         with: .allow(updatedInput: asked.answeredInput(asked.claudeAnswers(text: text)))) {
-                return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
+                // 电脑上会话的提问经 hook 回给终端里的进程：这一轮不是 BotBus 起的（协议 3.7，失败不探测目录）。
+                return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true,
+                                        runsUnderBotBus: isOwnTurn(sessionID))
             }
         }
         let input = try Self.stdinMessage(prompt: prompt, images: images)
@@ -1011,6 +1031,9 @@ public actor ClaudeConnector: TaskConnector {
                 session, _ in if !earlyCard { session.status = .running }
             }
         }
+        // 先把「开始跑了」推给 store，再 await 绑 token：进程若立刻失败，`finish` 会趁这个空当发布 failed，
+        // store 就没见过 running——`turnEndCount` 不涨，「BotBus 起的这一轮」的标记漏给下一轮。
+        await publish()
         if let injection { await registry.bind(injection.token, taskId: self.taskId(for: newID)) }
         return newID
     }
@@ -1239,11 +1262,10 @@ public actor ClaudeConnector: TaskConnector {
     private func run(arguments: [String], workingDirectory: String,
                      environment extra: [String: String] = [:], stdin: Data) async throws -> String {
         guard let executable = binary() else {
-            throw ConnectorError("本机没找到 claude 可执行文件")
+            throw ConnectorError("本机没找到 claude 可执行文件", diagnosis: .agentNotInstalled)
         }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: workingDirectory, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw ConnectorError("项目目录不存在：\(workingDirectory)")
+        if let diagnosis = await directoryProbe.diagnose(workingDirectory) {
+            throw ConnectorError.directory(diagnosis, path: workingDirectory)
         }
 
         let process = Process()
@@ -1334,7 +1356,13 @@ public actor ClaudeConnector: TaskConnector {
                                         cwd: sessions[sessionID]?.projectPath ?? "")) { session, _ in
             // 已经被 interrupt 标过的不要被"进程退出"改回 completed。
             // 后面还排着续聊：保持 running，不在两轮之间推一条"任务完成"。
-            if session.status != .interrupted, next == nil { session.status = result.failed ? .failed : .completed }
+            if session.status != .interrupted, next == nil {
+                session.status = result.failed ? .failed : .completed
+                // 只认报错的 result 行的原文；没认出时留着 StopFailure hook 先给的原因（那一轮的 hook 可能先到）。
+                if result.failed, let diagnosis = ClaudeFailure.diagnosis(result.errorText) {
+                    session.failureDiagnosis = diagnosis
+                }
+            }
             session.pendingRequest = nil
             if let text = result.lastText?.trimmed, !text.isEmpty {
                 session.lastMessage = String(text.prefix(Self.lastMessageLimit))
@@ -1351,6 +1379,7 @@ public actor ClaudeConnector: TaskConnector {
                                                 cwd: sessions[sessionID]?.projectPath ?? "")) { session, _ in
                     session.status = .failed
                     session.lastMessage = String(error.localizedDescription.prefix(Self.lastMessageLimit))
+                    session.failureDiagnosis = (error as? any FailureDiagnosing)?.diagnosis
                 }
             }
         }
