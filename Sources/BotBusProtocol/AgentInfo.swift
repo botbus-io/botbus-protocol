@@ -109,10 +109,12 @@ public struct ConnectorInfo: Codable, Hashable, Sendable, Identifiable {
     public var models: [ModelOption]?
     /// 协议 3.3：能不能给项目开「自动批准」（手机发起的轮次里审批不再逐条问）。只写 true，不能时整个键省略。
     public var canAutoApprove: Bool?
+    /// 协议 3.8：明确支持永久删除原生会话。省略 = 不支持。
+    public var canDeleteTasks: Bool?
 
     public init(kind: ConnectorKind, connectorId: String? = nil, displayName: String, available: Bool, enabled: Bool,
                 status: Status, taskCount: Int, lastError: String? = nil, canStartTask: Bool? = nil,
-                models: [ModelOption]? = nil, canAutoApprove: Bool? = nil) {
+                models: [ModelOption]? = nil, canAutoApprove: Bool? = nil, canDeleteTasks: Bool? = nil) {
         self.kind = kind
         self.connectorId = connectorId
         self.displayName = displayName
@@ -124,11 +126,12 @@ public struct ConnectorInfo: Codable, Hashable, Sendable, Identifiable {
         self.canStartTask = canStartTask
         self.models = models
         self.canAutoApprove = canAutoApprove
+        self.canDeleteTasks = canDeleteTasks
     }
 
     private enum CodingKeys: String, CodingKey {
         case kind, connectorId, displayName, available, enabled, status, taskCount, lastError, canStartTask, models
-        case canAutoApprove
+        case canAutoApprove, canDeleteTasks
     }
 
     public init(from decoder: Decoder) throws {
@@ -144,6 +147,7 @@ public struct ConnectorInfo: Codable, Hashable, Sendable, Identifiable {
         canStartTask = try container.decodeIfPresent(Bool.self, forKey: .canStartTask)
         models = try container.decodeIfPresent([ModelOption].self, forKey: .models)
         canAutoApprove = try container.decodeIfPresent(Bool.self, forKey: .canAutoApprove)
+        canDeleteTasks = try container.decodeIfPresent(Bool.self, forKey: .canDeleteTasks)
 
         if let models {
             guard !models.isEmpty, models.count <= ModelOption.maxModels,
@@ -289,10 +293,12 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
     /// 协议 3.7：这台电脑提供「操作电脑」的工作区服务（文件，之后是终端），`remoteControl` 命令在没有屏幕的宿主上也能用。
     /// 只写 true，nil = 没有。不放进 `HostCapabilities`：那里「省略 = 支持」，什么都不报的旧电脑会被当成有。
     public var workspace: Bool?
+    /// 协议 3.8：支持移出 BotBus 项目列表，省略 = 不支持。
+    public var canRemoveProjects: Bool?
 
     public init(agentId: String, name: String, platform: AgentPlatform = .macos, online: Bool,
                 lastSeenAt: String, appVersion: String, connectors: [ConnectorInfo], projectsRoot: String? = nil,
-                worktrees: Bool? = nil, capabilities: HostCapabilities? = nil, workspace: Bool? = nil) {
+                worktrees: Bool? = nil, capabilities: HostCapabilities? = nil, workspace: Bool? = nil, canRemoveProjects: Bool? = nil) {
         self.agentId = agentId
         self.name = name
         self.platform = platform
@@ -304,11 +310,12 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         self.worktrees = worktrees
         self.capabilities = capabilities
         self.workspace = workspace
+        self.canRemoveProjects = canRemoveProjects
     }
 
     private enum CodingKeys: String, CodingKey {
         case agentId, name, platform, online, lastSeenAt, appVersion, connectors, projectsRoot, worktrees, capabilities
-        case workspace
+        case workspace, canRemoveProjects
     }
 
     /// 校验集中在这里：Connector 最多 16 个且按 (kind, connectorId) 去重。数量下限没有——空数组合法。
@@ -325,6 +332,7 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         worktrees = try container.decodeIfPresent(Bool.self, forKey: .worktrees)
         capabilities = try container.decodeIfPresent(HostCapabilities.self, forKey: .capabilities)
         workspace = try container.decodeIfPresent(Bool.self, forKey: .workspace)
+        canRemoveProjects = try container.decodeIfPresent(Bool.self, forKey: .canRemoveProjects)
 
         guard connectors.count <= Self.maxConnectors else {
             throw DecodingError.dataCorruptedError(

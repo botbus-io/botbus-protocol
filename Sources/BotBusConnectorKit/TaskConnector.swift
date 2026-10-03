@@ -113,11 +113,17 @@ public protocol TaskConnector: Sendable {
 
     /// 协议 3.4：会话被手机「合并并结束」后，给后端一个收尾的机会（Codex 归档线程）。尽力而为，不抛；
     /// 会话本身已经由 `TaskStore.hide` 从列表里拿掉了。默认什么都不做（Claude 的 transcript 留在磁盘上）。
+    func deleteTask(taskId: String) async throws
+
     func discard(taskId: String) async
 }
 
 public extension TaskConnector {
     var runsUnderBotBus: Bool { true }
+
+    public func deleteTask(taskId: String) async throws {
+        throw ConnectorError("这个 Agent 不支持删除电脑端会话")
+    }
 
     /// 不带图的旧签名：多数调用方（与测试）只发文字，不必每处都写 `images: []`。
     public func start(projectPath: String, prompt: String) async throws -> ConnectorOutcome {

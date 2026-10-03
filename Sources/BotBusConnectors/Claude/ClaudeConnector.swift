@@ -1145,9 +1145,19 @@ public actor ClaudeConnector: TaskConnector {
         return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
     }
 
-    /// 协议 3.4：手机合并并结束了这个会话（`TaskStore.hide` 已经把它藏起来）。transcript 留在磁盘上不动，
-    /// 这里只让连接器忘掉它：挂着的审批放掉、排队的续聊作废，并像被分支取代的旧会话一样记进 `superseded`——
-    /// 之后桌面 hook 再来既不重建它，也不挂起审批（手机上看不到，挂着只会让 Claude Code 干等 120 秒）。
+    /// 协议 3.8：删除原生 transcript 后交还内存状态，不触碰项目文件。
+    public func deleteTask(taskId: String) async throws {
+        let id = try nativeTaskId(taskId, kind: .claude)
+        guard UUID(uuidString: id) != nil else { throw ConnectorError("会话 id 不合法") }
+        guard !isOwnTurn(id), sessions[id]?.isMidTurn != true else {
+            throw ConnectorError("会话还在进行中，等它停下来再删除")
+        }
+        try ClaudeMessageReader.deleteTranscript(sessionID: id, in: paths.projectsDirectory)
+        await discard(taskId: taskId)
+    }
+
+    /// 协议 3.4：合并并结束后只忘掉会话，transcript 留在磁盘上。
+    /// 也用于删除后的清理：审批放掉、排队续聊作废，后续桌面 hook 不重建或挂起审批。
     public func discard(taskId: String) async {
         guard let sessionID = try? nativeID(taskId) else { return }
         queued.removeValue(forKey: sessionID)

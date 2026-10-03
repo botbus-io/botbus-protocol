@@ -1,6 +1,6 @@
 # BotBus 协议
 
-版本 **3.7**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
+版本 **3.8**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
 
 Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，Kotlin 实现（Android）是 `Protocol.kt`，密封层在同目录的 `Sealing.kt` / `SealedTypes.kt`。在 app 仓库里它们分别位于 `Packages/BotBusProtocol`、`relay/src/protocol.ts` 与 `android/core/src/main/kotlin/io/botbus/core/`；公开仓库 `botbus-io/botbus-protocol` 由 app 仓库自动同步，前两者在那里是 `Sources/BotBusProtocol` 与 `src/protocol.ts`。三端都必须通过 `protocol-fixtures/` 下全部样本的往返测试，且拒绝 `invalid/` 下的样本：顶层是线上的密封形状，`plain/` 是密文里的明文结构（见文末「Fixture 与类型对应」）。Swift 中 `Task` 命名为 `TaskRecord`。
 
@@ -202,7 +202,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 
 ## 一、电脑与连接器
 
-手机据此画电脑列表、连接器开关、模型选择器和项目分组。3.5 起电脑这一端（宿主）的差异写在 `AgentInfo.capabilities` 里（见下「HostCapabilities」）；连接器之间发图、中断这类差异仍按连接器的 `kind` 决定，连接器一级还没有能力字段。
+手机据此画电脑列表、连接器开关、模型选择器和项目分组。3.5 起电脑这一端（宿主）的差异写在 `AgentInfo.capabilities` 里（见下「HostCapabilities」）；连接器之间发图、中断这类差异仍按连接器的 `kind` 决定，删除会话、自动批准等能力由 ConnectorInfo 的可选字段声明。
 
 ### AgentInfo
 
@@ -219,6 +219,8 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 | worktrees | true? | 3.4 起。电脑能从手机开 worktree 会话（`startTask.worktree`）、能 `mergeWorktree`；只写 true，不能时省略 |
 | capabilities | HostCapabilities? | 3.5 起。宿主能力；省略 = 全部支持（现在的 Mac 不报） |
 | workspace | true? | 3.7 起。电脑提供「操作电脑」的工作区服务（文件，之后是终端；见「工作区（3.7）」），没有屏幕的宿主也接受 `remoteControl`；只写 true，没有时省略。目前只有 Mac 报。不放进 `HostCapabilities`：那里省略 = 支持，什么都不报的旧电脑会被误判成有工作区 |
+
+3.8 起 `AgentInfo.canRemoveProjects: boolean?` 声明能移出 **BotBus 电脑端项目列表**。只有 `true` 才支持；省略或 `false` 都不支持，手机不向旧电脑发 `removeProject`。
 
 ### HostCapabilities
 
@@ -245,6 +247,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 | lastError | string? | 截断 200 字 |
 | models | [ModelOption]? | 3.2 起。手机续聊时能换的模型，电脑排好序（默认的在前），1–24 个、按 `id` 不重复；省略 = 不能从手机换模型，手机不画入口。Codex 取 app-server 的 `model/list`（去掉 hidden，每代子进程握手完问一次），Claude Code 报 `--model` 认的别名 `fable` / `opus` / `sonnet` / `haiku`，强度从本机 `claude --help` 读取（Haiku 不报强度；CLI 不可用或未列出强度时省略 models），`displayName` 带别名当前指向的版本（「Opus 5.5」：取 transcript 里见过的完整模型名，只往高处抬；没见过的只显示系列名）；其余 agent 省略 |
 | canAutoApprove | boolean? | 3.3 起。**只写 `true`**：这个 agent 支持项目级自动批准（见「项目级自动批准」），不支持时整个键省略。目前 Codex 与 Claude Code 报；手机只对报了的 agent 画「审批」开关 |
+| canDeleteTasks | boolean? | 3.8 起。只有 `true` 才支持永久删除原生会话记录；省略或 `false` = 不支持。当前 Codex 与 Claude Code 报，旧原生程序不支持删除 API 时命令仍可回失败，手机保留会话并显示原因 |
 | canStartTask | boolean? | 2.13 起。**只写 `false`**：这个 agent 不能从手机新建任务（ACP agent 没有启动命令、反向连接也没声明 `newSession`；3.1 起一档的 `dsh` 在电脑上找不到可执行文件、只看得见会话时也写）；能新建时整个键省略（不写 `true`）。手机的新建任务选择器不列 `false` 的 agent |
 
 ModelOption（3.2）：`id` string（原样回到 `followUp.model`，会成为 agent 命令行的参数值，所以限定 1–64 个 `[A-Za-z0-9._:/-]` 且不以 `-` 开头），`displayName` string（截断 40 字），`efforts` [string]?（能选的强度，从低到高，1–8 个不重复；每个 1–16 个 `[a-z0-9-]`、不以 `-` 开头；省略 = 这个模型不能调强度），`defaultEffort` string?（不指定时 agent 用哪一档，必须是 `efforts` 里的一个）。强度是 agent 自己的词，协议不定闭集：目前见到的是 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`，客户端认得的翻成本地文案，不认得的原样显示。
@@ -254,6 +257,17 @@ ModelOption（3.2）：`id` string（原样回到 `followUp.model`，会成为 a
 ### Project
 
 Project：`agentId`、`path`、`name`、`lastUsedAt` string，`pinned` boolean，`autoApprove` boolean?（3.3 起，**只写 `true`**：这个项目开了自动批准，见「项目级自动批准」；没开时整个键省略）。`agentId` 指明该项目路径所属的电脑——项目路径只在其所属电脑上有意义。`projects` 按 `lastUsedAt` 降序排列后再截断，使被丢弃的总是最久未用的；同值时按 `agentId`、`path` 次序稳定排序。
+
+### 列表删除与命令：removeProject、deleteTask（3.8）
+
+手机列表支持「最近会话」（按 `updatedAt` 降序，同秒按全局任务身份稳定排序）和「按项目」。默认的「删除」**只移出当前手机列表**，不发命令：按配对组持久保存 `(agentId, taskId)` 或 `(agentId, path)` 及删除时的活动基线。相同/旧快照、重连、历史回补不恢复；收到更晚的 `updatedAt`，或同一秒内不同的最后消息，会话恢复。项目包含全部连接器的会话；某条已知会话有新活动或新增会话不早于基线时，整个项目恢复。项目的旧会话记录仍在电脑；列表删除不停止正在运行的任务。
+
+勾选同步选项才发下列命令（载荷在密文内，AAD 与密封命令形状不变）：
+
+- `removeProject`：`projectPath` string。只从 BotBus 电脑端列表移出项目及全部来源会话，**不修改原生 Agent 的项目设置，不删除目录、源码、git worktree、会话记录或产物**。电脑保存活动基线并发全量快照；实时任务的所有权不变。有新会话/新活动时重新显示。电脑检查项目确实已知（含只由任务派生的项目），重复移出已隐藏项目回成功。
+- `deleteTask`：`taskId` string。只对报了 `canDeleteTasks` 且已停止的会话发送。电脑拒绝 `running` / `waitingApproval` / `waitingInput`、在途写命令与合并；预约删除期间不接该会话的续聊/审批/中断。Codex 使用 app-server `thread/delete`，不写数据库；上游同时删除派生子会话，确认文案须说明。Claude Code 只删除其数据目录内该 UUID 会话的顶层 `.jsonl` transcript（与 Agent SDK `delete_session` 的范围一致），拒绝软链接越界与路径注入。均不删除项目文件与源码。原生端确认后才永久隐藏该任务，避免旧观察快照把它补回来。
+
+HTTP 202 只表示 Relay 收到。手机等待 `CommandResult.ok == true` 才移出列表；失败保留项目/会话并显示原因，未确认/可重试网络失败沿用原 `command.id` / `createdAt`。确认选项默认不勾选；电脑离线、能力缺失、会话进行中时禁用并说明。非同步删除提供撤销，只恢复本次记录，不能撤销后来另一次删除。
 
 ### 命令：setConnectorEnabled
 
@@ -670,6 +684,8 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - 版本 3.7 加入**失败诊断** `Task.diagnosis` / `CommandResult.diagnosis`（`FailureDiagnosis`）：电脑认出常见失败原因（文件夹被拒、没装 agent、没登录 / 登录失效、额度用完、项目目录不在了），手机据此写操作步骤；旧端忽略即可，Relay 只改版本号，三条线都不动。
 - 版本 3.7 同时加入**「操作电脑」的工作区**（见「工作区（3.7）」）：`AgentInfo.workspace`；`remoteControl` 回的预览里多了 `/fs/*`（浏览、读写、上传文件），没有屏幕的宿主也能开；请求可带通道号 `c`，防重放改成按通道记窗口并另有全局下限，回复钉在请求上。都在密文里、走既有的预览隧道：Relay 只改版本号，两条最低线不动；旧手机照常只用屏幕，3.6 的 Mac 不报 `workspace`，新手机连它只有屏幕那一段。
 
+- 版本 3.8 加入 `deleteTask` / `removeProject` 命令、`ConnectorInfo.canDeleteTasks` / `AgentInfo.canRemoveProjects` 能力声明，以及两种手机列表视图和本地删除基线。新命令只发给声明支持的电脑；旧端忽略能力字段，Relay 继续只处理密封形状。当前版本升到 3.8，三条最低线不动。
+
 ## 附录 B：Fixture 与类型对应
 
 3.0 起样本分两层：`protocol-fixtures/` 顶层是**线上形状**（密封信封，由 `scripts/seal-fixtures.mjs` 从 `plain/` 生成，改了明文样本就重跑它），`plain/` 是密文里的**明文结构**。下表按明文结构列出；同名文件在顶层的密封版分别是 SealedSnapshot / SealedTask / SealedCommand / SealedEvent / AgentFrame / RelayFrame / ClientFrame（`plain/frame-*.json` 是明文帧，只作对照）。只有明文形状、不单独上线的（agent-info、connector-info、artifact、working-changes）只在 `plain/` 里。配对与 Relay 自己的 HTTP 消息只在顶层：`key-envelope.json`（KeyEnvelope）、`frame-relay-hello-with-key.json`（带信封的 hello）、`relay-pair-claim-request.json`（注册码认领，带信封与手机名密文）、`relay-pair-claim-request-invite.json`（邀请码认领，不带信封）、`relay-pair-clients-response.json`（手机名为密文，含一条 v2 时代无名记录）、`relay-device-registration*.json` 与 `relay-agent-devices-response.json`（设备名为密文）。`invalid/` 下是线上形状的反例，`plain/invalid/` 下是明文结构的反例。
@@ -779,5 +795,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | invalid/command-start-task-worktree-outside-project.json | 必须被拒绝：`projectPath` 为空串（不在项目中）却带 `worktree` |
 | invalid/agent-info-worktrees-false.json | 必须被拒绝：`worktrees` 只写 true，不能写 false |
 | invalid/agent-info-workspace-false.json | 必须被拒绝：`workspace` 只写 true，不能写 false |
+
+3.8 样本（`plain/` 内）：`command-delete-task.json` / `command-remove-project.json` → Command；`agent-info-list-management.json` → AgentInfo；`invalid/command-delete-task-missing-payload.json` / `invalid/command-remove-project-missing-payload.json` → 必须拒绝（kind 同名载荷缺失）。两条 Command 的根目录密封版由 `scripts/seal-fixtures.mjs` 生成，三端解密与重封核对。
 
 `protocol-fixtures/workspace/` 是工作区（3.7）的样本，Relay 不读：明文的 `WorkspaceStatus`（`status-mac.json`、`status-linux.json`、3.6 Mac 的 `status-legacy.json`）、`WorkspaceListing`（`listing.json`）、失败外形（`failure-conflict.json`，以及带不认得的 code 的 `failure-unknown-code.json`）、请求明文（`request-write.json`），以及由 `node scripts/seal-fixtures.mjs` 生成的 `sealed.json`（固定钥匙与确定性 nonce 封的请求、钉在请求上的回复、3 个包的 `/fs/read` 流，不要手改）。Swift 的 `WorkspaceWireTests` 逐字节核对它们；`android/core` 要在手机端实现时补上对应的测试（目前只有 Swift 一边核对）。

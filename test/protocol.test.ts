@@ -58,6 +58,8 @@ const SCHEMA: Record<string, ZodType> = {
   "command-start-task-worktree.json": P.SealedCommand,
   "command-start-task-worktree-auto-approve.json": P.SealedCommand,
   "command-merge-worktree.json": P.SealedCommand,
+  "command-delete-task.json": P.SealedCommand,
+  "command-remove-project.json": P.SealedCommand,
   "event-command-result-changes.json": P.SealedEvent,
   "event-command-result-system-permission.json": P.SealedEvent,
   "event-command-result-diagnosis.json": P.SealedEvent,
@@ -128,6 +130,7 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "agent-info-models.json": P.AgentInfo,
   "agent-info-worktrees.json": P.AgentInfo,
   "agent-info-workspace.json": P.AgentInfo,
+  "agent-info-list-management.json": P.AgentInfo,
   "agent-info-linux.json": P.AgentInfo,
   "agent-info-other-platform.json": P.AgentInfo,
   "connector-info-unavailable.json": P.ConnectorInfo,
@@ -174,6 +177,8 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "command-start-task-worktree.json": P.Command,
   "command-start-task-worktree-auto-approve.json": P.Command,
   "command-merge-worktree.json": P.Command,
+  "command-delete-task.json": P.Command,
+  "command-remove-project.json": P.Command,
   "event-snapshot.json": P.Event,
   "event-task-updated.json": P.Event,
   "event-task-removed.json": P.Event,
@@ -216,6 +221,8 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
   "command-start-task-worktree-outside-project.json": P.Command,
   "agent-info-worktrees-false.json": P.AgentInfo,
   "agent-info-workspace-false.json": P.AgentInfo,
+  "command-delete-task-missing-payload.json": P.Command,
+  "command-remove-project-missing-payload.json": P.Command,
   "connector-info-effort-not-listed.json": P.ConnectorInfo,
   "event-system-permission-missing-dialog-text.json": P.Event,
   "pending-question-missing-options.json": P.Task,
@@ -227,15 +234,15 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
 describe("fixture 目录与对照表一一对应", () => {
   it("每个 valid fixture 都在 SCHEMA / PLAIN_SCHEMA 表里，且表里没有已删除的文件", () => {
     expect([...validFixtures.keys()].sort()).toEqual(Object.keys(SCHEMA).sort());
-    expect(validFixtures.size).toBe(79);
+    expect(validFixtures.size).toBe(81);
     expect([...plainFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_SCHEMA).sort());
-    expect(plainFixtures.size).toBe(69);
+    expect(plainFixtures.size).toBe(72);
   });
   it("每个 invalid fixture 都在 MUST_REJECT / PLAIN_MUST_REJECT 表里", () => {
     expect([...invalidFixtures.keys()].sort()).toEqual(Object.keys(MUST_REJECT).sort());
     expect(invalidFixtures.size).toBe(4);
     expect([...plainInvalidFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_MUST_REJECT).sort());
-    expect(plainInvalidFixtures.size).toBe(19);
+    expect(plainInvalidFixtures.size).toBe(21);
   });
 });
 

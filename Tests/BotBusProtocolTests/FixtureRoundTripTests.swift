@@ -107,6 +107,8 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(Command.self, "plain/command-start-task-worktree.json"),
         roundTripCase(Command.self, "plain/command-start-task-worktree-auto-approve.json"),
         roundTripCase(Command.self, "plain/command-merge-worktree.json"),
+        roundTripCase(Command.self, "plain/command-delete-task.json"),
+        roundTripCase(Command.self, "plain/command-remove-project.json"),
     ] }
 
     private static var eventCases: [FixtureCase] { [
@@ -147,6 +149,7 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(AgentInfo.self, "plain/agent-info-linux.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-other-platform.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-workspace.json"),
+        roundTripCase(AgentInfo.self, "plain/agent-info-list-management.json"),
     ] }
 
     private static var relayCases: [FixtureCase] { [
@@ -194,6 +197,8 @@ final class FixtureRoundTripTests: XCTestCase {
         "plain/invalid/command-start-task-worktree-outside-project.json",
         "plain/invalid/agent-info-worktrees-false.json",
         "plain/invalid/agent-info-workspace-false.json",
+        "plain/invalid/command-delete-task-missing-payload.json",
+        "plain/invalid/command-remove-project-missing-payload.json",
     ]
 
     // MARK: - 往返

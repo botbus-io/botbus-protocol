@@ -46,7 +46,7 @@ struct CodexBridgeRouter {
         "thread/start", "thread/resume", "thread/read", "thread/loaded/list",
         "turn/start", "turn/steer", "turn/interrupt",
         // 协议 3.4：手机「合并并结束」后归档线程（`CodexConnector.discard`）。
-        "thread/archive",
+        "thread/archive", "thread/delete",
     ]
     private static let requestLimit = 1024
     private static let serverRequestLimit = 128

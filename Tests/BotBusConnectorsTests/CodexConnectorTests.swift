@@ -447,6 +447,16 @@ final class CodexConnectorTests: XCTestCase {
 
     // MARK: 合并并结束（协议 3.4）
 
+    func testDeleteUsesUpstreamDeleteWithoutArchivingOrWritingDatabase() async throws {
+        let rig = await makeRig()
+        rig.responder.on("thread/delete") { _ in [:] }
+        try await rig.connector.deleteTask(taskId: "codex:stored-thread")
+        let request = try XCTUnwrap(params(rig, method: "thread/delete"))
+        XCTAssertEqual(request["threadId"] as? String, "stored-thread")
+        XCTAssertTrue(rig.process.requests(method: "thread/archive").isEmpty)
+        await teardown(rig)
+    }
+
     func testDiscardArchivesTheThread() async throws {
         let rig = await makeRig()
         rig.responder.on("thread/archive") { _ in [:] }

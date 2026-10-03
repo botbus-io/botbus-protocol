@@ -311,6 +311,7 @@ export const ConnectorInfo = z.object({
     .optional(),
   /** 协议 3.3：能不能给项目开自动批准；只写 true。 */
   canAutoApprove: z.boolean().optional(),
+  canDeleteTasks: z.boolean().optional(),
 })
   // 跨字段校验，不是字段本身的规则：`connectorId` 只跟 `kind = acp` 一起出现。
   // `.extend()` / `.pick()` 出来的 schema 不带它，会把这条悄悄绕过去。
@@ -344,6 +345,7 @@ export const AgentInfo = z.object({
   capabilities: HostCapabilities.optional(),
   /** 协议 3.7：电脑提供「操作电脑」的工作区服务（文件，之后是终端）。只写 true。 */
   workspace: z.literal(true).optional(),
+  canRemoveProjects: z.boolean().optional(),
 });
 
 // ---- Snapshot ----
@@ -425,7 +427,7 @@ export const WorkingChanges = z.object({
 /** 协议 2.9 起加入 fetchFile，2.11 起加入 fetchChanges，2.12 起加入 remoteControl，3.4 起加入 mergeWorktree。 */
 export const CommandKind = z.enum([
   "startTask", "followUp", "approve", "interrupt", "setConnectorEnabled", "fetchMessages", "fetchFile",
-  "fetchChanges", "remoteControl", "mergeWorktree",
+  "fetchChanges", "remoteControl", "mergeWorktree", "deleteTask", "removeProject",
 ]);
 
 export const Command = z
@@ -507,6 +509,8 @@ export const Command = z
     remoteControl: z.object({ enabled: z.boolean() }).optional(),
     /** 协议 3.4：把 BotBus 开的 worktree 会话 squash 合并回检出分支，删 worktree 与分支，隐藏会话。 */
     mergeWorktree: z.object({ taskId: z.string().min(1) }).optional(),
+    deleteTask: z.object({ taskId: z.string().min(1) }).optional(),
+    removeProject: z.object({ projectPath: z.string().min(1) }).optional(),
   })
   .superRefine((c, ctx) => {
     if (c[c.kind] === undefined) {

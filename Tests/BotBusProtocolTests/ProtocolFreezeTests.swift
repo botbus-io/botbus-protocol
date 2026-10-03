@@ -1,15 +1,20 @@
 import XCTest
 @testable import BotBusProtocol
 
-/// 跨端枚举冻结（`docs/compatibility.md`）：这些枚举的每个值都是装在用户手机上的 app 必须认得的。
-/// 改动任何一个清单都必须同时升 `ProtocolVersion.current`、改 `PROTOCOL.md` 与 `docs/compatibility.md`，
+/// 跨端枚举冻结（`PROTOCOL.md`）：这些枚举的每个值都是装在用户手机上的 app 必须认得的。
+/// 改动任何一个清单都必须同时升 `ProtocolVersion.current`、改 `PROTOCOL.md` 与跨端 fixtures，
 /// 并在 PR 里写清是否需要发手机版；新 agent 一律走 `acp` + `connectorId`，不加来源值。
 final class ProtocolFreezeTests: XCTestCase {
+    func testListManagementPayloadsRejectEmptyIdentity() throws {
+        let decoder = ProtocolJSON.decoder()
+        XCTAssertThrowsError(try decoder.decode(Command.DeleteTask.self, from: Data(#"{"taskId":""}"#.utf8)))
+        XCTAssertThrowsError(try decoder.decode(Command.RemoveProject.self, from: Data(#"{"projectPath":""}"#.utf8)))
+    }
     private func assertFrozen<E: CaseIterable & RawRepresentable>(_ type: E.Type, _ expected: [String],
                                                                   file: StaticString = #filePath, line: UInt = #line)
     where E.RawValue == String {
         XCTAssertEqual(E.allCases.map(\.rawValue), expected,
-                       "\(E.self) changed — bump ProtocolVersion.current and update PROTOCOL.md / docs/compatibility.md",
+                       "\(E.self) changed — bump ProtocolVersion.current and update PROTOCOL.md",
                        file: file, line: line)
     }
 
@@ -39,7 +44,7 @@ final class ProtocolFreezeTests: XCTestCase {
 
     func testCommandKindIsFrozen() {
         assertFrozen(Command.Kind.self, ["startTask", "followUp", "approve", "interrupt", "setConnectorEnabled",
-                                         "fetchMessages", "fetchFile", "fetchChanges", "remoteControl", "mergeWorktree"])
+                                         "fetchMessages", "fetchFile", "fetchChanges", "remoteControl", "mergeWorktree", "deleteTask", "removeProject"])
     }
 
     func testEventKindIsFrozen() {
@@ -59,6 +64,6 @@ final class ProtocolFreezeTests: XCTestCase {
     }
 
     func testProtocolVersionMatchesTheFrozenContract() {
-        XCTAssertEqual(ProtocolVersion.current, "3.7")
+        XCTAssertEqual(ProtocolVersion.current, "3.8")
     }
 }

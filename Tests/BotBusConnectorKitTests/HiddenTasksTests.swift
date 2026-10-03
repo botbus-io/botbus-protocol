@@ -19,6 +19,51 @@ final class HiddenTasksTests: XCTestCase {
                    startedAt: "2026-09-28T01:00:00Z", updatedAt: "2026-09-28T02:00:00Z")
     }
 
+    func testProjectRemovalPersistsKeepsLiveOwnershipAndReturnsOnActivity() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("removed-project-test-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source.swift")
+        try Data("keep source".utf8).write(to: source)
+        let hidden = root.appendingPathComponent("hidden-tasks.json")
+        let s = store(hiddenURL: hidden)
+        var original = task("a"); original.projectPath = root.path
+        let project = Project(agentId: "agent-1", path: root.path, name: "test", lastUsedAt: original.updatedAt, pinned: false)
+        await s.reconcile(source: .claude, tasks: [original], projects: [project])
+        await s.claimLive(original.id)
+        try await s.removeProject(path: root.path)
+        let after = await s.snapshot()
+        XCTAssertTrue(after.projects.isEmpty)
+        XCTAssertTrue(after.tasks.isEmpty)
+        let owner = await s.owner(of: original.id)
+        XCTAssertEqual(owner, .live)
+        let raw = await s.task(id: original.id)
+        XCTAssertNotNil(raw)
+        XCTAssertEqual(try String(contentsOf: source, encoding: .utf8), "keep source")
+        await s.upsert(original)
+        let unchanged = await s.snapshot()
+        XCTAssertTrue(unchanged.tasks.isEmpty)
+        let restart = store(hiddenURL: hidden)
+        await restart.reconcile(source: .claude, tasks: [original], projects: [project])
+        let restarted = await restart.snapshot()
+        XCTAssertTrue(restarted.tasks.isEmpty)
+        original.updatedAt = "2026-09-28T03:00:00Z"
+        original.lastMessage = "new message"
+        await restart.upsert(original)
+        let restored = await restart.snapshot()
+        XCTAssertEqual(restored.tasks.count, 1)
+        XCTAssertEqual(restored.projects.count, 1)
+        XCTAssertEqual(try String(contentsOf: source, encoding: .utf8), "keep source")
+    }
+
+    func testCanRemoveTaskDerivedProjectWithNoReportedProject() async throws {
+        let s = store()
+        await s.upsert(task("a"))
+        try await s.removeProject(path: "/p")
+        let result = await s.snapshot()
+        XCTAssertTrue(result.tasks.isEmpty)
+    }
+
     func testHiddenTaskLeavesAndStaysOut() async {
         let s = store()
         await s.reconcile(source: .claude, tasks: [task("a"), task("b")], projects: [])

@@ -166,6 +166,9 @@ public actor TaskStore {
     ///   - supportsWorktrees: 分发器装了 `WorktreeManaging` 时传 true，快照的 `AgentInfo.worktrees` 随之为 true。
     ///   - supportsWorkspace: 宿主建了工作区服务时传 true，快照的 `AgentInfo.workspace` 随之为 true。
     ///   - host: 宿主平台与能力（协议 3.5），原样进快照的 `AgentInfo.platform` / `capabilities`。
+    private var projectDismissals = ListDismissals()
+    private let projectDismissalsURL: URL?
+
     public init(identity: AgentIdentity = AgentIdentity(),
                 host: HostIdentity = .mac,
                 connectors: ConnectorRegistry = ConnectorRegistry(),
@@ -191,6 +194,11 @@ public actor TaskStore {
         self.phoneTasksURL = phoneTasksURL
         self.autoApproveURL = autoApproveURL
         self.hiddenTasksURL = hiddenTasksURL
+        self.projectDismissalsURL = hiddenTasksURL?.deletingLastPathComponent().appendingPathComponent("removed-projects.json")
+        if let url = self.projectDismissalsURL, let data = try? Data(contentsOf: url),
+           let saved = try? ProtocolJSON.decoder().decode(ListDismissals.self, from: data) {
+            self.projectDismissals = saved
+        }
         self.supportsWorktrees = supportsWorktrees
         self.supportsWorkspace = supportsWorkspace
         self.artifactSaveDelay = artifactSaveDelay
@@ -367,7 +375,10 @@ public actor TaskStore {
 
     private func publish(_ events: [Event]) {
         guard let eventContinuation, !events.isEmpty else { return }
-        for event in events { eventContinuation.yield(event) }
+        for event in events {
+            if event.kind == .taskUpdated, let task = event.task, projectDismissals.hides(task) { continue }
+            eventContinuation.yield(event)
+        }
     }
 
     // MARK: - 所有权
@@ -518,6 +529,29 @@ public actor TaskStore {
         return remove(id: id)
     }
 
+    /// 移出 BotBus 列表，保留原始任务及其所有权、源码、产物与原生记录。
+    public func removeProject(path rawPath: String) throws {
+        let path = PlatformPath.canonical(rawPath)
+        if projectDismissals.hidesProject(agentId: identity.agentId, path: path) { return }
+        let related = tasks.values.filter { $0.projectPath == path && $0.outsideProject != true }
+        let project = mergedProjects().first(where: { $0.path == path })
+        guard (project != nil || !related.isEmpty), !outsideProjects.contains(path) else {
+            throw ConnectorError("本机没有这个项目")
+        }
+        let previous = projectDismissals
+        projectDismissals.dismissProject(agentId: identity.agentId, path: path,
+                                         tasks: Array(related), lastUsedAt: project?.lastUsedAt ?? related.map(\.updatedAt).max() ?? "")
+        do { try saveProjectDismissals() } catch { projectDismissals = previous; throw error }
+        publish([.snapshot(snapshot())])
+    }
+
+    private func saveProjectDismissals() throws {
+        guard let url = projectDismissalsURL else { return }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try ProtocolJSON.encoder().encode(projectDismissals).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
     /// 这个 id 是不是被手机合并并结束过（协议 3.4）。重试的 `mergeWorktree` 靠它认出"已经做完了"。
     public func isHidden(_ id: String) -> Bool { hidden[id] != nil }
 
@@ -636,7 +670,7 @@ public actor TaskStore {
             publish(events)
             return (CommandResult(commandId: command.id, ok: true, finishedAt: finishedAt), events)
         case .startTask, .followUp, .approve, .interrupt, .fetchMessages, .fetchFile, .fetchChanges, .remoteControl,
-             .mergeWorktree:
+             .mergeWorktree, .deleteTask, .removeProject:
             // 这些都归 CommandDispatcher（要连接器或 MessageReader）；走到这里说明调用方绕过了它。
             return failure("这个版本的 Agent 还不支持 \(command.kind.rawValue)")
         }
@@ -658,7 +692,7 @@ public actor TaskStore {
                            projectsRoot: outsideProjects.projectsRoot,
                            worktrees: supportsWorktrees ? true : nil,
                            capabilities: host.capabilities,
-                           workspace: supportsWorkspace ? true : nil)
+                           workspace: supportsWorkspace ? true : nil, canRemoveProjects: true)
         return Snapshot(agents: [me], tasks: visible, projects: mergedProjects(),
                         recentResults: [], seq: 0, generatedAt: generatedAt)
     }
@@ -850,7 +884,7 @@ public actor TaskStore {
     /// 时间戳是秒精度，同一秒的任务很常见；用 id 作次序键保证输出确定。
     private func visibleTasks() -> [TaskRecord] {
         tasks.values
-            .filter { isEnabled($0) }
+            .filter { isEnabled($0) && !projectDismissals.hides($0) }
             .sorted { $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt }
     }
 
@@ -938,8 +972,11 @@ public actor TaskStore {
         if task.status != .failed { clearFailureDiagnostics(for: task.id) }
         tasks[task.id] = task
         if task.origin == .watch { rememberPhoneStarted(task.id) }
-        var events: [Event] = [.taskUpdated(task)]
-        if notifyAllowed, Self.notificationKey(previous) != Self.notificationKey(task),
+        let restoredProject = projectDismissals.reconcile([task])
+        if restoredProject { try? saveProjectDismissals() }
+        var events: [Event] = projectDismissals.hides(task) ? [] : [.taskUpdated(task)]
+        if restoredProject { events.append(.snapshot(snapshot())) }
+        if notifyAllowed, !projectDismissals.hides(task), Self.notificationKey(previous) != Self.notificationKey(task),
            let notify = notification(for: task) {
             events.append(.notify(notify))
         }
@@ -1136,7 +1173,8 @@ public actor TaskStore {
         // `isEnabled(.acp source)` 恒为 true，`.acp` 的项目列表由 `AcpHub.reconcile()`
         // 在每次某个 agent 开关翻转之后，只用"已启用 agent"的任务重新算一遍再报上来。
         for (source, projects) in projectsBySource where isEnabled(source) {
-            for project in projects where !outsideProjects.contains(project.path) {
+            for project in projects where !outsideProjects.contains(project.path)
+                && !projectDismissals.hidesProject(agentId: project.agentId, path: project.path) {
                 if let existing = byIdentity[project.id], existing.lastUsedAt >= project.lastUsedAt { continue }
                 byIdentity[project.id] = project
             }

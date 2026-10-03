@@ -80,6 +80,7 @@ public actor CommandDispatcher {
     /// 正在执行的针对已有任务的命令（`onTask`）：任务 id → 条数。有命令在跑时不合并——Claude 要等命令返回
     /// 才把状态翻成 running，光看 `status` 挡不住刚发出去的续聊。
     private var activeTaskCommands: [String: Int] = [:]
+    private var deletingTasks: Set<String> = []
     /// 新建命令还没有 taskId，用真实 cwd 与 worktree 合并互斥。
     private var activeStartDirectories: [String: Int] = [:]
     private var remoteControl: (any RemoteControlling)?
@@ -477,6 +478,29 @@ public actor CommandDispatcher {
             guard let payload = command.fetchFile else { throw DispatchFailure("缺少 fetchFile 载荷") }
             try await fetchFile(payload)
             return RunResult(taskId: payload.taskId)
+        case .deleteTask:
+            guard let payload = command.deleteTask else { throw DispatchFailure("缺少 deleteTask 载荷") }
+            let id = payload.taskId
+            if await store.isHidden(id) { return RunResult(taskId: id) }
+            guard let task = await store.task(id: id) else { throw DispatchFailure("本机没有这个会话", taskId: id) }
+            guard !Self.isBusy(task.status), activeTaskCommands[id] == nil, !isMerging(taskId: id, workingDirectory: task.workingDirectory), !deletingTasks.contains(id) else {
+                throw DispatchFailure("会话还在进行中，等它停下来再删除", taskId: id)
+            }
+            let connector = try self.connector(for: task.connectorRef.kind)
+            guard [.codex, .claude].contains(connector.kind) else { throw DispatchFailure("这个 Agent 不支持删除电脑端会话", taskId: id) }
+            // 先预约，跨 await 的续聊/合并不能进入。原生端确认删除后才隐藏。
+            deletingTasks.insert(id)
+            defer { deletingTasks.remove(id) }
+            guard let latest = await store.task(id: id), !Self.isBusy(latest.status) else {
+                throw DispatchFailure("会话还在进行中，等它停下来再删除", taskId: id)
+            }
+            try await connector.deleteTask(taskId: id)
+            await store.hide(id: id)
+            return RunResult(taskId: id)
+        case .removeProject:
+            guard let payload = command.removeProject else { throw DispatchFailure("缺少 removeProject 载荷") }
+            try await store.removeProject(path: payload.projectPath)
+            return RunResult()
         case .mergeWorktree:
             guard let payload = command.mergeWorktree else { throw DispatchFailure("缺少 mergeWorktree 载荷") }
             return RunResult(taskId: try await mergeWorktree(payload))
@@ -634,7 +658,7 @@ public actor CommandDispatcher {
         }
         let related = Set(sessions.map(\.id)).union([taskId])
         // 从这里到登记进 `merging` 没有挂起点：与 `onTask` 的检查互斥，两条并发的合并也只有一条能过。
-        guard !related.contains(where: { activeTaskCommands[$0] != nil }),
+        guard !related.contains(where: { activeTaskCommands[$0] != nil || deletingTasks.contains($0) }),
               !activeStartDirectories.keys.contains(where: { managed.contains($0) }) else {
             throw DispatchFailure("会话还在进行中，等它停下来再合并", taskId: taskId)
         }
@@ -769,6 +793,9 @@ public actor CommandDispatcher {
         }
         // 协议 3.4：它所在的 worktree 正在合并，这时开新一轮会和删 worktree 撞上。检查与登记之间没有挂起点，
         // 和 `mergeWorktree` 的检查互斥。
+        guard !deletingTasks.contains(taskId) else {
+            throw DispatchFailure("这个会话正在删除", taskId: taskId)
+        }
         guard !isMerging(taskId: taskId, workingDirectory: task.workingDirectory) else {
             throw DispatchFailure("这个会话正在合并", taskId: taskId)
         }
@@ -894,6 +921,8 @@ public actor CommandDispatcher {
         case .fetchFile: command.fetchFile?.taskId
         case .fetchChanges: command.fetchChanges?.taskId
         case .mergeWorktree: command.mergeWorktree?.taskId
+        case .deleteTask: command.deleteTask?.taskId
+        case .removeProject: nil
         case .startTask, .setConnectorEnabled, .remoteControl: nil
         }
     }

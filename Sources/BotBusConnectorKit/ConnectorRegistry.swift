@@ -256,7 +256,8 @@ public final class ConnectorRegistry: @unchecked Sendable {
                                  canStartTask: probe.canStartTask ? nil : false,
                                  // 本机没装时报了也选不了。
                                  models: probe.available ? snapshot.4[descriptor.kind] : nil,
-                                 canAutoApprove: probe.available && descriptor.kind.supportsAutoApprove ? true : nil)
+                                 canAutoApprove: probe.available && descriptor.kind.supportsAutoApprove ? true : nil,
+                                 canDeleteTasks: probe.available && [.codex, .claude].contains(descriptor.kind) ? true : nil)
         }
         let acp = snapshot.2.map { entry in
             ConnectorInfo(kind: .acp, connectorId: entry.id,

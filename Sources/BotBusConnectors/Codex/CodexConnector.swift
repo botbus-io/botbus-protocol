@@ -489,6 +489,19 @@ public actor CodexConnector: TaskConnector {
         return ConnectorOutcome(taskId: Self.protocolId(threadId), retainsLiveOwnership: true)
     }
 
+    public func deleteTask(taskId: String) async throws {
+        let threadId = try Self.nativeId(taskId)
+        try enterCommand()
+        defer { activeCommands -= 1 }
+        if let thread = threads[threadId], thread.currentTurnId != nil {
+            throw ConnectorError("会话还在进行中，等它停下来再删除")
+        }
+        // 使用上游的删除事务，绝不写 Codex 数据库。老版本不支持时原样回失败。
+        _ = try await server.request("thread/delete", params: ["threadId": .string(threadId)])
+        threads.removeValue(forKey: threadId)
+        order.removeAll { $0 == threadId }
+    }
+
     /// 协议 3.4：合并并结束后把线程归档（`thread/archive {threadId}`），Codex 自己的列表里也不再显示。
     /// 尽力而为：桌面正在接管、app-server 不认这个方法都只记日志，会话早已由 `TaskStore.hide` 藏起来。
     public func discard(taskId: String) async {
@@ -562,6 +575,13 @@ public actor CodexConnector: TaskConnector {
     }
 
     private func apply(_ notification: CodexNotification) async {
+        if case .other(let method, let params) = notification, method == "thread/deleted",
+           let id = params["threadId"]?.stringValue {
+            threads.removeValue(forKey: id)
+            order.removeAll { $0 == id }
+            await store.hide(id: Self.protocolId(id))
+            return
+        }
         guard let threadId = notification.threadId else { return }
         if threads[threadId] == nil, sharedDesktop {
             // Desktop turns on the shared upstream are also actionable on the phone.

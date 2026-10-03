@@ -3,7 +3,7 @@ import Foundation
 public struct Command: Codable, Hashable, Sendable, Identifiable {
     public enum Kind: String, Codable, Sendable, CaseIterable {
         case startTask, followUp, approve, interrupt, setConnectorEnabled, fetchMessages, fetchFile, fetchChanges
-        case remoteControl, mergeWorktree
+        case remoteControl, mergeWorktree, deleteTask, removeProject
     }
 
     public struct StartTask: Codable, Hashable, Sendable {
@@ -230,6 +230,34 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         public init(taskId: String) { self.taskId = taskId }
     }
 
+    /// 协议 3.8：永久删除原生会话记录，不删除项目文件。只能用于停止的会话。
+    public struct DeleteTask: Codable, Hashable, Sendable {
+        public var taskId: String
+        public init(taskId: String) { self.taskId = taskId }
+        private enum CodingKeys: String, CodingKey { case taskId }
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            taskId = try container.decode(String.self, forKey: .taskId)
+            guard !taskId.isEmpty else {
+                throw DecodingError.dataCorruptedError(forKey: .taskId, in: container, debugDescription: "taskId must not be empty")
+            }
+        }
+    }
+
+    /// 协议 3.8：移出 BotBus 电脑端项目列表，保留文件和会话；新活动会恢复显示。
+    public struct RemoveProject: Codable, Hashable, Sendable {
+        public var projectPath: String
+        public init(projectPath: String) { self.projectPath = projectPath }
+        private enum CodingKeys: String, CodingKey { case projectPath }
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            projectPath = try container.decode(String.self, forKey: .projectPath)
+            guard !projectPath.isEmpty else {
+                throw DecodingError.dataCorruptedError(forKey: .projectPath, in: container, debugDescription: "projectPath must not be empty")
+            }
+        }
+    }
+
     /// 远程操作这台电脑的桌面（协议 2.12）。人不在电脑前、agent 卡在只有人能做的那一步时
     /// （登录、密码、确认弹窗），手机接管鼠标键盘。
     ///
@@ -259,13 +287,16 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
     public var fetchChanges: FetchChanges?
     public var remoteControl: RemoteControl?
     public var mergeWorktree: MergeWorktree?
+    public var deleteTask: DeleteTask?
+    public var removeProject: RemoveProject?
 
     public init(id: String = UUID().uuidString.lowercased(), createdAt: String, agentId: String, kind: Kind,
                 startTask: StartTask? = nil, followUp: FollowUp? = nil,
                 approve: Approve? = nil, interrupt: Interrupt? = nil,
                 setConnectorEnabled: SetConnectorEnabled? = nil, fetchMessages: FetchMessages? = nil,
                 fetchFile: FetchFile? = nil, fetchChanges: FetchChanges? = nil,
-                remoteControl: RemoteControl? = nil, mergeWorktree: MergeWorktree? = nil) {
+                remoteControl: RemoteControl? = nil, mergeWorktree: MergeWorktree? = nil,
+                deleteTask: DeleteTask? = nil, removeProject: RemoveProject? = nil) {
         self.id = id
         self.createdAt = createdAt
         self.agentId = agentId
@@ -280,11 +311,13 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         self.fetchChanges = fetchChanges
         self.remoteControl = remoteControl
         self.mergeWorktree = mergeWorktree
+        self.deleteTask = deleteTask
+        self.removeProject = removeProject
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, createdAt, agentId, kind, startTask, followUp, approve, interrupt, setConnectorEnabled, fetchMessages
-        case fetchFile, fetchChanges, remoteControl, mergeWorktree
+        case fetchFile, fetchChanges, remoteControl, mergeWorktree, deleteTask, removeProject
     }
 
     private var hasPayloadForKind: Bool {
@@ -299,6 +332,8 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         case .fetchChanges: fetchChanges != nil
         case .remoteControl: remoteControl != nil
         case .mergeWorktree: mergeWorktree != nil
+        case .deleteTask: deleteTask != nil
+        case .removeProject: removeProject != nil
         }
     }
 
@@ -320,6 +355,8 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         fetchChanges = try container.decodeIfPresent(FetchChanges.self, forKey: .fetchChanges)
         remoteControl = try container.decodeIfPresent(RemoteControl.self, forKey: .remoteControl)
         mergeWorktree = try container.decodeIfPresent(MergeWorktree.self, forKey: .mergeWorktree)
+        deleteTask = try container.decodeIfPresent(DeleteTask.self, forKey: .deleteTask)
+        removeProject = try container.decodeIfPresent(RemoveProject.self, forKey: .removeProject)
 
         guard hasPayloadForKind else {
             throw DecodingError.dataCorruptedError(
@@ -336,6 +373,8 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         if kind != .fetchChanges { fetchChanges = nil }
         if kind != .remoteControl { remoteControl = nil }
         if kind != .mergeWorktree { mergeWorktree = nil }
+        if kind != .deleteTask { deleteTask = nil }
+        if kind != .removeProject { removeProject = nil }
     }
 
     /// 编码方向同样守住这条规则：载荷缺失直接拒绝编码，与 kind 不符的载荷不写出。
@@ -357,6 +396,8 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         case .fetchChanges: try container.encode(required(fetchChanges, encoder), forKey: .fetchChanges)
         case .remoteControl: try container.encode(required(remoteControl, encoder), forKey: .remoteControl)
         case .mergeWorktree: try container.encode(required(mergeWorktree, encoder), forKey: .mergeWorktree)
+        case .deleteTask: try container.encode(required(deleteTask, encoder), forKey: .deleteTask)
+        case .removeProject: try container.encode(required(removeProject, encoder), forKey: .removeProject)
         }
     }
 
@@ -429,5 +470,14 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
                                      id: String = UUID().uuidString.lowercased(),
                                      agentId: String) -> Command {
         Command(id: id, createdAt: createdAt, agentId: agentId, kind: .mergeWorktree, mergeWorktree: payload)
+    }
+    public static func deleteTask(_ payload: DeleteTask, createdAt: String,
+                                  id: String = UUID().uuidString.lowercased(), agentId: String) -> Command {
+        Command(id: id, createdAt: createdAt, agentId: agentId, kind: .deleteTask, deleteTask: payload)
+    }
+
+    public static func removeProject(_ payload: RemoveProject, createdAt: String,
+                                     id: String = UUID().uuidString.lowercased(), agentId: String) -> Command {
+        Command(id: id, createdAt: createdAt, agentId: agentId, kind: .removeProject, removeProject: payload)
     }
 }

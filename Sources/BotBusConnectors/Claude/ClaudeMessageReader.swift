@@ -59,6 +59,43 @@ public struct ClaudeMessageReader: MessageReader {
         return nil
     }
 
+    /// 与 Agent SDK delete_session 相同：只移除该会话的顶层 transcript。
+    /// 不使用 hook 的任意路径，拒绝目录/文件软链接越界与非 UUID 的路径注入。
+    static func deleteTranscript(sessionID: String, in projectsDirectory: URL) throws {
+        guard UUID(uuidString: sessionID) != nil else { throw ConnectorError("会话 id 不合法") }
+        // 删除不能复用只读查找的 try?：没有权限枚举不等于已经删除。
+        let directories: [URL]
+        do {
+            directories = try FileManager.default.contentsOfDirectory(at: projectsDirectory,
+                includingPropertiesForKeys: [.isDirectoryKey])
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return
+        }
+        for directory in directories {
+            guard try directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
+            let candidate = directory.appendingPathComponent("\(sessionID).jsonl")
+            do {
+                _ = try candidate.resourceValues(forKeys: [.isRegularFileKey])
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                continue
+            }
+            try removeTranscript(candidate, sessionID: sessionID, in: projectsDirectory)
+            return
+        }
+    }
+
+    private static func removeTranscript(_ url: URL, sessionID: String, in projectsDirectory: URL) throws {
+        let root = projectsDirectory.resolvingSymlinksInPath().standardizedFileURL
+        let resolved = url.resolvingSymlinksInPath().standardizedFileURL
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true,
+              resolved.deletingLastPathComponent().deletingLastPathComponent() == root,
+              resolved.lastPathComponent == "\(sessionID).jsonl" else {
+            throw ConnectorError("会话记录路径不安全，不能删除")
+        }
+        try FileManager.default.removeItem(at: url)
+    }
+
     /// Claude Code 自己注入、被记成 user 行的整块。用户没说过这些话，不该出现在对话记录里。
     static let injectedTags = ["system-reminder", "task-notification"]
 
