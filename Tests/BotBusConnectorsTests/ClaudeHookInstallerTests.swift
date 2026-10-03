@@ -95,6 +95,33 @@ final class ClaudeHookInstallerTests: XCTestCase {
                        "已经是全套就不再写文件")
     }
 
+    /// 2 分钟 → 30 分钟那次升级只换了脚本，settings 里的 `timeout` 还是 130：Claude Code 两分钟就掐掉 hook，
+    /// 手机上之后点什么都是「过期」。超时不对也要重装，别人的 hook 照旧。
+    func testUpgradeFixesAnOutdatedPermissionTimeout() throws {
+        try write(foreign)
+        try ClaudeHookInstaller.install(paths: paths, supportDirectory: support)
+        var settings = try read()
+        var hooks = try XCTUnwrap(settings["hooks"] as? [String: Any])
+        var matchers = try XCTUnwrap(hooks["PermissionRequest"] as? [[String: Any]])
+        var entries = try XCTUnwrap(matchers[0]["hooks"] as? [[String: Any]])
+        entries[0]["timeout"] = 130
+        matchers[0]["hooks"] = entries
+        hooks["PermissionRequest"] = matchers
+        settings["hooks"] = hooks
+        try write(settings)
+        XCTAssertTrue(ClaudeHookInstaller.isInstalled(paths: paths, supportDirectory: support), "设置页照样算已安装")
+
+        XCTAssertTrue(try ClaudeHookInstaller.upgradeIfNeeded(paths: paths, supportDirectory: support))
+        let upgraded = try XCTUnwrap(try read()["hooks"] as? [String: Any])
+        let permission = try XCTUnwrap(upgraded["PermissionRequest"] as? [[String: Any]])
+        XCTAssertEqual(permission.count, 1, "不会多出第二条")
+        let entry = try XCTUnwrap((permission[0]["hooks"] as? [[String: Any]])?.first)
+        XCTAssertEqual(entry["timeout"] as? Int, ClaudeHookInstaller.permissionTimeoutSeconds)
+        XCTAssertNotNil(upgraded["PreToolUse"], "别人的 hook 原样留着")
+        XCTAssertFalse(try ClaudeHookInstaller.upgradeIfNeeded(paths: paths, supportDirectory: support),
+                       "超时对了就不再写文件")
+    }
+
     func testPermissionRequestCarriesTimeout() throws {
         try ClaudeHookInstaller.install(paths: paths, supportDirectory: support)
         let hooks = try XCTUnwrap(try read()["hooks"] as? [String: Any])

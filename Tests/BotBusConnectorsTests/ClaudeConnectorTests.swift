@@ -518,9 +518,10 @@ final class ClaudeConnectorTests: XCTestCase {
     // MARK: - AskUserQuestion（协议 2.14）
 
     /// 形状取自本机 Claude Code 2.1.273 的真实 PermissionRequest 负载。
-    private func askUserQuestion(_ connector: ClaudeConnector, id: String = "toolu-ask") async -> LocalHookServer.Reply {
+    private func askUserQuestion(_ connector: ClaudeConnector, id: String = "toolu-ask",
+                                 cwd: String = "/tmp/proj") async -> LocalHookServer.Reply {
         await send(connector, [
-            "hook_event_name": "PermissionRequest", "session_id": "s1", "cwd": "/tmp/proj",
+            "hook_event_name": "PermissionRequest", "session_id": "s1", "cwd": cwd,
             "tool_name": "AskUserQuestion", "tool_use_id": id,
             "tool_input": ["questions": [
                 ["question": "要处理什么？", "header": "要处理什么", "multiSelect": false,
@@ -637,8 +638,8 @@ final class ClaudeConnectorTests: XCTestCase {
         XCTAssertEqual(after.status, .running)
     }
 
-    /// 挂起的请求只活 120 秒。过期之后再点允许，得给用户一句人话，而不是静默什么都不发生。
-    func testApproveAfterTheHoldIsGoneFails() async throws {
+    /// 既没挂着、也没有卡片的审批（手机上的旧卡片、点了两次）：说清楚已经处理过，什么都不发。
+    func testApproveForAnUnknownRequestSaysItWasHandled() async throws {
         let store = makeStore()
         let connector = makeConnector(store: store)
         await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/tmp/proj"])
@@ -646,8 +647,145 @@ final class ClaudeConnectorTests: XCTestCase {
             _ = try await connector.approve(taskId: "claude:s1", requestId: "nope", decision: .allow)
             XCTFail("不存在的审批应当报错")
         } catch {
-            XCTAssertTrue("\(error)".contains("过期"), "报错要说清楚原因：\(error)")
+            XCTAssertTrue("\(error)".contains("已经处理过了"), "报错要说清楚原因：\(error)")
         }
+    }
+
+    // MARK: - 过期之后才到的回答
+
+    /// 假 `claude`：把 stdin 第一行（续聊的那条 user 消息）记进 `prompts.log`，session id 固定 `s1`（不分支）。
+    /// `directory` 同时当项目目录：续聊要求目录真的存在。
+    private func recordingClaude() throws -> (binary: String, log: URL, directory: String) {
+        try skipPOSIXScriptOnWindows()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("claude-late-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let log = directory.appendingPathComponent("prompts.log")
+        let binary = directory.appendingPathComponent("claude")
+        try """
+        #!/bin/sh
+        [ "$1" = "--help" ] && exit 0
+        read -r first
+        printf '%s\\n' "$first" >> "\(log.path)"
+        echo '{"type":"system","subtype":"init","session_id":"s1"}'
+        echo '{"type":"result","subtype":"success","result":"ok"}'
+        cat > /dev/null
+        """.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: binary.path)
+        return (binary.path, log, directory.path)
+    }
+
+    /// `prompts.log` 里每次续聊的文字。
+    private func sentPrompts(_ log: URL) -> [String] {
+        let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        return text.split(separator: "\n").compactMap { line in
+            let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            let content = (object?["message"] as? [String: Any])?["content"] as? [[String: Any]]
+            return content?.first { $0["type"] as? String == "text" }?["text"] as? String
+        }
+    }
+
+    /// 电脑上的会话里挂一条 Bash 审批，再让 Claude Code 把 hook 掐掉（它自己的超时到了）。
+    private func expiredDesktopApproval(_ connector: ClaudeConnector, cwd: String, transcript: URL? = nil) async throws {
+        await send(connector, ["hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": cwd, "prompt": "跑测试"])
+        var payload: [String: Any] = [
+            "hook_event_name": "PermissionRequest", "session_id": "s1", "cwd": cwd,
+            "tool_name": "Bash", "tool_use_id": "toolu-1", "tool_input": ["command": "npm test -- --filter settings"],
+        ]
+        if let transcript { payload["transcript_path"] = transcript.path }
+        guard case .hold(let hold) = await send(connector, payload) else { return XCTFail("应当挂起") }
+        XCTAssertTrue(hold.abandon(), "Claude Code 掐掉 hook：响应再也送不出去")
+    }
+
+    /// hook 被 Claude Code 掐掉之后卡片还留着，手机上点「批准」：不报错，改成一条续聊把批准说过去。
+    func testApprovingAnExpiredDesktopApprovalSendsItAsAFollowUp() async throws {
+        let (binary, log, cwd) = try recordingClaude()
+        let store = makeStore()
+        let connector = makeConnector(store: store, binary: binary)
+        try await expiredDesktopApproval(connector, cwd: cwd)
+        let pending = try await requireTask(store, "s1")
+        XCTAssertEqual(pending.pendingRequest?.id, "toolu-1", "过期了卡片也还在")
+
+        let outcome = try await connector.approve(taskId: "claude:s1", requestId: "toolu-1", decision: .allow)
+        XCTAssertEqual(outcome.taskId, "s1")
+        XCTAssertEqual(sentPrompts(log), ["已批准：Bash · npm test -- --filter settings，请继续。"])
+        let after = try await requireTask(store, "s1")
+        XCTAssertNil(after.pendingRequest, "卡片收掉")
+        await connector.stop()
+    }
+
+    /// 过期之后点「拒绝」：只收掉卡片，不为一句「不要」另起一轮。
+    func testDenyingAnExpiredDesktopApprovalOnlyClearsTheCard() async throws {
+        let (binary, log, cwd) = try recordingClaude()
+        let store = makeStore()
+        let connector = makeConnector(store: store, binary: binary)
+        try await expiredDesktopApproval(connector, cwd: cwd)
+
+        _ = try await connector.approve(taskId: "claude:s1", requestId: "toolu-1", decision: .deny)
+        XCTAssertEqual(sentPrompts(log), [], "拒绝不发消息")
+        let after = try await requireTask(store, "s1")
+        XCTAssertNil(after.pendingRequest)
+    }
+
+    /// hook 超时后用户在电脑上的权限框里已经处理了（transcript 里有这个工具的结果）：不能再发一遍批准。
+    func testExpiredApprovalAlreadyHandledOnTheDesktopIsNotResent() async throws {
+        let (binary, log, cwd) = try recordingClaude()
+        let file = try transcript([
+            ["type": "assistant", "message": ["role": "assistant", "content": [
+                ["type": "tool_use", "id": "toolu-1", "name": "Bash", "input": ["command": "npm test"]],
+            ]]],
+            ["type": "user", "message": ["role": "user", "content": [
+                ["type": "tool_result", "tool_use_id": "toolu-1", "content": "ok"],
+            ]]],
+        ])
+        let store = makeStore()
+        let connector = makeConnector(store: store, binary: binary)
+        try await expiredDesktopApproval(connector, cwd: cwd, transcript: file)
+
+        do {
+            _ = try await connector.approve(taskId: "claude:s1", requestId: "toolu-1", decision: .allow)
+            XCTFail("电脑上处理过的不该成功")
+        } catch {
+            XCTAssertTrue("\(error)".contains("电脑上处理过"), "\(error)")
+        }
+        XCTAssertEqual(sentPrompts(log), [])
+        let after = try await requireTask(store, "s1")
+        XCTAssertNil(after.pendingRequest, "卡片收掉，不再让人点")
+    }
+
+    /// 过期的提问：选好的答案按题目顺序一题一行发过去。
+    func testAnsweringAnExpiredDesktopQuestionSendsTheAnswersInOrder() async throws {
+        let (binary, log, cwd) = try recordingClaude()
+        let store = makeStore()
+        let connector = makeConnector(store: store, binary: binary)
+        guard case .hold(let hold) = await askUserQuestion(connector, cwd: cwd) else { return XCTFail("应当挂起") }
+        XCTAssertTrue(hold.abandon())
+
+        _ = try await connector.approve(taskId: "claude:s1", requestId: "toolu-ask", decision: .allow,
+                                        answers: ["1": ["手机", "手表"], "0": ["发新版"]])
+        XCTAssertEqual(sentPrompts(log), ["要处理什么？发新版\n测哪些？手机, 手表"])
+        let after = try await requireTask(store, "s1")
+        XCTAssertNil(after.pendingRequest)
+        await connector.stop()
+    }
+
+    /// 只有一题时就发答案本身。
+    func testAnsweringAnExpiredSingleQuestionSendsJustTheAnswer() async throws {
+        let (binary, log, cwd) = try recordingClaude()
+        let store = makeStore()
+        let connector = makeConnector(store: store, binary: binary)
+        let reply = await send(connector, [
+            "hook_event_name": "PermissionRequest", "session_id": "s1", "cwd": cwd,
+            "tool_name": "AskUserQuestion", "tool_use_id": "toolu-one",
+            "tool_input": ["questions": [["question": "选哪个", "header": "方案", "multiSelect": false,
+                                          "options": [["label": "A"], ["label": "B"]]]]],
+        ])
+        guard case .hold(let hold) = reply else { return XCTFail("应当挂起") }
+        XCTAssertTrue(hold.abandon())
+
+        _ = try await connector.approve(taskId: "claude:s1", requestId: "toolu-one", decision: .allow, answers: ["0": ["B"]])
+        XCTAssertEqual(sentPrompts(log), ["B"])
+        await connector.stop()
     }
 
     func testIdleNotificationSetsWaitingInputAndOthersAreIgnored() async throws {

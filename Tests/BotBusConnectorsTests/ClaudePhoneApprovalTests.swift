@@ -15,7 +15,7 @@ final class ClaudePhoneApprovalTests: XCTestCase {
         return directory
     }
 
-    /// 假 `claude`：读一行 user 消息，吐 init，再吐 `request.json` 里的那行控制请求，读一行回答存进 `answer`，
+    /// 假 `claude`：读一行 user 消息（记进 `prompts.log`），吐 init，再吐 `request.json` 里的那行控制请求，读一行回答存进 `answer`，
     /// 然后吐 result，像真 claude 一样等 stdin 关了才退出（连接器读到 result 就关）。
     private func fakeClaude(in directory: URL) throws -> URL {
         try skipPOSIXScriptOnWindows()
@@ -28,6 +28,7 @@ final class ClaudePhoneApprovalTests: XCTestCase {
           exit 0
         fi
         read -r first
+        printf '%s\\n' "$first" >> "\(dir)/prompts.log"
         echo '{"type":"system","subtype":"init","session_id":"sess-auto"}'
         sleep 0.2
         cat "\(dir)/request.json"
@@ -149,8 +150,9 @@ final class ClaudePhoneApprovalTests: XCTestCase {
         await rig.connector.stop()
     }
 
-    /// 手机一直不回：到点按拒绝回，绝不能变成允许；卡片收掉，迟到的回答报过期。
-    func testUnansweredApprovalTimesOutAsDenyNeverAllow() async throws {
+    /// 手机一直不回：到点按拒绝回，绝不能变成允许；卡片收掉。
+    /// 迟到的「批准」（手机上的旧卡片）不报错，改成一条续聊把批准说过去。
+    func testUnansweredApprovalTimesOutAsDenyAndALateAllowBecomesAFollowUp() async throws {
         let rig = try makeRig(approvalTimeout: 0.3)
         _ = try await rig.connector.start(projectPath: rig.project.path, prompt: "看看系统版本", images: [])
         _ = await waitForPending(rig)
@@ -158,13 +160,54 @@ final class ClaudePhoneApprovalTests: XCTestCase {
         let response = try await answer(rig)
         XCTAssertEqual(response["behavior"] as? String, "deny")
         await assertEventually { await rig.store.task(id: "claude:sess-auto")?.pendingRequest == nil }
-        do {
-            _ = try await rig.connector.approve(taskId: "claude:sess-auto", requestId: "toolu-1", decision: .allow)
-            XCTFail("超时之后的回答送不到")
-        } catch let error as ConnectorError {
-            XCTAssertTrue(error.message.contains("过期"), error.message)
-        }
+        let outcome = try await rig.connector.approve(taskId: "claude:sess-auto", requestId: "toolu-1", decision: .allow)
+        XCTAssertEqual(outcome.taskId, "sess-auto")
+        await assertEventually(timeout: 5) { self.prompts(rig).count == 2 }
+        XCTAssertEqual(prompts(rig).last, "已批准：Bash · sw_vers，请继续。")
         await rig.connector.stop()
+    }
+
+    /// 超时已经按拒绝回过了，迟到的「拒绝」什么都不用做：回执成功，不另起一轮。
+    func testLateDenyAfterTimeoutSendsNothing() async throws {
+        let rig = try makeRig(approvalTimeout: 0.3)
+        _ = try await rig.connector.start(projectPath: rig.project.path, prompt: "看看系统版本", images: [])
+        _ = await waitForPending(rig)
+        _ = try await answer(rig)
+        await assertEventually { await rig.store.task(id: "claude:sess-auto")?.pendingRequest == nil }
+
+        _ = try await rig.connector.approve(taskId: "claude:sess-auto", requestId: "toolu-1", decision: .deny)
+        await assertEventually(timeout: 5) { await rig.store.task(id: "claude:sess-auto")?.status == .completed }
+        XCTAssertEqual(prompts(rig), ["看看系统版本"])
+        await rig.connector.stop()
+    }
+
+    /// 提问同理：超时后才选好的答案当续聊发过去。
+    func testLateAnswerToATimedOutQuestionBecomesAFollowUp() async throws {
+        let rig = try makeRig(tool: "AskUserQuestion", input: ["questions": [
+            ["question": "选哪个？", "header": "方案", "multiSelect": false,
+             "options": [["label": "A"], ["label": "B"]]],
+        ]], approvalTimeout: 0.3)
+        _ = try await rig.connector.start(projectPath: rig.project.path, prompt: "问我", images: [])
+        _ = await waitForPending(rig)
+        _ = try await answer(rig)
+        await assertEventually { await rig.store.task(id: "claude:sess-auto")?.pendingRequest == nil }
+
+        _ = try await rig.connector.approve(taskId: "claude:sess-auto", requestId: "toolu-1", decision: .allow,
+                                            answers: ["0": ["B"]])
+        await assertEventually(timeout: 5) { self.prompts(rig).count == 2 }
+        XCTAssertEqual(prompts(rig).last, "B")
+        await rig.connector.stop()
+    }
+
+    /// 假 claude 每次收到的那条 user 消息的文字。
+    private func prompts(_ rig: Rig) -> [String] {
+        let url = rig.directory.appendingPathComponent("prompts.log")
+        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        return text.split(separator: "\n").compactMap { line in
+            let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            let content = (object?["message"] as? [String: Any])?["content"] as? [[String: Any]]
+            return content?.first { $0["type"] as? String == "text" }?["text"] as? String
+        }
     }
 
     /// 停机时挂着的审批按拒绝回、进程随即终止：来得及读到的只能是拒绝，不能放行。
