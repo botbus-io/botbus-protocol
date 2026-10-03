@@ -111,7 +111,7 @@ public struct CodexMessageReader: MessageReader {
     /// 相对路径不收——拼到 Agent 自己的工作目录上只会指错文件。
     static func localFile(_ path: String) -> ImageSource? {
         let expanded = (path.trimmed as NSString).expandingTildeInPath
-        guard expanded.hasPrefix("/") else { return nil }
+        guard PlatformPath.isAbsolute(expanded) else { return nil }
         return .file(URL(fileURLWithPath: expanded))
     }
 

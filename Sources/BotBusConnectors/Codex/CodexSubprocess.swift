@@ -30,7 +30,9 @@ public struct CodexSubprocessLauncher: CodexProcessLauncher {
     /// 按 `CodexPaths` 的优先级找一个能用的 codex；一个都没有时返回 nil。
     public static func detected(fileManager: FileManager = .default) -> CodexSubprocessLauncher? {
         guard let path = CodexPaths.detectCodexBinary(fileManager: fileManager) else { return nil }
-        return CodexSubprocessLauncher(executablePath: path)
+        // npm 装的 `codex.js` 是 `#!/usr/bin/env node` 脚本：GUI 进程的 PATH 里多半没有 node，把它旁边的放到最前。
+        let script = path.hasSuffix(".js") || (path as NSString).resolvingSymlinksInPath.hasSuffix(".js")
+        return CodexSubprocessLauncher(executablePath: path, environment: script ? AgentBinary.environment(for: path) : nil)
     }
 
     public func launch() throws -> any CodexProcessHandle {

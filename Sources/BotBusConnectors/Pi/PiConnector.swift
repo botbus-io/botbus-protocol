@@ -422,7 +422,7 @@ final class PiSubprocess: PiProcessHandle, @unchecked Sendable {
 
     func interrupt() {
         guard process.isRunning else { return }
-        kill(process.processIdentifier, SIGINT)
+        PlatformProcess.interrupt(process.processIdentifier)
     }
 
     func terminate() {

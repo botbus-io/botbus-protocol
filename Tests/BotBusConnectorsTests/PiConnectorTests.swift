@@ -128,14 +128,14 @@ final class PiConnectorTests: XCTestCase {
         XCTAssertEqual(task.origin, .watch)
         XCTAssertEqual(task.source, .pi)
         XCTAssertEqual(task.title, "给首页加个深色模式")
-        XCTAssertEqual(task.projectPath, projectDirectory.path)
+        XCTAssertEqual(task.projectPath, PlatformPath.canonical(projectDirectory.path))
         XCTAssertTrue(task.controllable)
 
         let request = try XCTUnwrap(launcher.last?.request)
         XCTAssertEqual(request.executable, "/fake/bin/pi")
         XCTAssertEqual(request.arguments, ["--mode", "json", "给首页加个深色模式"])
         XCTAssertEqual(request.workingDirectory, projectDirectory.path, "pi 没有 --cwd，靠子进程的工作目录")
-        XCTAssertTrue(request.environment["PATH"]?.hasPrefix("/fake/bin:") ?? false,
+        XCTAssertEqual(PlatformPath.splitSearchPath(PlatformPath.searchPath(in: request.environment) ?? "").first, "/fake/bin",
                       "pi 是 node 脚本，可执行文件所在目录要排在 PATH 最前")
         XCTAssertNil(request.environment[AgentToolsInjection.taskTokenVariable], "没配工具就完全不注入")
     }
@@ -256,7 +256,7 @@ final class PiConnectorTests: XCTestCase {
     // MARK: - 注入
 
     func testInjectionAddsEnvironmentInstructionsAndBindsToken() async throws {
-        let cli = fixture.agentDirectory.appendingPathComponent("botbus")
+        let cli = fixture.agentDirectory.appendingPathComponent(fakeCLIName)
         try Data("#!/bin/sh\n".utf8).write(to: cli)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
         let tools = AgentToolsConfiguration(cliPath: cli.path, toolsURL: "http://127.0.0.1:4567")
@@ -382,7 +382,7 @@ final class PiConnectorTests: XCTestCase {
         XCTAssertEqual(arguments.count, 5)
         let sessionPath = arguments.count == 5 ? arguments.remove(at: 3) : ""
         XCTAssertEqual(arguments, ["--mode", "json", "--session", "再补个测试"])
-        XCTAssertTrue(sessionPath.hasPrefix("/"), "只传绝对路径，不传 id（传 id 可能弹 fork 确认把进程卡死）")
+        XCTAssertTrue(PlatformPath.isAbsolute(sessionPath), "只传绝对路径，不传 id（传 id 可能弹 fork 确认把进程卡死）")
         XCTAssertEqual(URL(fileURLWithPath: sessionPath).resolvingSymlinksInPath().path,
                        file.resolvingSymlinksInPath().path)
         XCTAssertEqual(request.workingDirectory, projectDirectory.path, "工作目录以 header 的 cwd 为准")
@@ -402,7 +402,7 @@ final class PiConnectorTests: XCTestCase {
     }
 
     func testFollowUpReusesToken() async throws {
-        let cli = fixture.agentDirectory.appendingPathComponent("botbus")
+        let cli = fixture.agentDirectory.appendingPathComponent(fakeCLIName)
         try Data("#!/bin/sh\n".utf8).write(to: cli)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
         let tools = AgentToolsConfiguration(cliPath: cli.path, toolsURL: "http://127.0.0.1:4567")

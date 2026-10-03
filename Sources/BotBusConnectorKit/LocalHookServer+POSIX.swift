@@ -4,9 +4,12 @@ import Foundation
 import Glibc
 #elseif canImport(Musl)
 import Musl
+#elseif canImport(WinSDK)
+import WinSDK
 #endif
 
-/// 没有 Network.framework 的平台（Linux）：非阻塞 POSIX socket + `DispatchSource`。
+/// 没有 Network.framework 的平台（Linux、Windows）：Linux 是非阻塞 POSIX socket + `DispatchSource`，
+/// Windows 是阻塞的 Winsock + 每条连接一个读线程（`LocalHookServer+Windows.swift`）。
 /// 对外的 API 与语义和 Apple 平台那份完全一样；解析与回写的报文在 `LocalHookServer.swift`，
 /// 系统调用在 `LoopbackSocket.swift`。
 extension LocalHookServer {
@@ -77,7 +80,7 @@ extension LocalHookServer {
 
     // MARK: - 每条连接
 
-    private nonisolated func accept(_ descriptor: Int32, peer: String) {
+    private nonisolated func accept(_ descriptor: LoopbackSocket.Descriptor, peer: String) {
         guard Self.isLoopbackAddress(peer) else {
             Self.log.warning("拒绝非回环来源：\(peer, privacy: .public)")
             LoopbackSocket.closeSocket(descriptor)
@@ -96,6 +99,8 @@ extension LocalHookServer {
     }
 }
 
+#if !os(Windows)
+// Windows 的 `SocketListener` / `SocketConnection`（阻塞 Winsock + 线程）在 `LocalHookServer+Windows.swift`。
 /// 监听 socket。可读事件来了就 accept 到队列空为止，每条新连接交给 `onAccept`（fd 归对方）。
 final class SocketListener: @unchecked Sendable {
     /// fd 用完（EMFILE / ENFILE）时暂停接受这么久：读事件源是电平触发的，不停下来就是空转。
@@ -383,4 +388,5 @@ final class SocketConnection: HookTransport, @unchecked Sendable {
         source.cancel()
     }
 }
+#endif // !os(Windows)
 #endif // !canImport(Network)

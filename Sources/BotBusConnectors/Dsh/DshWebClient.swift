@@ -162,6 +162,18 @@ public struct DshWebClient: Sendable {
         return items.compactMap(DshWebSessionSummary.init(json:))
     }
 
+    /// 桌面不会实时索引外部 ACP 新会话。首轮交还写锁后，经它自己的接口接入原会话与工作区；不创建新会话身份。
+    func adoptSession(sessionId: String, cwd: String) async throws {
+        let workspace = try await call("workspace/create", ["path": .string(cwd)])
+        guard let workspaceId = workspace.path("workspace", "workspaceId")?.stringValue, !workspaceId.isEmpty else {
+            throw DshWebError.malformedResponse(method: "workspace/create")
+        }
+        let session = try await call("session/create", ["sessionId": .string(sessionId), "workspaceId": .string(workspaceId)])
+        guard session["sessionId"]?.stringValue == sessionId else {
+            throw DshWebError.malformedResponse(method: "session/create")
+        }
+    }
+
     /// 续聊（`mode: "queue"`：这一轮在跑就排在后面）。web 没载入的会话会自己载入（之后一直持锁）。
     /// 返回 dsh 是否接受（`accepted`）。`requestId` 会成为 `user/message.source.rpcId`。
     @discardableResult

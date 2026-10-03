@@ -21,6 +21,24 @@ final class WorktreeTests: XCTestCase {
 
     // MARK: - 夹具
 
+    /// 主仓库路径的写法：POSIX 原样；Windows 上是 `C:\…`（解析结果统一成反斜杠，与 Claude / Codex 报的工作目录一致）。
+    private func repo(_ posix: String) -> String {
+        #if os(Windows)
+        return "C:" + posix.replacingOccurrences(of: "/", with: "\\")
+        #else
+        return posix
+        #endif
+    }
+
+    /// 写进 worktree `.git` 文件的 gitdir：Windows 上的 git 写的是 `C:/…`（正斜杠）。
+    private func gitdir(_ posix: String) -> String {
+        #if os(Windows)
+        return "C:" + posix
+        #else
+        return posix
+        #endif
+    }
+
     /// 在沙箱里摆出一个 worktree：目录里一个 `.git` 文件，内容就是 `gitdir: …`。只写这一个文件，不需要真的 git。
     @discardableResult
     private func makeWorktree(_ relative: String, gitdir: String) throws -> String {
@@ -72,20 +90,21 @@ final class WorktreeTests: XCTestCase {
     }
 
     func testCodexWorktreeIsResolvedFromItsGitFile() throws {
-        let path = try makeWorktree("codex/worktrees/a1b2/app", gitdir: "/Users/me/Projects/app/.git/worktrees/app")
+        let path = try makeWorktree("codex/worktrees/a1b2/app", gitdir: gitdir("/Users/me/Projects/app/.git/worktrees/app"))
         let resolver = WorktreeResolver()
-        XCTAssertEqual(resolver.projectRoot(for: path), "/Users/me/Projects/app")
+        XCTAssertEqual(resolver.projectRoot(for: path), repo("/Users/me/Projects/app"))
 
         // worktree 里的子目录往上找到同一个 `.git`，归到主仓库里的同一个子目录。
         let sub = sandbox.appendingPathComponent("codex/worktrees/a1b2/app/relay/src", isDirectory: true)
         try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
-        XCTAssertEqual(resolver.projectRoot(for: sub.path), "/Users/me/Projects/app/relay/src")
+        XCTAssertEqual(resolver.projectRoot(for: sub.path), repo("/Users/me/Projects/app/relay/src"))
     }
 
     func testRelativeGitdirIsResolvedAgainstTheWorktree() throws {
         // 新版 git 的 `worktree.useRelativePaths` 会写相对路径。
         let path = try makeWorktree("repo/wt/worktrees/feature", gitdir: "../../../.git/worktrees/feature")
-        XCTAssertEqual(WorktreeResolver().projectRoot(for: path), sandbox.appendingPathComponent("repo").path)
+        // Windows 上结果统一成反斜杠（`PlatformPath.normalized`），POSIX 上就是原样。
+        XCTAssertEqual(WorktreeResolver().projectRoot(for: path), PlatformPath.normalized(sandbox.appendingPathComponent("repo").path))
     }
 
     func testSubmoduleBareRepoAndPlainRepoAreNotWorktrees() throws {
@@ -114,21 +133,21 @@ final class WorktreeTests: XCTestCase {
         XCTAssertNil(resolver.projectRoot(for: directory.path))
 
         // `.git` 后写出来：缓存期内仍是 nil，过了重试间隔才认出来。
-        try "gitdir: /Users/me/app/.git/worktrees/app\n"
+        try "gitdir: \(gitdir("/Users/me/app/.git/worktrees/app"))\n"
             .write(to: directory.appendingPathComponent(".git"), atomically: true, encoding: .utf8)
         XCTAssertNil(resolver.projectRoot(for: directory.path))
         clock.advance(WorktreeResolver.missRetryInterval + 1)
-        XCTAssertEqual(resolver.projectRoot(for: directory.path), "/Users/me/app")
+        XCTAssertEqual(resolver.projectRoot(for: directory.path), repo("/Users/me/app"))
     }
 
     func testResolvedWorktreeSurvivesDeletionAndRestart() throws {
         let archive = sandbox.appendingPathComponent("support/worktrees.json")
-        let path = try makeWorktree("codex/worktrees/a1b2/app", gitdir: "/Users/me/app/.git/worktrees/app")
-        XCTAssertEqual(WorktreeResolver(archiveURL: archive).projectRoot(for: path), "/Users/me/app")
+        let path = try makeWorktree("codex/worktrees/a1b2/app", gitdir: gitdir("/Users/me/app/.git/worktrees/app"))
+        XCTAssertEqual(WorktreeResolver(archiveURL: archive).projectRoot(for: path), repo("/Users/me/app"))
 
         // worktree 删了、Agent 重启：靠 worktrees.json 仍归得回去。
         try FileManager.default.removeItem(atPath: path)
-        XCTAssertEqual(WorktreeResolver(archiveURL: archive).projectRoot(for: path), "/Users/me/app")
+        XCTAssertEqual(WorktreeResolver(archiveURL: archive).projectRoot(for: path), repo("/Users/me/app"))
         XCTAssertNil(WorktreeResolver().projectRoot(for: path), "没有持久化就认不出了")
     }
 
@@ -150,10 +169,10 @@ final class WorktreeTests: XCTestCase {
         let resolver = WorktreeResolver()
         // 另一个还在的 worktree 让主仓库被认出来。
         let alive = try makeWorktree("codex/worktrees/6431/giggleland",
-                                     gitdir: "/Users/me/Projects/giggleland/.git/worktrees/giggleland3")
-        XCTAssertEqual(resolver.projectRoot(for: alive), "/Users/me/Projects/giggleland")
+                                     gitdir: gitdir("/Users/me/Projects/giggleland/.git/worktrees/giggleland3"))
+        XCTAssertEqual(resolver.projectRoot(for: alive), repo("/Users/me/Projects/giggleland"))
         let gone = sandbox.appendingPathComponent("codex/worktrees/8417/giggleland").path
-        XCTAssertEqual(resolver.projectRoot(for: gone), "/Users/me/Projects/giggleland")
+        XCTAssertEqual(resolver.projectRoot(for: gone), repo("/Users/me/Projects/giggleland"))
 
         // 目录还在、只是认不出（不是 worktree）的不按名字猜。
         let plain = sandbox.appendingPathComponent("codex/worktrees/9999/giggleland", isDirectory: true)
@@ -221,6 +240,30 @@ final class WorktreeTests: XCTestCase {
         let repeated = await store.upsert(task("wt", path: worktree))
         XCTAssertTrue(repeated.isEmpty)
     }
+
+    #if os(Windows)
+    /// 手机新建的项目是 `C:/…`（`URL.path`），worktree 与 Claude / Codex 报的 cwd 是 `C:\…`：
+    /// 同一个目录只能是一个项目，自动批准也按同一个写法认。
+    func testWindowsSpellingsOfOneDirectoryAreOneProject() async {
+        let store = makeStore()
+        await store.setAutoApprove(true, project: "c:/Users/me/proj/")
+        await store.reconcile(source: .claude,
+                              tasks: [task("main", path: "C:/Users/me/proj"),
+                                      task("wt", path: "C:\\Users\\me\\proj\\.claude\\worktrees\\8345fa")],
+                              projects: [project("C:/Users/me/proj"),
+                                         project("C:\\Users\\me\\proj\\.claude\\worktrees\\8345fa")])
+        let snapshot = await store.snapshot()
+        let byId = Dictionary(uniqueKeysWithValues: snapshot.tasks.map { ($0.id, $0) })
+        XCTAssertEqual(byId["claude:main"]?.projectPath, "C:\\Users\\me\\proj")
+        XCTAssertEqual(byId["claude:wt"]?.projectPath, "C:\\Users\\me\\proj")
+        XCTAssertEqual(byId["claude:wt"]?.worktreePath, "C:\\Users\\me\\proj\\.claude\\worktrees\\8345fa")
+        XCTAssertEqual(snapshot.projects.map(\.path), ["C:\\Users\\me\\proj"])
+        XCTAssertEqual(byId["claude:main"]?.autoApprove, true)
+        XCTAssertEqual(byId["claude:wt"]?.autoApprove, true)
+        let project = await store.autoApproveProject(forWorkingDirectory: "C:/Users/me/proj/.claude/worktrees/8345fa")
+        XCTAssertEqual(project, "C:\\Users\\me\\proj")
+    }
+    #endif
 
     func testOutsideProjectIsJudgedOnTheMainRepository() async {
         // 主仓库本身不算项目时（这里是主目录），worktree 里的会话同样算「不在项目中」。

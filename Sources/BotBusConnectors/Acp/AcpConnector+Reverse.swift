@@ -129,7 +129,7 @@ extension AcpConnector {
         loaded.remove(sessionId)
         sessions[sessionId] = state
         trimTranscripts(keeping: sessionId)
-        await store.claimLive(taskId)
+        await store.claimLive(taskId, ownerToken: liveOwnerToken)
         await store.upsert(sessions[sessionId]?.record ?? state.record)
     }
 
@@ -246,7 +246,7 @@ extension AcpConnector {
         trimTranscripts(keeping: sessionId)
         if let injection { await registry.bind(injection.token, taskId: taskId) }
         // 先写 running 再发 prompt：反过来的话，一轮若很快结束，收尾写的最终状态会被这里的 running 盖掉。
-        await store.claimLive(taskId)
+        await store.claimLive(taskId, ownerToken: liveOwnerToken)
         await publish(sessionId)
         guard reverseOwner[sessionId] == owner, reverseTurns[sessionId] == turn else {
             throw ConnectorError("电脑上的连接已断开，没能新建任务")

@@ -2,6 +2,8 @@
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(WinSDK)
+import WinSDK
 #endif
 import Foundation
 #if canImport(Network)
@@ -414,6 +416,7 @@ final class LocalHookServerTests: XCTestCase {
 
 /// 极简 HTTP 客户端。用裸 socket 而不是 URLSession：这些用例里有一半发的就是畸形请求，
 /// URLSession 会替我们"纠正"掉，测不到解析器。
+#if !os(Windows)
 private enum RawSocket {
     struct Failure: Error, Sendable { let message: String }
 
@@ -538,3 +541,103 @@ private enum RawSocket {
         return String(decoding: response, as: UTF8.self)
     }
 }
+#endif
+
+#if os(Windows)
+/// Windows 版的极简 HTTP 客户端（Winsock）。语义同上：发什么就是什么，不替调用方"纠正"请求。
+private enum RawSocket {
+    struct Failure: Error, Sendable { let message: String }
+
+    static let invalid = ~SOCKET(0)
+
+    static func roundTrip(_ pieces: [String], host: String, port: UInt16, halfClose: Bool,
+                          readTimeout: TimeInterval, connectTimeout: TimeInterval) throws -> String {
+        let descriptor = try connect(host: host, port: port, readTimeout: readTimeout, connectTimeout: connectTimeout)
+        defer { closesocket(descriptor) }
+        for (index, piece) in pieces.enumerated() {
+            if index > 0 { Thread.sleep(forTimeInterval: 0.1) }
+            try send(piece, on: descriptor)
+        }
+        if halfClose { shutdown(descriptor, SD_SEND) }
+        return readAll(descriptor)
+    }
+
+    static func sendAndClose(_ request: String, port: UInt16) throws {
+        let descriptor = try connect(host: "127.0.0.1", port: port, readTimeout: 5, connectTimeout: 2)
+        defer { closesocket(descriptor) }
+        try send(request, on: descriptor)
+    }
+
+    private static func connect(host: String, port: UInt16, readTimeout: TimeInterval,
+                                connectTimeout: TimeInterval) throws -> SOCKET {
+        var data = WSADATA()
+        _ = WSAStartup(0x0202, &data)
+        let descriptor = socket(AF_INET, SOCK_STREAM, Int32(IPPROTO_TCP.rawValue))
+        guard descriptor != invalid else { throw Failure(message: "socket() 失败") }
+        var address = sockaddr_in()
+        address.sin_family = ADDRESS_FAMILY(AF_INET)
+        address.sin_port = port.bigEndian
+        guard inet_pton(AF_INET, host, &address.sin_addr) == 1 else {
+            closesocket(descriptor)
+            throw Failure(message: "认不出地址 \(host)")
+        }
+        // 非阻塞 connect + select：连一个没人在听、也不回 RST 的地址时不用干等。
+        var nonBlocking: u_long = 1
+        ioctlsocket(descriptor, FIONBIO_, &nonBlocking)
+        let started = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                WinSDK.connect(descriptor, $0, Int32(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if started != 0 {
+            guard WSAGetLastError() == WSAEWOULDBLOCK else {
+                closesocket(descriptor)
+                throw Failure(message: "connect(\(host):\(port)) 失败 WSA \(WSAGetLastError())")
+            }
+            var watch = WSAPOLLFD(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+            let ready = WSAPoll(&watch, 1, Int32(connectTimeout * 1000))
+            guard ready > 0, watch.revents & Int16(POLLOUT) != 0 else {
+                closesocket(descriptor)
+                throw Failure(message: "connect(\(host):\(port)) 超时或被拒")
+            }
+        }
+        nonBlocking = 0
+        ioctlsocket(descriptor, FIONBIO_, &nonBlocking)
+        var milliseconds = DWORD(readTimeout * 1000)
+        _ = withUnsafePointer(to: &milliseconds) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 4) {
+                setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, $0, Int32(MemoryLayout<DWORD>.size))
+            }
+        }
+        return descriptor
+    }
+
+    /// `FIONBIO` 是个带类型转换的宏，没导进来：`_IOW('f', 126, u_long)`。
+    private static let FIONBIO_ = Int32(bitPattern: 0x8004_667E)
+
+    private static func send(_ text: String, on descriptor: SOCKET) throws {
+        let bytes = Array(text.utf8)
+        var offset = 0
+        while offset < bytes.count {
+            let written = bytes.withUnsafeBufferPointer { buffer in
+                buffer.baseAddress!.withMemoryRebound(to: CChar.self, capacity: bytes.count) {
+                    WinSDK.send(descriptor, $0 + offset, Int32(bytes.count - offset), 0)
+                }
+            }
+            guard written > 0 else { throw Failure(message: "send() 失败 WSA \(WSAGetLastError())") }
+            offset += Int(written)
+        }
+    }
+
+    private static func readAll(_ descriptor: SOCKET) -> String {
+        var response = Data()
+        var buffer = [CChar](repeating: 0, count: 4096)
+        while true {
+            let count = recv(descriptor, &buffer, Int32(buffer.count), 0)
+            if count <= 0 { break }
+            response.append(contentsOf: buffer[0..<Int(count)].map { UInt8(bitPattern: $0) })
+        }
+        return String(decoding: response, as: UTF8.self)
+    }
+}
+#endif

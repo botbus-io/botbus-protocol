@@ -71,7 +71,7 @@ public struct ManagedWorktree: Codable, Hashable, Sendable {
     /// 任务盖过章的工作目录可以直接传（连接器报的 cwd 与 BotBus 交给连接器的 worktree 目录都是真实路径）；
     /// 来路不明的目录先 `TranscriptFileRefs.realPath`，`WorktreeManager.worktree(containing:)` 就是这么做的。
     public func contains(_ directory: String) -> Bool {
-        directory == path || directory.hasPrefix(path + "/")
+        PlatformPath.same(directory, path) || PlatformPath.isInside(directory, root: path)
     }
 }
 

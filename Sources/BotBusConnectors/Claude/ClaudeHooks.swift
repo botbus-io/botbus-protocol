@@ -10,8 +10,14 @@ public struct ClaudePaths: Sendable {
         self.claudeHome = claudeHome
     }
 
+    /// Linux / Windows 上认 Claude Code 自己的 `CLAUDE_CONFIG_DIR`（后台进程拿得到用户的环境变量；Mac 的 GUI 进程拿不到，照旧）。
     public static var defaultClaudeHome: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
+        #if !canImport(Darwin)
+        if let custom = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], PlatformPath.isAbsolute(custom) {
+            return URL(fileURLWithPath: custom, isDirectory: true)
+        }
+        #endif
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
     }
 
     public var settingsFile: URL { claudeHome.appendingPathComponent("settings.json") }
@@ -36,10 +42,179 @@ public struct ClaudePaths: Sendable {
         "/usr/bin/claude",
     ]
 
+    /// 手机那一轮、终端接续与「在终端中打开」用的 `claude`：本机找得到的几份里版本最高的那份。
+    ///
+    /// 命令行装的常常几个月不升级，Claude 桌面 app 自带的那份跟着桌面 app 自动更新，所以谁新用谁，
+    /// 手机那一轮多半就和桌面 app 是同一版。两份的登录态是同一份（macOS 的钥匙串、其余平台的 `~/.claude`），
+    /// 换着用不用重新登录。版本一样时命令行装的优先。
     public static func detectClaudeBinary(fileManager: FileManager = .default) -> String? {
-        knownBinaries
-            .map { ($0 as NSString).expandingTildeInPath }
-            .first { fileManager.isExecutableFile(atPath: $0) }
+        newest(installedBinaries(fileManager: fileManager)) { version(ofBinary: $0, fileManager: fileManager) }
+    }
+
+    /// 本机找得到的 `claude`，命令行装的在前、Claude 桌面 app 自带的在后（版本一样时就按这个顺序挑）。
+    static func installedBinaries(fileManager: FileManager = .default) -> [String] {
+        var found: [String] = []
+        #if os(Windows)
+        // Windows：原生安装器的 `~\.local\bin\claude.exe` 优先，其次 npm 全局的 `claude.cmd`、winget、PATH（见 `AgentBinary`）；
+        // 桌面 app 自带的每个根（普通安装、Microsoft Store）各取最高的一份。
+        if let binary = AgentBinary.detect("claude", fileManager: fileManager) { found.append(binary) }
+        for root in desktopClaudeCodeRoots(fileManager: fileManager) {
+            if let binary = newestVersionedBinary(in: root, executable: "claude.exe", fileManager: fileManager) { found.append(binary) }
+        }
+        #else
+        // 原生安装器与 Homebrew 的固定位置优先；再按常见全局目录与 nvm 找（npm 全局装的 `claude` 也是原生程序，
+        // 不靠 node）。macOS 再加上 Claude 桌面 app 自带的那份。
+        if let known = knownBinaries.map({ ($0 as NSString).expandingTildeInPath })
+            .first(where: { fileManager.isExecutableFile(atPath: $0) }) {
+            found.append(known)
+        } else if let binary = AgentBinary.detect("claude", fileManager: fileManager) {
+            found.append(binary)
+        }
+        #if os(macOS)
+        if let desktop = newestVersionedBinary(in: desktopClaudeCodeRoot, executable: desktopClaudeCodeExecutable,
+                                               fileManager: fileManager) {
+            found.append(desktop)
+        }
+        #endif
+        #endif
+        return found
+    }
+
+    /// 几份里挑版本最高的；一样高时取排在前面的。读不出版本的排在读得出的后面——
+    /// 连 `--version` 都跑不起来的那份，多半也跑不了一轮对话。只有一份时不读版本。
+    static func newest(_ candidates: [String], version: (String) -> [Int]?) -> String? {
+        guard candidates.count > 1 else { return candidates.first }
+        var best: (path: String, version: [Int]?)?
+        for candidate in candidates {
+            let found = version(candidate)
+            guard let current = best else {
+                best = (candidate, found)
+                continue
+            }
+            guard let found else { continue }
+            if current.version.map({ $0.lexicographicallyPrecedes(found) }) ?? true { best = (candidate, found) }
+        }
+        return best?.path
+    }
+
+    /// `claude` 的版本号（`[2, 1, 286]`）。先从路径认（软链接解析到底）：原生安装器指向 `versions/<版本>`，
+    /// 桌面 app 自带的在 `claude-code/<版本>/…`，Homebrew cask 在 `Caskroom/claude-code/<版本>/`。
+    /// 认不出（npm 全局、Windows 的 `claude.exe`）再跑一次 `--version`，按路径、大小与修改时间记住，升级后自然重读。
+    static func version(ofBinary path: String, fileManager: FileManager = .default) -> [Int]? {
+        let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        if let version = versionInPath(resolved) { return version }
+        let attributes = try? fileManager.attributesOfItem(atPath: resolved)
+        let stamp = [resolved,
+                     (attributes?[.size] as? NSNumber)?.stringValue ?? "",
+                     (attributes?[.modificationDate] as? Date).map { String($0.timeIntervalSince1970) } ?? ""]
+            .joined(separator: "|")
+        if let cached = versionCache.withLock({ $0[stamp] }) { return cached }
+        // 跑原路径：Windows 上解析出来的路径形如 `/C:/…`，拿去起进程不可靠。
+        let version = runVersion(path)
+        versionCache.withLock { $0[stamp] = .some(version) }
+        return version
+    }
+
+    /// 跑过 `--version` 的结果（读不出也记，免得每次都多起一个进程）。
+    private static let versionCache = LockedValue<[String: [Int]?]>([:])
+
+    /// 路径末尾几段里离文件最近的一段 `X.Y.Z`。只看末尾几段：再往上是用户自己的目录，碰巧叫 `1.0.0` 也不算。
+    static func versionInPath(_ path: String) -> [Int]? {
+        let components = path.split(whereSeparator: { $0 == "/" || $0 == "\\" })
+        for component in components.suffix(6).reversed() {
+            if let version = parseVersion(component) { return version }
+        }
+        return nil
+    }
+
+    /// `2.1.286`、`2.1.286 (Claude Code)` → `[2, 1, 286]`；不是三段数字的不算。
+    static func parseVersion<S: StringProtocol>(_ text: S) -> [Int]? {
+        let token = text.split(separator: " ").first ?? ""
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) }
+        guard parts.count == 3, !parts.contains(nil) else { return nil }
+        return parts.compactMap { $0 }
+    }
+
+    private static func runVersion(_ binary: String) -> [Int]? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: binary)
+        process.arguments = ["--version"]
+        // 同 `ClaudeConnector.environment`：`environment = nil` 在 macOS 26 上是空环境。
+        process.environment = ProcessInfo.processInfo.environment
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        do { try process.run() } catch {
+            try? output.fileHandleForReading.close()
+            try? output.fileHandleForWriting.close()
+            return nil
+        }
+        let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3, execute: timeout)
+        let data = (try? output.fileHandleForReading.readToEnd()) ?? Data()
+        // 读完就关：Linux 的 Foundation 不会在 EOF 时替你关读端。
+        try? output.fileHandleForReading.close()
+        process.waitUntilExit()
+        timeout.cancel()
+        guard process.terminationStatus == 0 else { return nil }
+        return parseVersion(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    #if os(macOS)
+    /// Claude 桌面 app 把 Claude Code 解到 `~/Library/Application Support/Claude/claude-code/<版本>/<哈希>/claude.app`
+    ///（早先没有哈希那一层），每个版本一个目录，随桌面 app 自动更新。单独跑时用的是命令行那份登录（钥匙串里的
+    /// `Claude Code-credentials`），与桌面 app 自己的登录分开；没登录过要先用它 `claude auth login`。
+    static var desktopClaudeCodeRoot: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Claude/claude-code", isDirectory: true).path
+    }
+
+    static let desktopClaudeCodeExecutable = "claude.app/Contents/MacOS/claude"
+    #endif
+
+    #if os(Windows)
+    /// Claude 桌面 app 把 Claude Code 解到 `%APPDATA%\Claude\claude-code\<版本>\claude.exe`，每个版本一个目录
+    ///（像 Mac 那样再隔一层哈希目录也认）。
+    /// Microsoft Store（MSIX）版的 `%APPDATA%` 是虚拟化的，真实位置在 `%LOCALAPPDATA%\Packages\Claude_<发布者>\LocalCache\Roaming`。
+    /// 只装了桌面 app 的电脑靠它才有 `claude`；它的登录态与桌面 app 分开，没登录过要先用它 `claude auth login`。
+    static func desktopClaudeCodeRoots(fileManager: FileManager) -> [String] {
+        let environment = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let appData = environment["APPDATA"] ?? home + "\\AppData\\Roaming"
+        let localAppData = environment["LOCALAPPDATA"] ?? home + "\\AppData\\Local"
+        let packages = localAppData + "\\Packages"
+        let storeRoots = ((try? fileManager.contentsOfDirectory(atPath: packages)) ?? [])
+            .filter { $0.hasPrefix("Claude_") }
+            .sorted()
+            .map { packages + "\\" + $0 + "\\LocalCache\\Roaming\\Claude\\claude-code" }
+        return [appData + "\\Claude\\claude-code"] + storeRoots
+    }
+    #endif
+
+    /// `root` 下按版本号命名的子目录（`2.1.284`）里，挑版本最高、带 `executable` 的那个。名字不是点分数字的目录不算。
+    ///
+    /// 版本目录里可以直接是 `executable`，也可以再隔一层哈希目录（桌面 app 2.1.28x 起是
+    /// `<版本>/<哈希>/claude.app/…`）；同一版本有几个哈希目录时取 `executable` 修改时间最新的。
+    static func newestVersionedBinary(in root: String, executable: String, fileManager: FileManager = .default) -> String? {
+        let versions = ((try? fileManager.contentsOfDirectory(atPath: root)) ?? []).compactMap { name -> (name: String, parts: [Int])? in
+            let parts = name.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) }
+            guard !parts.contains(nil) else { return nil }
+            return (name, parts.compactMap { $0 })
+        }
+        for version in versions.sorted(by: { $1.parts.lexicographicallyPrecedes($0.parts) }) {
+            let directory = (root as NSString).appendingPathComponent(version.name)
+            let direct = (directory as NSString).appendingPathComponent(executable)
+            if PlatformPath.isExecutableFile(direct, fileManager: fileManager) { return direct }
+            let hashed = ((try? fileManager.contentsOfDirectory(atPath: directory)) ?? [])
+                .map { ((directory as NSString).appendingPathComponent($0) as NSString).appendingPathComponent(executable) }
+                .filter { PlatformPath.isExecutableFile($0, fileManager: fileManager) }
+            let modified = { (path: String) in
+                (try? fileManager.attributesOfItem(atPath: path)[.modificationDate] as? Date) ?? .distantPast
+            }
+            if let newest = hashed.max(by: { modified($0) < modified($1) }) { return newest }
+        }
+        return nil
     }
 }
 

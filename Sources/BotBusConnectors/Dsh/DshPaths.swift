@@ -68,7 +68,7 @@ public struct DshInstallation: Hashable, Sendable {
     public var executable: String
     /// 放在子命令之前的参数：`.npxCache` 是 `[<package>/lib/bin.js]`，`.binary` 为空。
     public var leadingArguments: [String]
-    /// npx 缓存里包的版本（`package.json` 的 `version`）；`.binary` 不读，为 nil。
+    /// npx 包或桌面 app 的版本；普通 PATH 包装器不读，为 nil。
     public var version: String?
     /// 跑内嵌 node 脚本（解 transcript）用的 node；找不到够新的就是 nil，那时只能靠 web 读记录。
     public var node: String?
@@ -94,20 +94,27 @@ public struct DshInstallation: Hashable, Sendable {
 }
 
 extension DshPaths {
-    /// 本机的 dsh：先 `AgentBinary.detect("dsh")`（常见 bin 目录与 nvm），找不到再去 npx 缓存挑最高版本。
+    /// 本机的 dsh：优先桌面版随包 CLI（与桌面日志版本一致），再 `AgentBinary.detect("dsh")`，最后 npx 缓存。
     /// 会读盘，`.binary` 时还可能跑几次 `node --version`（挑 node），别在主线程上反复调。
     ///
     /// - Parameters:
     ///   - locate: 找 PATH 类目录里的可执行文件（测试注入）。
     ///   - npxRoot: npx 缓存根（`~/.npm/_npx`）。
+    ///   - desktopBundles: 候选桌面 app；测试传空数组，不读取本机安装。
     ///   - nodeVersion: 问一个 node 的版本（测试注入；默认跑 `<node> --version`，3 秒超时）。
     public static func detectInstallation(
         locate: (String) -> String? = { AgentBinary.detect($0) },
         npxRoot: URL = defaultNpxRoot,
+        desktopBundles: [URL] = defaultDesktopBundles,
         nodeCandidates: [String] = defaultNodeCandidates(),
         nodeVersion: (String) -> DshVersion? = cachedNodeVersion,
         fileManager: FileManager = .default
     ) -> DshInstallation? {
+        if !desktopBundles.isEmpty,
+           let desktop = DshDesktopInstallation.detect(bundles: desktopBundles,
+               node: selectNode(from: nodeCandidates, version: nodeVersion, fileManager: fileManager), fileManager: fileManager) {
+            return desktop
+        }
         if let binary = locate("dsh") {
             // 脚本旁边的 node 优先（npm 全局装时几乎总在同一个 bin 目录），再按常见位置找。
             let beside = AgentBinary.pathDirectories(for: binary).map { ($0 as NSString).appendingPathComponent("node") }
@@ -126,6 +133,8 @@ extension DshPaths {
     public static var defaultNpxRoot: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".npm/_npx", isDirectory: true)
     }
+
+    public static var defaultDesktopBundles: [URL] { DshDesktopInstallation.defaultBundles }
 
     /// npx 缓存里的一份 dsh 包。
     public struct NpxPackage: Hashable, Sendable {
@@ -182,7 +191,7 @@ extension DshPaths {
         return version
     }
 
-    private static let nodeVersionMemo = DshLockedValue<[String: DshVersion?]>([:])
+    private static let nodeVersionMemo = LockedValue<[String: DshVersion?]>([:])
 
     /// 跑 `<node> --version`（`v24.1.0`），3 秒超时。失败返回 nil。
     public static let probeNodeVersion: @Sendable (String) -> DshVersion? = { node in
@@ -240,8 +249,8 @@ public final class DshInstallationProbe: @unchecked Sendable {
     }
 }
 
-/// 加锁的一个值（本文件里的静态缓存用）。
-final class DshLockedValue<Value>: @unchecked Sendable {
+/// 加锁的一个值（本包里的静态缓存用：dsh 的探测、`ClaudePaths` 的版本号）。
+final class LockedValue<Value>: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Value
 

@@ -33,7 +33,13 @@ public actor ClaudeConnector: TaskConnector {
     static let maxSessions = 200
     /// 等 `claude -p` 吐出 `system/init`（里面才有 session id）的上限。
     /// 命令回执只表示"后端已接受"，不该为了它等一整轮。
+    /// Windows 上放宽到 60 秒：只装了 Claude 桌面版的电脑用它自带的 claude.exe，桌面版同时开着一堆会话时，
+    /// 从起进程到 init 实测要 15–20 秒（4 核虚拟机，含 SessionStart hook），20 秒的上限会让手机上的新任务白白失败。
+    #if os(Windows)
+    static let sessionIDTimeout: TimeInterval = 60
+    #else
     static let sessionIDTimeout: TimeInterval = 20
+    #endif
     /// `claude` 一行 init 都没吐就退出了（参数不认、没登录……）。新建时认它来决定要不要去掉 `--name` 重起。
     static let exitedWithoutSessionID = ConnectorError("claude 退出了，没有拿到 session id")
     /// 标题上限，对齐协议里 Claude 取首条 prompt 截断 80 字。
@@ -103,7 +109,10 @@ public actor ClaudeConnector: TaskConnector {
     private let paths: ClaudePaths
     private let binary: @Sendable () -> String?
     /// 本机 `claude --help` 认的强度；nil = CLI 不可用，不报 models。
-    private let supportedEfforts: [String]?
+    private var supportedEfforts: [String]?
+    /// `supportedEfforts` 是哪一份 claude 报的（软链接解析到底的路径）。挑中的那份换了（升级、桌面 app
+    /// 更新了自带的那份）就重读一次，见 `refreshSupportedEfforts`。
+    private var effortsBinary: String?
     private let now: @Sendable () -> Date
     private let tools: @Sendable () -> AgentToolsConfiguration?
     private let registry: TaskContextRegistry
@@ -164,6 +173,10 @@ public actor ClaudeConnector: TaskConnector {
         var sessionID: String
         var asked: ClaudeAskedQuestions
     }
+    /// 手机那一轮里超时收掉的卡片，按 requestId。手机上的旧卡片晚一步点到时改发续聊（`answerLate`），
+    /// 最多留 `lateRequestLimit` 条。电脑上的会话超时后卡片本来就留着，不记在这里。
+    private var lateRequests: [String: ClaudeLateRequest] = [:]
+    static let lateRequestLimit = 64
     /// 我们自己起的子进程，`interrupt` 要靠它发 SIGINT。桌面上用户自己开的会话不在这里。
     private var ownProcesses: [String: Process] = [:]
     /// 自己那一轮还在跑时到达的续聊，按 session 排队；上一轮结束（`finish`）后依次 `--resume`。
@@ -218,7 +231,9 @@ public actor ClaudeConnector: TaskConnector {
         self.store = store
         self.paths = paths
         self.binary = binary
-        self.supportedEfforts = ClaudeModels.efforts(forBinary: binary())
+        let executable = binary()
+        self.supportedEfforts = ClaudeModels.efforts(forBinary: executable)
+        self.effortsBinary = executable.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
         self.now = now
         self.tools = tools
         self.registry = registry
@@ -250,6 +265,19 @@ public actor ClaudeConnector: TaskConnector {
         titleRefreshes.removeAll()
         turnEndCheck?.cancel()
         turnEndCheck = nil
+    }
+
+    /// 手机发起新一轮之前看一眼挑中的 claude 换没换：换了就重读它认的强度，变了下一次 `publish` 补发快照。
+    /// 没换时只是找一遍可执行文件（版本号有缓存），不起进程。
+    private func refreshSupportedEfforts() {
+        let executable = binary()
+        let resolved = executable.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
+        guard resolved != effortsBinary else { return }
+        effortsBinary = resolved
+        let efforts = ClaudeModels.efforts(forBinary: executable)
+        guard efforts != supportedEfforts else { return }
+        supportedEfforts = efforts
+        if store.connectors.setModels(modelOptions, for: .claude) { modelsChanged = true }
     }
 
     /// 见到一个完整模型名：版本比记着的新就更新手机上的模型列表，下一次 `publish` 补发快照。
@@ -468,12 +496,26 @@ public actor ClaudeConnector: TaskConnector {
     }
 
     /// 控制协议里等太久的审批：按拒绝回，卡片收掉，这一轮接着跑（Claude 会说没拿到许可）。
+    /// 卡片记进 `lateRequests`：手机上的旧卡片晚一步点到时改发续聊。
     private func expire(_ requestID: String, token: UUID) async {
         guard let hold = holds[requestID], hold.token == token else { return }
         holds.removeValue(forKey: requestID)
         questionHolds.removeValue(forKey: requestID)
         hold.release("手机上一直没有回应，这次没有执行")
+        if let session = sessions.values.first(where: { $0.pendingRequest?.id == requestID }),
+           let request = session.pendingRequest {
+            rememberLate(ClaudeLateRequest(sessionID: session.sessionID, request: request, transcriptPath: nil,
+                                           since: now()), for: requestID)
+        }
         if settle(requestID) { await publish() }
+    }
+
+    private func rememberLate(_ late: ClaudeLateRequest, for requestID: String) {
+        lateRequests[requestID] = late
+        while lateRequests.count > Self.lateRequestLimit,
+              let oldest = lateRequests.min(by: { $0.value.since < $1.value.since })?.key {
+            lateRequests.removeValue(forKey: oldest)
+        }
     }
 
     /// 挂着 `requestID` 的会话收掉卡片、回到运行中。没有这样的会话返回 false。
@@ -852,6 +894,7 @@ public actor ClaudeConnector: TaskConnector {
     public func start(projectPath: String, prompt: String, images: [URL],
                       selection: ModelSelection) async throws -> ConnectorOutcome {
         // 先查模型、再读图：不对就别起进程，也别签 token。
+        refreshSupportedEfforts()
         let chosen = try Self.resolve(selection, current: nil, options: modelOptions ?? [])
         let input = try Self.stdinMessage(prompt: prompt, images: images)
         let injection = await AgentToolsInjection.make(tools(), registry: registry)
@@ -897,6 +940,7 @@ public actor ClaudeConnector: TaskConnector {
     public func followUp(taskId: String, prompt: String, images: [URL],
                          selection: ModelSelection) async throws -> ConnectorOutcome {
         let sessionID = try nativeID(taskId)
+        refreshSupportedEfforts()
         var chosen = (model: sessions[sessionID]?.chosenModel, effort: sessions[sessionID]?.chosenEffort)
         if !selection.isEmpty {
             chosen = try Self.resolve(selection, current: sessions[sessionID], options: modelOptions ?? [])
@@ -991,30 +1035,17 @@ public actor ClaudeConnector: TaskConnector {
             }
             guard await answerQuestion(requestId, sessionID: sessionID, with: reply) else {
                 // hook 已超时，Claude Code 回落到了电脑上的提问框。
-                // 把选好的答案当续聊消息发过去：Claude 从历史里能看到问了什么。
-                if decision != .deny {
-                    let text = asked.claudeAnswers(answers ?? [:]).values.joined(separator: "\n")
-                    if !text.isEmpty {
-                        return try await followUp(taskId: taskId, prompt: text, images: [])
-                    }
-                }
-                // 跳过的话没什么好发，把卡片收掉就行。
-                if var session = sessions[sessionID], session.pendingRequest?.id == requestId {
-                    session.pendingRequest = nil
-                    sessions[sessionID] = session
-                    await publish()
-                }
-                return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
+                return try await answerLate(taskId: taskId, requestId: requestId, decision: decision, answers: answers)
             }
             return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
         }
-        // 电脑上的会话：挂起的 hook 过了时限，Claude Code 已经回落到自己的弹窗。
-        // 手机那一轮：超时已按拒绝回，或者这一轮已经结束。
-        let expired = ConnectorError(isOwnTurn(sessionID) ? "这条审批已经过期" : "这条审批已经过期，请在电脑上处理")
-        guard let hold = holds.removeValue(forKey: requestId) else { throw expired }
         let allow = decision == .allow
-        // hold 对象还在字典里但已超时（清理任务还差零点几秒）或进程已退出：回答送不出去了。
-        guard hold.answer(allow ? .allow(updatedInput: nil) : .deny(message: "用户在手机上拒绝了")) else { throw expired }
+        // hold 已经不在（hook 到了时限、手机那一轮超时已按拒绝回），或者还在字典里但送不出去了
+        // （Claude Code 掐掉了 hook、清理任务还差零点几秒、进程已退出）。
+        guard let hold = holds.removeValue(forKey: requestId),
+              hold.answer(allow ? .allow(updatedInput: nil) : .deny(message: "用户在手机上拒绝了")) else {
+            return try await answerLate(taskId: taskId, requestId: requestId, decision: decision, answers: answers)
+        }
         apply(ClaudeHookEvent.synthetic(kind: .userPromptSubmit, sessionID: sessionID,
                                         cwd: sessions[sessionID]?.projectPath ?? "")) { session, _ in
             session.pendingRequest = nil
@@ -1023,6 +1054,39 @@ public actor ClaudeConnector: TaskConnector {
         }
         await publish()
         return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
+    }
+
+    /// 回答已经送不到了的审批 / 提问：手机上不报错，批准与选好的答案改成一条续聊发过去——Claude 从历史里
+    /// 看得到要做什么、问了什么；拒绝 / 跳过只收掉卡片（手机那一轮超时已按拒绝回过，电脑上的权限框还开着）。
+    /// 认得出的只有两种：会话上还挂着这张卡片（电脑上的会话超时后卡片留着），或手机那一轮超时时记下的。
+    /// 电脑上的会话先看 transcript：已经在电脑上批过或拒过的不再发。
+    private func answerLate(taskId: String, requestId: String, decision: Command.Approve.Decision,
+                            answers: [String: [String]]?) async throws -> ConnectorOutcome {
+        let sessionID = try nativeID(taskId)
+        var late = lateRequests[requestId]
+        if let session = sessions[sessionID], let request = session.pendingRequest, request.id == requestId {
+            late = ClaudeLateRequest(sessionID: sessionID, request: request,
+                                     transcriptPath: isOwnTurn(sessionID) ? nil : session.transcriptPath, since: now())
+        }
+        guard let late else { throw ConnectorError("这条审批已经处理过了") }
+        // 先算好再动状态：提问一个都没选时报错，卡片留着让人重选。
+        let prompt = try late.followUp(decision: decision, answers: answers)
+        // 读文件之前就收掉，免得等的时候同一张卡片又被点一次、发两遍。
+        lateRequests.removeValue(forKey: requestId)
+        questionHolds.removeValue(forKey: requestId)
+        if var session = sessions[late.sessionID], session.pendingRequest?.id == requestId {
+            session.pendingRequest = nil
+            sessions[late.sessionID] = session
+        }
+        await publish()
+        if let path = late.transcriptPath,
+           await Task.detached(priority: .userInitiated, operation: {
+               ClaudeSessionHistory.hasToolResult(for: requestId, inTranscriptAt: path)
+           }).value {
+            throw ConnectorError("这条请求已经在电脑上处理过了")
+        }
+        guard let prompt else { return ConnectorOutcome(taskId: late.sessionID, retainsLiveOwnership: true) }
+        return try await followUp(taskId: taskId, prompt: prompt, images: [])
     }
 
     /// 把回答交给挂着的 AskUserQuestion。已经超时（Claude Code 回落到电脑上的提问框）返回 false。
@@ -1045,7 +1109,7 @@ public actor ClaudeConnector: TaskConnector {
             // 桌面上用户自己开的会话不是我们的子进程，发不了信号。
             throw ConnectorError("这个会话是在电脑上启动的，只能在电脑上中断")
         }
-        kill(process.processIdentifier, SIGINT)
+        PlatformProcess.interrupt(process.processIdentifier)
         // 中断就是不要了：排在后面的续聊一并作废，不在这一轮退出后又自己跑起来。
         queued.removeValue(forKey: sessionID)
         if let session = sessions[sessionID] { releaseHold(for: session) }

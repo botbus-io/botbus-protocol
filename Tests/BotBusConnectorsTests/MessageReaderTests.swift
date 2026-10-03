@@ -66,13 +66,13 @@ final class MessageReaderTests: XCTestCase {
 
     func testCodexUserMessageCollectsLocalAndInlineImages() throws {
         let json = """
-            {"content":[{"type":"text","text":"看"},{"type":"localImage","path":"/tmp/x.png","detail":null},\
+            {"content":[{"type":"text","text":"看"},{"type":"localImage","path":"\(sampleImageJSON)","detail":null},\
             {"type":"image","url":"\(TestImage.pngDataURL)","detail":null}]}
             """
         let entry = try XCTUnwrap(CodexMessageReader.entry(from: codexRow("userMessage", json)))
         XCTAssertEqual(entry.message.role, .user)
         XCTAssertEqual(entry.message.text, "看")
-        XCTAssertEqual(entry.images, [.file(URL(fileURLWithPath: "/tmp/x.png")), .data(TestImage.png, contentType: "image/png")])
+        XCTAssertEqual(entry.images, [.file(URL(fileURLWithPath: sampleImagePath)), .data(TestImage.png, contentType: "image/png")])
         XCTAssertEqual(entry.pathCandidates, [])
         XCTAssertNil(entry.message.attachments, "附件由 uploader 填，读取器不碰")
     }
@@ -80,9 +80,9 @@ final class MessageReaderTests: XCTestCase {
     /// 只发了一张图、没打字：2.9 起也是一条对话，正文为空串。
     func testCodexImageOnlyUserMessageIsKept() throws {
         let entry = try XCTUnwrap(CodexMessageReader.entry(from: codexRow(
-            "userMessage", #"{"content":[{"type":"localImage","path":"/tmp/x.png"}]}"#)))
+            "userMessage", #"{"content":[{"type":"localImage","path":"\#(sampleImageJSON)"}]}"#)))
         XCTAssertEqual(entry.message.text, "")
-        XCTAssertEqual(entry.images, [.file(URL(fileURLWithPath: "/tmp/x.png"))])
+        XCTAssertEqual(entry.images, [.file(URL(fileURLWithPath: sampleImagePath))])
     }
 
     func testCodexImageGenerationIsAnAgentImage() throws {

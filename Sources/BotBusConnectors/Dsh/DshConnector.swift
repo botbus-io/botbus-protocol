@@ -9,13 +9,13 @@ import BotBusProtocol
 import BotBusConnectorKit
 
 /// DeepSeek Harness（协议 3.1，一档来源 `dsh`）的连接器：BotBus 自己的活走 `dsh --profile acp` 子进程
-///（`AcpConnector`，身份 `.builtin(.dsh)`），电脑上的会话经用户开着的 `dsh web` 的内部接口看见、也经它控制；
+///（`AcpConnector`，身份 `.builtin(.dsh)`），电脑上的会话经桌面版或 `dsh web` 的内部接口看见、也经它控制；
 /// web 不在时扫 `~/.dsh/sessions`（`DshSessionScanner`）。spec「控制」一表：
 ///
 /// | 操作 | 走哪条 |
 /// |---|---|
 /// | 新建 | 一律 ACP（带 botbus MCP 与审批）；没有可执行文件时报错 |
-/// | 续聊 | 会话在我们的 ACP 进程里 → ACP；否则 web 连着 → web `session/prompt`（不带 botbus 工具）；都不是 → ACP `session/resume`，撞锁时 web 连得上就改走 web，否则报错 |
+/// | 续聊 | 会话在我们的 ACP 进程里 → ACP；否则 web 连着 → web `session/prompt`（带任务专用 CLI 管道）；都不是 → ACP `session/resume`，撞锁时 web 连得上就改走 web，否则报错 |
 /// | 审批 / 提问 | 我们的 ACP 这一轮挂着的 → ACP；web 的 waterfall 挂着的 → `$events/result`（按最近一条 waterfall 的 eventId） |
 /// | 中断 | ACP `session/cancel` 或 web `session/cancel` |
 ///
@@ -27,7 +27,7 @@ import BotBusConnectorKit
 /// **只 follow web 已经在跑的会话**：`session/follow` 会让 web 载入并一直锁住会话，之后 ACP 的 resume 必撞锁。
 /// 只读历史走读盘或 `session/page`（`DshMessageReader`）。
 ///
-/// **只连用我们主目录的 web**（`DshWebLocator` 按 `DSH_HOME` 过滤），别的主目录的实例一概不碰。依赖的是 dsh 0.1.5-rc 的内部接口，
+/// **只连用我们主目录的服务**（`DshWebLocator` 按 `DSH_HOME` 过滤），别的主目录的实例一概不碰。依赖的是 dsh 0.1.5-rc web / 0.2.0-rc 桌面的内部接口，
 /// 升级可能要跟着改：连不上就退回扫盘，不会弄坏 dsh。
 public actor DshConnector: TaskConnector {
     public nonisolated var kind: ConnectorKind { .dsh }
@@ -78,12 +78,17 @@ public actor DshConnector: TaskConnector {
         let client: DshWebClient
         let mux: DshWebMux
         let clientId: String
+        let isDesktopHost: Bool
     }
 
     public nonisolated let paths: DshPaths
     /// BotBus 自己的活。测试与读取器要直接问它（`completeTranscript`）。
     let acp: AcpConnector
     private let store: TaskStore
+    private let tools: @Sendable () -> AgentToolsConfiguration?
+    private let registry: TaskContextRegistry
+    private var toolsContexts: [String: DshToolsContext] = [:]
+    private var toolsContextGeneration = 0
     private let installation: @Sendable () -> DshInstallation?
     private let http: any DshHTTPTransport
     private let webSocket: any WebSocketTransport
@@ -111,6 +116,13 @@ public actor DshConnector: TaskConnector {
     private var nextConnectAttempt: Date = .distantPast
     /// web 拒绝了登录（或读不到签名密钥）：健康状态里说清楚。
     private var webAuthProblem: String?
+    private struct DesktopHandoff {
+        let cwd: String
+        var nextAttempt = Date.distantPast
+    }
+    /// 仅本连接器新建的会话，首轮空闲后交给桌面工作区。失败不影响手机任务，延后重试。
+    private var desktopHandoffs: [String: DesktopHandoff] = [:]
+    private var handingOff: Set<String> = []
 
     // 扫盘
     private var scanned: [String: DshSessionSummary]?
@@ -125,6 +137,7 @@ public actor DshConnector: TaskConnector {
     private var settleTimers: [String: Task<Void, Never>] = [:]
     /// 本连接器 `claimLive` 过、还没交还的任务 id。
     private var claimed: Set<String> = []
+    private let liveOwnerToken = UUID()
 
     // 对账与健康
     private var hasBaseline = false
@@ -150,6 +163,8 @@ public actor DshConnector: TaskConnector {
                 timing: Timing = Timing(),
                 onHealth: @escaping HealthHandler = { _, _ in }) {
         self.store = store
+        self.tools = tools
+        self.registry = registry
         self.paths = paths
         self.installation = installation
         self.http = http
@@ -170,7 +185,8 @@ public actor DshConnector: TaskConnector {
         self.acp = AcpConnector(
             spec: Self.acpSpec(installation(), paths: paths), identity: DshTaskMapping.identity, store: store,
             launcher: launcher, tools: tools, registry: registry, archive: archive, clientVersion: clientVersion,
-            now: now,
+            // 空闲检查仍保护轮次、命令与载入；全部结束后立即释放写锁，供桌面接聊。
+            idleTimeout: 0, now: now,
             onHealth: { _, status, message, _ in await relay.connector?.acpHealthChanged(status, message) },
             onTasksChanged: { await relay.connector?.reconcile() })
         relay.connector = self
@@ -194,6 +210,8 @@ public actor DshConnector: TaskConnector {
     public func stop() async {
         loop?.cancel()
         loop = nil
+        await closeToolsContexts()
+        desktopHandoffs.removeAll()
         await dropWeb()
         hasBaseline = false
         scanned = nil
@@ -203,14 +221,17 @@ public actor DshConnector: TaskConnector {
 
     /// 解除配对或被接管：只关 BotBus 拉起的 ACP 子进程，观察照旧。
     public func stopSubprocesses() async {
+        await closeToolsContexts()
         await acp.stopSubprocess()
     }
 
     /// App 退出：不可逆，之后迟到的命令拉不起进程。
     public func shutdown() async {
         isShutDown = true
+        desktopHandoffs.removeAll()
         loop?.cancel()
         loop = nil
+        await closeToolsContexts()
         await dropWeb()
         await acp.shutdown()
     }
@@ -246,6 +267,7 @@ public actor DshConnector: TaskConnector {
             }
             if web != nil, now().timeIntervalSince(lastListRefresh) >= timing.listRefresh { await refreshWebList() }
         }
+        await handOffNewSessionsToDesktop()
         if web == nil {
             await scanDisk()
             await reconcile()
@@ -268,7 +290,38 @@ public actor DshConnector: TaskConnector {
         guard await syncAcpSpec() else {
             throw ConnectorError("本机没找到 DeepSeek Harness 的可执行文件（dsh），没法从手机新建任务")
         }
-        return try await acp.start(projectPath: projectPath, prompt: prompt, images: [])
+        // 桌面工作区以 realpath 存目录，adopt 严格比较 session header 的 cwd；两端必须使用同一写法。
+        let cwd = TranscriptFileRefs.realPath(projectPath) ?? projectPath
+        let outcome = try await acp.start(projectPath: cwd, prompt: prompt, images: [])
+        if loop != nil, !isShutDown {
+            desktopHandoffs[try Self.sessionId(outcome.taskId)] = DesktopHandoff(cwd: cwd)
+        }
+        return outcome
+    }
+
+    private func handOffNewSessionsToDesktop() async {
+        guard let link = web, link.isDesktopHost, loop != nil, !isShutDown else { return }
+        for (sessionId, handoff) in desktopHandoffs {
+            guard !handingOff.contains(sessionId), now() >= handoff.nextAttempt else { continue }
+            let taskId = DshTaskMapping.identity.taskId(sessionId: sessionId)
+            guard await acp.isInProcess(taskId: taskId) == false else { continue }
+            guard await store.task(id: taskId) != nil else {
+                desktopHandoffs.removeValue(forKey: sessionId)
+                continue
+            }
+            guard web?.generation == link.generation, loop != nil, !isShutDown else { return }
+            guard handingOff.insert(sessionId).inserted else { continue }
+            desktopHandoffs[sessionId]?.nextAttempt = now().addingTimeInterval(timing.authRetry)
+            do {
+                try await link.client.adoptSession(sessionId: sessionId, cwd: handoff.cwd)
+                desktopHandoffs.removeValue(forKey: sessionId)
+                if web?.generation == link.generation { await refreshWebList() }
+            } catch {
+                let category = (error as? DshWebError)?.logCategory ?? "transport"
+                Self.log.debug("desktop handoff failed: \(category, privacy: .public)")
+            }
+            handingOff.remove(sessionId)
+        }
     }
 
     public func followUp(taskId: String, prompt: String, images: [URL]) async throws -> ConnectorOutcome {
@@ -355,7 +408,13 @@ public actor DshConnector: TaskConnector {
                                  link: WebLink) async throws -> ConnectorOutcome {
         let accepted: Bool
         do {
-            accepted = try await link.client.prompt(sessionId: sessionId, text: prompt)
+            let generation = toolsContextGeneration
+            let context = try await toolsContext(for: taskId)
+            guard generation == toolsContextGeneration, web?.generation == link.generation else {
+                throw DshWebError.disconnected
+            }
+            accepted = try await link.client.prompt(sessionId: sessionId, text: context?.prompt(prompt) ?? prompt,
+                requestId: (context == nil ? "botbus-" : DshToolsContext.requestPrefix) + UUID().uuidString)
         } catch {
             throw Self.webFailure(error)
         }
@@ -375,6 +434,38 @@ public actor DshConnector: TaskConnector {
         }
         await publishLive(sessionId)
         return ConnectorOutcome(taskId: taskId, retainsLiveOwnership: isLive(sessionId))
+    }
+
+    private func toolsContext(for taskId: String) async throws -> DshToolsContext? {
+        #if os(Windows)
+        return nil
+        #else
+        let generation = toolsContextGeneration
+        guard let configuration = tools(), configuration.isUsable else { return nil }
+        let token = await registry.issue(for: taskId)
+        let injection = AgentToolsInjection(configuration: configuration, token: token)
+        guard !isShutDown, loop != nil, generation == toolsContextGeneration else { throw DshWebError.disconnected }
+        if let existing = toolsContexts[taskId], existing.configuration == injection.configuration,
+           existing.token == injection.token { return existing }
+        if let existing = toolsContexts.removeValue(forKey: taskId) { await existing.shutdown() }
+        guard !isShutDown, loop != nil, generation == toolsContextGeneration else { throw DshWebError.disconnected }
+        if toolsContexts.count >= TaskContextRegistry.maxTokens, let oldest = toolsContexts.keys.first,
+           let context = toolsContexts.removeValue(forKey: oldest) { await context.shutdown() }
+        guard !isShutDown, loop != nil, generation == toolsContextGeneration else { throw DshWebError.disconnected }
+        // shutdown 会让出 actor；另一条续聊可能已为同一凭据补建管道。
+        if let existing = toolsContexts[taskId], existing.configuration == injection.configuration,
+           existing.token == injection.token { return existing }
+        let context = try DshToolsContext(injection: injection)
+        toolsContexts[taskId] = context
+        return context
+        #endif
+    }
+
+    private func closeToolsContexts() async {
+        toolsContextGeneration += 1
+        let contexts = toolsContexts.values
+        toolsContexts.removeAll()
+        for context in contexts { await context.shutdown() }
     }
 
     private func answerWaterfall(_ waterfall: DshWaterfall, link: WebLink, allow: Bool? = nil,
@@ -398,10 +489,12 @@ public actor DshConnector: TaskConnector {
 
     // MARK: - 对话记录
 
-    /// `DshMessageReader` 的实现：内存里齐全的（BotBus 本次建的会话）→ 读盘 → web 的 `session/page`（不激活会话）。
+    /// `DshMessageReader` 的实现：ACP 仍拥有且内存里齐全的 → 读盘 → web 的 `session/page`（不激活会话）。
     func transcript(taskId: String, limit: Int) async throws -> (entries: [TranscriptEntry], hasMore: Bool) {
         let sessionId = try Self.sessionId(taskId)
-        if let complete = await acp.completeTranscript(taskId: taskId, limit: limit) { return complete }
+        // 交还写锁后桌面可能已经续聊，内存里的“完整”记录不再代表最新历史。
+        if await acp.isInProcess(taskId: taskId),
+           let complete = await acp.completeTranscript(taskId: taskId, limit: limit) { return complete }
         var failure: Error?
         if let file = logFile(for: sessionId) {
             do {
@@ -483,7 +576,7 @@ public actor DshConnector: TaskConnector {
         var unauthorized = false
         for instance in instances {
             for endpoint in instance.endpoints {
-                switch await attach(endpoint: endpoint, pid: instance.pid, secret: secret) {
+                switch await attach(endpoint: endpoint, pid: instance.pid, isDesktopHost: instance.isDesktopHost, secret: secret) {
                 case .connected:
                     webAuthProblem = nil
                     return
@@ -502,7 +595,7 @@ public actor DshConnector: TaskConnector {
     private enum AttachResult { case connected, unauthorized, failed }
 
     /// 握手、订 `$events`、等 `ready`、拉一次列表。失败就关掉这条 mux。
-    private func attach(endpoint: DshWebEndpoint, pid: Int32, secret: SymmetricKey) async -> AttachResult {
+    private func attach(endpoint: DshWebEndpoint, pid: Int32, isDesktopHost: Bool, secret: SymmetricKey) async -> AttachResult {
         let client = DshWebClient(endpoint: endpoint, secret: secret, http: http, now: now)
         let mux = DshWebMux(client: client, transport: webSocket)
         do {
@@ -535,7 +628,7 @@ public actor DshConnector: TaskConnector {
             return .failed
         }
         // 先记下连接再拉列表：期间到的 status / waterfall 照常处理，列表随后按最新的覆盖。
-        web = WebLink(generation: generation, pid: pid, client: client, mux: mux, clientId: clientId)
+        web = WebLink(generation: generation, pid: pid, client: client, mux: mux, clientId: clientId, isDesktopHost: isDesktopHost)
         await mux.setOnClose { [weak self] in await self?.webLost(generation: generation) }
         let list: [DshWebSessionSummary]
         do {
@@ -701,7 +794,7 @@ public actor DshConnector: TaskConnector {
 
     private func release(_ ids: Set<String>) async {
         // 期间又连上了 web、重新认领了的，归新连接管。
-        for id in ids where !claimed.contains(id) { await store.releaseLive(id) }
+        for id in ids where !claimed.contains(id) { await store.releaseLive(id, ownerToken: liveOwnerToken) }
     }
 
     // MARK: - follow
@@ -828,7 +921,7 @@ public actor DshConnector: TaskConnector {
         }
         await publishLive(sessionId)
         claimed.remove(taskId)
-        await store.releaseLive(taskId)
+        await store.releaseLive(taskId, ownerToken: liveOwnerToken)
         await reconcile()
     }
 
@@ -860,7 +953,7 @@ public actor DshConnector: TaskConnector {
         guard web?.generation == generation else { return }
         if !claimed.contains(taskId) {
             claimed.insert(taskId)
-            await store.claimLive(taskId)
+            await store.claimLive(taskId, ownerToken: liveOwnerToken)
         }
         // 记录在最后一个 await 之后才定稿、随即写入：同一个会话可能有几次发布交错（snapshot 的这次还在认领，
         // 收尾那次已经写完交还了），先算好的旧记录晚到就会盖掉最终状态。交还了（收尾、web 断了）就不再写。

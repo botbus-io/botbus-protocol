@@ -129,6 +129,9 @@ final class CodexBridgeRouterTests: XCTestCase {
     }
 
     func testDescriptorRequiresPrivateFileAndDirectory() throws {
+        #if os(Windows)
+        throw XCTSkip("Codex 桌面桥接只在 Mac 上用；Windows 没有 POSIX 权限位")
+        #endif
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])

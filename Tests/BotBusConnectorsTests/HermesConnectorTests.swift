@@ -124,7 +124,8 @@ final class HermesConnectorTests: XCTestCase {
         XCTAssertEqual(launch.request.executable, "/opt/fake/bin/hermes")
         XCTAssertEqual(launch.request.arguments, ["chat", "-q", "把结账按钮修好", "--format", "stream-json", "--in", project.path])
         XCTAssertEqual(launch.request.workingDirectory, project.path)
-        XCTAssertTrue(launch.request.environment["PATH"]?.hasPrefix("/opt/fake/bin:") == true, "可执行文件目录补到 PATH 最前")
+        XCTAssertEqual(PlatformPath.splitSearchPath(PlatformPath.searchPath(in: launch.request.environment) ?? "").first,
+                       "/opt/fake/bin", "可执行文件目录补到 PATH 最前")
         XCTAssertNil(launch.request.environment[AgentToolsInjection.taskTokenVariable], "没配工具就不注入")
         XCTAssertNil(launch.request.environment[HermesConnector.ephemeralPromptVariable])
 
@@ -132,7 +133,7 @@ final class HermesConnectorTests: XCTestCase {
         XCTAssertEqual(record.status, .running)
         XCTAssertEqual(record.origin, .watch)
         XCTAssertEqual(record.title, "把结账按钮修好")
-        XCTAssertEqual(record.projectPath, project.path)
+        XCTAssertEqual(record.projectPath, PlatformPath.canonical(project.path))
         XCTAssertEqual(record.projectName, "shop")
         XCTAssertTrue(record.controllable)
         let ownerWhileRunning = await store.owner(of: "hermes:sess-1")
@@ -435,7 +436,7 @@ final class HermesConnectorTests: XCTestCase {
     // MARK: - agent 工具注入
 
     func testInjectsToolEnvironmentAndBindsToken() async throws {
-        let cli = project.appendingPathComponent("botbus")
+        let cli = project.appendingPathComponent(fakeCLIName)
         try Data("#!/bin/sh\n".utf8).write(to: cli)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
         let configuration = AgentToolsConfiguration(cliPath: cli.path, toolsURL: "http://127.0.0.1:4567")
@@ -459,6 +460,7 @@ final class HermesConnectorTests: XCTestCase {
     // MARK: - 真的 Process（假的 hermes 脚本）
 
     private func script(_ body: String) throws -> String {
+        try skipPOSIXScriptOnWindows()
         let url = project.deletingLastPathComponent().appendingPathComponent("fake-hermes")
         try Data("#!/bin/sh\n\(body)\n".utf8).write(to: url)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)

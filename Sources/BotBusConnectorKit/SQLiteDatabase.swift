@@ -3,6 +3,8 @@ import Foundation
 import SQLite3
 #elseif canImport(CSQLite)
 import CSQLite
+#elseif canImport(SwiftToolchainCSQLite)
+import SwiftToolchainCSQLite
 #endif
 
 public enum SQLiteValue: Equatable, Sendable {
@@ -103,9 +105,16 @@ public final class SQLiteDatabase {
     }
 
     /// SQLite 的 URI 文件名里 `?` 和 `#` 会截断路径、`%` 是转义前缀，这三个字符得先转义。
+    /// Windows 的 `C:\x\y.db` 写成 `file:///C:/x/y.db`：URI 里只认正斜杠，盘符前要有 `/`。
     private static func immutableURI(for path: String) -> String {
         var escaped = ""
-        for scalar in path.unicodeScalars {
+        #if os(Windows)
+        var uriPath = path.replacingOccurrences(of: "\\", with: "/")
+        if !uriPath.hasPrefix("/") { uriPath = "///" + uriPath }
+        #else
+        let uriPath = path
+        #endif
+        for scalar in uriPath.unicodeScalars {
             switch scalar {
             case "%": escaped += "%25"
             case "?": escaped += "%3f"

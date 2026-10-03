@@ -61,11 +61,20 @@ enum ClaudeModels {
         return efforts(inHelp: help)
     }
 
+    /// `--effort <level>` 那一项的说明可能折到下一行（新版按 80 列排，档位单独一行），续行一起读：
+    /// 续行是缩进过、又不以 `-` 开头的行。
     static func efforts(inHelp help: String) -> [String]? {
-        guard let line = help.split(separator: "\n").first(where: { $0.contains("--effort <level>") }),
-              let opening = line.lastIndex(of: "("), let closing = line.lastIndex(of: ")"),
+        let lines = help.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let start = lines.firstIndex(where: { $0.contains("--effort <level>") }) else { return nil }
+        var entry = String(lines[start])
+        for next in lines[(start + 1)...] {
+            let trimmed = next.trimmingCharacters(in: .whitespaces)
+            guard next.first?.isWhitespace == true, !trimmed.isEmpty, !trimmed.hasPrefix("-") else { break }
+            entry += " " + trimmed
+        }
+        guard let opening = entry.lastIndex(of: "("), let closing = entry.lastIndex(of: ")"),
               opening < closing else { return nil }
-        let values = line[line.index(after: opening)..<closing]
+        let values = entry[entry.index(after: opening)..<closing]
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
         guard !values.isEmpty, values.allSatisfy(ModelOption.isValidEffort),

@@ -14,10 +14,13 @@ final class FixtureRoundTripTests: XCTestCase {
     /// 从本文件路径向上找到仓库根目录下的 protocol-fixtures。
     static let fixturesDir: URL = {
         var url = URL(fileURLWithPath: #filePath)
-        while url.path != "/" {
+        // 到根目录（`/` 或 Windows 的 `C:\`）时再删一级路径不再变，就停。
+        while true {
             let candidate = url.appendingPathComponent("protocol-fixtures")
             if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
-            url.deleteLastPathComponent()
+            let parent = url.deletingLastPathComponent()
+            if parent.path == url.path { break }
+            url = parent
         }
         fatalError("protocol-fixtures not found above \(#filePath)")
     }()
@@ -121,6 +124,8 @@ final class FixtureRoundTripTests: XCTestCase {
     ] }
 
     private static var frameCases: [FixtureCase] { [
+        roundTripCase(AgentReadyFrame.self, "frame-agent-ready.json"),
+        roundTripCase(AgentReadyFrame.self, "frame-agent-ready-min-client.json"),
         roundTripCase(RelayHelloFrame.self, "frame-relay-hello.json"),
         roundTripCase(RelayHelloFrame.self, "frame-relay-hello-with-key.json"),
         roundTripCase(ClientFrame.self, "frame-client-changed.json"),
@@ -172,6 +177,7 @@ final class FixtureRoundTripTests: XCTestCase {
         "plain/invalid/agent-info-bad-connector-kind.json",
         "plain/invalid/artifact-bad-kind.json",
         "invalid/client-frame-payload-mismatch.json",
+        "invalid/frame-agent-ready-bad-min-client.json",
         "plain/invalid/event-system-permission-missing-dialog-text.json",
         "plain/invalid/task-acp-missing-connector-id.json",
         "plain/invalid/agent-info-acp-missing-connector-id.json",
@@ -542,6 +548,18 @@ final class FixtureRoundTripTests: XCTestCase {
         let start = try XCTUnwrap(decodeFixture(Command.self, "plain/command-start-task-auto-approve.json").startTask)
         XCTAssertEqual(start.autoApprove, true)
         XCTAssertNil(try XCTUnwrap(decodeFixture(Command.self, "plain/command-follow-up.json").followUp).autoApprove)
+    }
+
+    /// 协议 3.6：ready 帧的 `minClientProtocol` 省略即不要求；写法不对的整帧拒收。Mac 发的仍是字节不变的 `{"type":"ready"}`。
+    func testReadyFrameMinClientProtocol() throws {
+        XCTAssertNil(try decodeFixture(AgentReadyFrame.self, "frame-agent-ready.json").minClientProtocol)
+        XCTAssertEqual(try decodeFixture(AgentReadyFrame.self, "frame-agent-ready-min-client.json").minClientProtocol, "3.5")
+        XCTAssertThrowsError(try decodeFixture(AgentReadyFrame.self, "invalid/frame-agent-ready-bad-min-client.json"))
+        let mac = try XCTUnwrap(String(data: try ProtocolJSON.encoder().encode(AgentReadyFrame()), encoding: .utf8))
+        XCTAssertEqual(mac, #"{"type":"ready"}"#)
+        let linux = try XCTUnwrap(String(data: try ProtocolJSON.encoder().encode(AgentReadyFrame(minClientProtocol: "3.5")),
+                                         encoding: .utf8))
+        XCTAssertEqual(linux, #"{"minClientProtocol":"3.5","type":"ready"}"#)
     }
 
     /// 旧版 Agent 只认 `RelayFrame`：hello 帧在它那里必须解码失败（被忽略），而不是被误读成命令。

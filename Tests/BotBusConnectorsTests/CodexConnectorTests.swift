@@ -915,7 +915,7 @@ final class CodexConnectorTests: XCTestCase {
             .appendingPathComponent("codex-tools-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
-        let cli = directory.appendingPathComponent("botbus")
+        let cli = directory.appendingPathComponent(fakeCLIName)
         try Data("#!/bin/sh\nexit 0\n".utf8).write(to: cli)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
         return cli.path

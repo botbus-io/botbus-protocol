@@ -31,10 +31,10 @@ final class AcpDiscoveryTests: XCTestCase {
     }
 
     func testValidManifestWithAbsoluteCommand() throws {
-        try write("my-agent.json", #"{"id":"my-agent","name":"My Agent","command":"/bin/sh","args":["-c","exit 0"],"env":{"A":"1"}}"#)
+        try write("my-agent.json", #"{"id":"my-agent","name":"My Agent","command":"\#(anyExecutableJSON)","args":["-c","exit 0"],"env":{"A":"1"}}"#)
         let result = AcpDiscovery.discover(manifestDirectory: directory, catalog: [], locate: locate)
         XCTAssertEqual(result.problems, [])
-        XCTAssertEqual(result.agents, [AcpAgentSpec(id: "my-agent", name: "My Agent", executable: "/bin/sh",
+        XCTAssertEqual(result.agents, [AcpAgentSpec(id: "my-agent", name: "My Agent", executable: anyExecutablePath,
                                                     arguments: ["-c", "exit 0"], environment: ["A": "1"],
                                                     origin: .manifest, defaultEnabled: true)])
     }
@@ -77,6 +77,7 @@ final class AcpDiscoveryTests: XCTestCase {
     /// 文件叫 `compass`，跟 Sass 的老工具同名）。`AcpDiscovery.discover` 必须确认 `locate` 找到的
     /// 可执行文件（跟软链接之后）真的落在这个 npm 包的 `node_modules/` 目录下，才把它当成这个 agent。
     func testRegistryVerifiesNpmPackageBeforeTrustingBinary() throws {
+        try skipPOSIXScriptOnWindows()
         let packageBinary = directory.appendingPathComponent("lib/node_modules/@google/gemini-cli/bin/gemini")
         try FileManager.default.createDirectory(at: packageBinary.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("#!/bin/sh\necho hi\n".utf8).write(to: packageBinary)
@@ -86,7 +87,7 @@ final class AcpDiscoveryTests: XCTestCase {
         let symlinkDirectory = directory.appendingPathComponent("bin", isDirectory: true)
         try FileManager.default.createDirectory(at: symlinkDirectory, withIntermediateDirectories: true)
         let symlink = symlinkDirectory.appendingPathComponent("gemini")
-        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: packageBinary)
+        try makeSymbolicLink(at: symlink, withDestinationURL: packageBinary)
 
         // 同名但跟这个 npm 包毫无关系的可执行文件——比如用户自己装的另一个叫 gemini 的脚本。
         let unrelatedDirectory = directory.appendingPathComponent("bin2", isDirectory: true)
@@ -106,8 +107,71 @@ final class AcpDiscoveryTests: XCTestCase {
         XCTAssertEqual(rejected, AcpDiscoveryResult(agents: [], problems: []), "不在这个包 node_modules 下的同名可执行文件不该被当成这个 agent")
     }
 
+    /// Windows 上 npm 全局装的命令不是软链接，而是 `%APPDATA%\npm` 里的 `.cmd` 包装脚本，
+    /// 包本身在同目录的 `node_modules\<包名>\` 下；`AgentBinary.detect` 交出来的是 `gemini.cmd`。
+    /// 这种包装得按它引用的包来认，不然每个 npm 分发的注册表条目在 Windows 上都会被悄悄跳过。
+    func testRegistryAcceptsWindowsNpmCmdShim() throws {
+        #if !os(Windows)
+        throw XCTSkip("只有 Windows 的 npm 全局安装是 .cmd 包装")
+        #else
+        let fileManager = FileManager.default
+        let npmDirectory = directory.appendingPathComponent("npm", isDirectory: true)
+        let packageDirectory = npmDirectory.appendingPathComponent("node_modules/@google/gemini-cli/bundle", isDirectory: true)
+        try fileManager.createDirectory(at: packageDirectory, withIntermediateDirectories: true)
+        try Data("console.log('hi')\n".utf8).write(to: packageDirectory.appendingPathComponent("gemini.js"))
+        // npm（cmd-shim）生成的包装脚本原样。
+        let shim = npmDirectory.appendingPathComponent("gemini.cmd")
+        try Data(#"""
+            @ECHO off\#r
+            GOTO start\#r
+            :find_dp0\#r
+            SET dp0=%~dp0\#r
+            EXIT /b\#r
+            :start\#r
+            SETLOCAL\#r
+            CALL :find_dp0\#r
+            \#r
+            IF EXIST "%dp0%\node.exe" (\#r
+              SET "_prog=%dp0%\node.exe"\#r
+            ) ELSE (\#r
+              SET "_prog=node"\#r
+              SET PATHEXT=%PATHEXT:;.JS;=;%\#r
+            )\#r
+            \#r
+            endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@google\gemini-cli\bundle\gemini.js" %*\#r
+
+            """#.utf8).write(to: shim)
+
+        // 同目录下另一个同名包装，但引用的是别的包——比如用户自己装的另一个叫 gemini 的 npm 包。
+        let otherDirectory = directory.appendingPathComponent("other", isDirectory: true)
+        try fileManager.createDirectory(at: otherDirectory.appendingPathComponent("node_modules/@google/gemini-cli", isDirectory: true),
+                                        withIntermediateDirectories: true)
+        let unrelatedShim = otherDirectory.appendingPathComponent("gemini.cmd")
+        try Data(#"@"%~dp0\node_modules\gemini-lookalike\bin\gemini.js" %*"#.utf8).write(to: unrelatedShim)
+
+        // 包里直接带的原生 `.exe`（路径里就有 `node_modules\<包名>\`），用 Windows 分隔符写。
+        let nativeDirectory = npmDirectory.appendingPathComponent("node_modules/@github/copilot/bin", isDirectory: true)
+        try fileManager.createDirectory(at: nativeDirectory, withIntermediateDirectories: true)
+        let native = nativeDirectory.appendingPathComponent("copilot.exe")
+        try Data().write(to: native)
+
+        let entry = AcpRegistryEntry(id: "gemini", name: "Gemini CLI", binaries: ["gemini"], args: ["--acp"],
+                                     defaultEnabled: true, npmPackage: "@google/gemini-cli")
+        let copilot = AcpRegistryEntry(id: "github-copilot-cli", name: "GitHub Copilot", binaries: ["copilot"], args: ["--acp"],
+                                       defaultEnabled: true, npmPackage: "@github/copilot")
+        let windowsPath = { (url: URL) in url.withUnsafeFileSystemRepresentation { String(cString: $0!) } }
+
+        XCTAssertEqual(AcpDiscovery.locateVerifiedBinary(for: entry) { _ in windowsPath(shim) }, windowsPath(shim),
+                       "引用了这个包的 npm .cmd 包装应该被采信")
+        XCTAssertNil(AcpDiscovery.locateVerifiedBinary(for: entry) { _ in windowsPath(unrelatedShim) },
+                     "引用别的包的同名 .cmd 包装不该被当成这个 agent（旁边有没有这个包的目录都一样）")
+        XCTAssertEqual(AcpDiscovery.locateVerifiedBinary(for: copilot) { _ in windowsPath(native) }, windowsPath(native),
+                       "落在这个包 node_modules 下的 .exe 用反斜杠写也要认")
+        #endif
+    }
+
     func testManifestWinsOverRegistry() throws {
-        try write("gemini.json", #"{"id":"gemini","name":"我的 Gemini","command":"/bin/sh"}"#)
+        try write("gemini.json", #"{"id":"gemini","name":"我的 Gemini","command":"\#(anyExecutableJSON)"}"#)
         let result = AcpDiscovery.discover(manifestDirectory: directory, catalog: catalog, locate: locate)
         XCTAssertEqual(result.agents.map(\.name), ["我的 Gemini"])
         XCTAssertEqual(result.agents.first?.origin, .manifest)

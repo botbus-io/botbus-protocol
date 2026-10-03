@@ -4,7 +4,7 @@ import BotBusConnectorKit
 
 /// 发现到的一个 ACP agent：怎么启动、叫什么、从哪儿来。
 public struct AcpAgentSpec: Hashable, Sendable {
-    public enum Origin: String, Hashable, Sendable { case manifest, registry }
+    public enum Origin: String, Hashable, Sendable { case builtin, manifest, registry }
 
     public var id: String
     public var name: String
@@ -96,9 +96,11 @@ public enum AcpDiscovery {
     public static let reservedIds: Set<String> = Set(ConnectorKind.allCases.map(\.rawValue))
         .union(["claude-acp", "codex-acp", "pi-acp"])
 
+    public static let builtinAcpIds: Set<String> = ["opencode"]
+
     public static func discover(manifestDirectory: URL = defaultManifestDirectory,
                                 catalog: [AcpRegistryEntry] = AcpRegistrySnapshot.entries,
-                                locate: (String) -> String? = { AgentBinary.detect($0) },
+                                locate: (String) -> String? = { $0 == "opencode" ? OpenCodeSessionReader.detectBinary() : AgentBinary.detect($0) },
                                 fileManager: FileManager = .default) -> AcpDiscoveryResult {
         var problems: [AcpManifestProblem] = []
         var byId: [String: AcpAgentSpec] = [:]
@@ -108,7 +110,7 @@ public enum AcpDiscovery {
         for file in files {
             switch loadManifest(file, locate: locate, fileManager: fileManager) {
             case .success(let spec):
-                if reservedIds.contains(spec.id) {
+                if reservedIds.contains(spec.id) || builtinAcpIds.contains(spec.id) {
                     problems.append(AcpManifestProblem(file: file.path, reason: "id「\(spec.id)」已被 BotBus 内置的 agent 占用，换一个"))
                 } else {
                     byId[spec.id] = spec
@@ -120,7 +122,7 @@ public enum AcpDiscovery {
         for entry in catalog where byId[entry.id] == nil && !reservedIds.contains(entry.id) {
             guard let executable = locateVerifiedBinary(for: entry, locate: locate) else { continue }
             byId[entry.id] = AcpAgentSpec(id: entry.id, name: entry.name, executable: executable, arguments: entry.args,
-                                          environment: [:], origin: .registry, defaultEnabled: entry.defaultEnabled)
+                                          environment: [:], origin: entry.id == "opencode" ? .builtin : .registry, defaultEnabled: entry.defaultEnabled)
         }
         // `byId.values` 的迭代顺序按进程随机的哈希种子来，每次启动都可能不一样；
         // 名字相同时按 id 兜底，保证顺序在多次启动之间稳定。
@@ -135,7 +137,8 @@ public enum AcpDiscovery {
     ///
     /// `npmPackage` 有值时（`npx` 分发）：只按名字定位还不够——PATH 上可能装着同名的无关程序
     /// （`nova` 的 npm 包里那个可执行文件叫 `compass`，同名的 Sass 老工具也叫这个），所以还要求
-    /// 解出的真实路径（跟软链接）落在 `node_modules/<npmPackage>/` 下；不满足就试下一个候选名，
+    /// 解出的真实路径（跟软链接）落在 `node_modules/<npmPackage>/` 下（Windows 上 npm 的 `.cmd` 包装按它引用的包认，
+    /// 见 `belongs(_:toNpmPackage:)`）；不满足就试下一个候选名，
     /// 都不满足就跳过这个 agent，不猜。
     ///
     /// 没有 `npmPackage` 的（`binary` / `uvx` 分发）没有类似的本机验证手段，仍只按名字命中；
@@ -144,14 +147,39 @@ public enum AcpDiscovery {
         guard let npmPackage = entry.npmPackage else {
             return entry.binaries.lazy.compactMap(locate).first
         }
-        let marker = "/node_modules/\(npmPackage)/"
         for name in entry.binaries {
             guard let located = locate(name) else { continue }
-            let resolved = URL(fileURLWithPath: located).resolvingSymlinksInPath().path
-            if resolved.contains(marker) { return located }
+            if belongs(located, toNpmPackage: npmPackage) { return located }
         }
         return nil
     }
+
+    #if os(Windows)
+    /// npm 包装脚本只有几百字节；再大的 `.cmd` 不会是它，不读。
+    private static let npmShimSizeLimit = 64 * 1024
+
+    /// Windows：npm 全局装的命令不是软链接，而是 `%APPDATA%\npm` 里的 `gemini.cmd` 这种包装脚本
+    /// （cmd-shim 生成，内容是 `"%dp0%\node_modules\@google\gemini-cli\…\gemini.js" %*`）。
+    /// 所以除了路径本身（跟软链接）落在 `node_modules\<包名>\` 下，`.cmd` / `.bat` 包装在正文里引用了
+    /// 这个包的 `node_modules\<包名>\` 也算。两处都不分 `\` 与 `/`、不分大小写。
+    private static func belongs(_ located: String, toNpmPackage npmPackage: String) -> Bool {
+        let marker = "\\node_modules\\" + npmPackage.replacingOccurrences(of: "/", with: "\\") + "\\"
+        func mentionsPackage(_ text: String) -> Bool {
+            text.replacingOccurrences(of: "/", with: "\\").range(of: marker, options: .caseInsensitive) != nil
+        }
+        if mentionsPackage(URL(fileURLWithPath: located).resolvingSymlinksInPath().path) { return true }
+        guard ["cmd", "bat"].contains((located as NSString).pathExtension.lowercased()),
+              let size = (try? FileManager.default.attributesOfItem(atPath: located))?[.size] as? NSNumber,
+              size.intValue <= npmShimSizeLimit,
+              let data = FileManager.default.contents(atPath: located) else { return false }
+        return mentionsPackage(String(decoding: data, as: UTF8.self))
+    }
+    #else
+    /// 解出的真实路径（跟软链接）落在 `node_modules/<包名>/` 下。
+    private static func belongs(_ located: String, toNpmPackage npmPackage: String) -> Bool {
+        URL(fileURLWithPath: located).resolvingSymlinksInPath().path.contains("/node_modules/\(npmPackage)/")
+    }
+    #endif
 
     static func loadManifest(_ file: URL, locate: (String) -> String?,
                              fileManager: FileManager) -> Result<AcpAgentSpec, AcpManifestProblem> {
@@ -174,8 +202,8 @@ public enum AcpDiscovery {
         var executable: String?
         if let raw = manifest.command?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
             let command = (raw as NSString).expandingTildeInPath
-            if command.hasPrefix("/") {
-                guard fileManager.isExecutableFile(atPath: command) else {
+            if PlatformPath.isAbsolute(command) {
+                guard PlatformPath.isExecutableFile(command, fileManager: fileManager) else {
                     return problem("command 指向的文件不存在或不可执行：\(command)")
                 }
                 executable = command

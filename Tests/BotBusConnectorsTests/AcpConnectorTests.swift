@@ -38,12 +38,12 @@ final class AcpConnectorTests: XCTestCase {
     }
 
     func testStartInjectsBotBusMcpServer() async throws {
-        let tools = AgentToolsConfiguration(cliPath: "/bin/sh", toolsURL: "http://127.0.0.1:1")
+        let tools = AgentToolsConfiguration(cliPath: anyExecutablePath, toolsURL: "http://127.0.0.1:1")
         let h = await AcpHarness.make(tools: tools)
         _ = try await h.connector.start(projectPath: project, prompt: "x", images: [])
         let server = h.behavior.params.withLock { $0["session/new"] }?["mcpServers"]?[0]
         XCTAssertEqual(server?["name"], "botbus")
-        XCTAssertEqual(server?["command"], "/bin/sh")
+        XCTAssertEqual(server?["command"], .string(anyExecutablePath))
         let envNames = server?["env"]?.arrayValue?.compactMap { $0["name"]?.stringValue } ?? []
         XCTAssertTrue(envNames.contains(AgentToolsInjection.taskTokenVariable))
     }
