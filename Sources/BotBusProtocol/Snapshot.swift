@@ -35,9 +35,12 @@ public struct CommandResult: Codable, Hashable, Sendable {
     public var systemPermission: SystemPermissionNotice?
     /// 协议 2.11：`fetchChanges` 成功时，改动清单（`WorkingChanges` 的 JSON）的产物 id。
     public var artifactId: String?
+    /// 协议 3.7：电脑对这次失败的诊断（认出了常见原因时）；任务尚未创建时也可随结果返回。
+    public var diagnosis: FailureDiagnosis?
 
     public init(commandId: String, ok: Bool, error: String? = nil, taskId: String? = nil, finishedAt: String,
-                systemPermission: SystemPermissionNotice? = nil, artifactId: String? = nil) {
+                systemPermission: SystemPermissionNotice? = nil, artifactId: String? = nil,
+                diagnosis: FailureDiagnosis? = nil) {
         self.commandId = commandId
         self.ok = ok
         self.error = error
@@ -45,6 +48,7 @@ public struct CommandResult: Codable, Hashable, Sendable {
         self.finishedAt = finishedAt
         self.systemPermission = systemPermission
         self.artifactId = artifactId
+        self.diagnosis = diagnosis
     }
 }
 

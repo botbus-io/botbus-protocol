@@ -45,6 +45,7 @@ public actor PiConnector: TaskConnector {
     private let now: @Sendable () -> Date
     private let tools: @Sendable () -> AgentToolsConfiguration?
     private let registry: TaskContextRegistry
+    private let directoryProbe: DirectoryProbe
     private let onRunFinished: @Sendable () async -> Void
 
     private var launches: [UUID: Launch] = [:]
@@ -59,6 +60,7 @@ public actor PiConnector: TaskConnector {
     ///   - launcher: 测试注入假的，永远不起真实 `pi`。
     ///   - tools: 每次起子进程时现取；nil 或不可用 = 不注入 agent 工具。
     ///   - registry: 签发与绑定 task token；app 里与本机工具服务器共用同一个实例。
+    ///   - directoryProbe: 起 `pi` 之前读一次工作目录（协议 3.7）。
     ///   - onRunFinished: 一轮结束、所有权交还之后调用；app 用它催 `SessionObserver.pollOnce()`。
     public init(store: TaskStore,
                 paths: @escaping @Sendable () -> PiPaths = { PiPaths() },
@@ -67,6 +69,7 @@ public actor PiConnector: TaskConnector {
                 now: @escaping @Sendable () -> Date = { Date() },
                 tools: @escaping @Sendable () -> AgentToolsConfiguration? = { nil },
                 registry: TaskContextRegistry = TaskContextRegistry(),
+                directoryProbe: DirectoryProbe = .live(),
                 onRunFinished: @escaping @Sendable () async -> Void = {}) {
         self.store = store
         self.paths = paths
@@ -75,6 +78,7 @@ public actor PiConnector: TaskConnector {
         self.now = now
         self.tools = tools
         self.registry = registry
+        self.directoryProbe = directoryProbe
         self.onRunFinished = onRunFinished
     }
 
@@ -91,7 +95,7 @@ public actor PiConnector: TaskConnector {
     public func start(projectPath: String, prompt: String, images: [URL]) async throws -> ConnectorOutcome {
         // 协议 2.9 的手机发图本期只接了 Codex 与 Claude；明说不支持，别只发文字让用户以为 agent 看过图。
         guard images.isEmpty else { throw ConnectorError("这个 Agent 暂不支持发图") }
-        guard Self.isDirectory(projectPath) else { throw ConnectorError("项目目录不存在：\(projectPath)") }
+        try await checkDirectory(projectPath)
         let injection = await AgentToolsInjection.make(tools(), registry: registry)
         let (launchID, sessionID) = try await launch(
             arguments: Self.arguments(prompt: prompt, sessionFile: nil, injection: injection),
@@ -134,7 +138,7 @@ public actor PiConnector: TaskConnector {
         guard let header = PiSessionFile.header(atPath: file.path) else {
             throw ConnectorError("这个 Pi 会话的记录文件认不出来")
         }
-        guard Self.isDirectory(header.cwd) else { throw ConnectorError("项目目录不存在：\(header.cwd)") }
+        try await checkDirectory(header.cwd)
 
         // 续聊沿用这条任务之前的 token（agent 若把它记在了别处也照样有效）。
         let injection = await AgentToolsInjection.make(tools(), registry: registry, reusing: self.taskId(for: sessionID))
@@ -199,9 +203,15 @@ public actor PiConnector: TaskConnector {
         return arguments
     }
 
-    private static func isDirectory(_ path: String) -> Bool {
+    /// 起 `pi` 之前看一眼工作目录：子进程沿用 BotBus 的文件夹授权，不在、读不了就不起，原话照旧、带上诊断（协议 3.7）。
+    private func checkDirectory(_ path: String) async throws {
+        guard !path.isEmpty else { throw ConnectorError.directory(.projectMissing, path: path) }
+        if let diagnosis = await directoryProbe.diagnose(path) { throw ConnectorError.directory(diagnosis, path: path) }
+        // 探测同一目录还有读取没回来、或超时时回 nil（不下结论）：至少不能在不存在的目录里起进程。
         var isDirectory: ObjCBool = false
-        return !path.isEmpty && FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw ConnectorError.directory(.projectMissing, path: path)
+        }
     }
 
     // MARK: - 子进程

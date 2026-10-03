@@ -238,12 +238,17 @@ final class HermesConnectorTests: XCTestCase {
         do {
             _ = try await makeConnector(store: store, launcher: launcher, binary: nil).start(projectPath: project.path, prompt: "x")
             XCTFail("没有 hermes 要报错")
-        } catch {}
+        } catch let error as ConnectorError {
+            // 旧手机不认诊断，看的是原话。
+            XCTAssertEqual(error.message, "本机没找到 hermes 可执行文件")
+            XCTAssertEqual(error.diagnosis, .agentNotInstalled)
+        } catch { XCTFail("\(error)") }
         do {
             _ = try await makeConnector(store: store, launcher: launcher).start(projectPath: "/nonexistent/dir", prompt: "x")
             XCTFail("目录不存在要报错")
         } catch let error as ConnectorError {
             XCTAssertEqual(error.message, "项目目录不存在：/nonexistent/dir")
+            XCTAssertEqual(error.diagnosis, .projectMissing)
         } catch { XCTFail("\(error)") }
         XCTAssertTrue(launcher.launches.current.isEmpty)
     }

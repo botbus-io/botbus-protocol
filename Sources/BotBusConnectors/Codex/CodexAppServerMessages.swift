@@ -94,7 +94,8 @@ public enum CodexNotification: Hashable, Sendable {
     case threadStarted(threadId: String, thread: JSONValue)
     case threadStatusChanged(threadId: String, status: CodexThreadStatus)
     case turnStarted(threadId: String, turnId: String)
-    case turnCompleted(threadId: String, turnId: String, status: CodexTurnStatus, error: String?)
+    /// `errorInfo`：turn 错误里的 `codexErrorInfo`（单值变体是字符串，带字段的变体是只有一个键的对象，取键名）。
+    case turnCompleted(threadId: String, turnId: String, status: CodexTurnStatus, error: String?, errorInfo: String?)
     case agentMessageDelta(threadId: String, itemId: String, delta: String)
     case itemStarted(threadId: String, turnId: String?, item: CodexItem)
     case itemCompleted(threadId: String, turnId: String?, item: CodexItem)
@@ -125,7 +126,8 @@ public enum CodexNotification: Hashable, Sendable {
                 let turn = params["turn"]
                 let status = CodexTurnStatus(turn?["status"]?.stringValue ?? "")
                 self = .turnCompleted(threadId: id, turnId: turn?["id"]?.stringValue ?? "",
-                                      status: status, error: Self.errorText(turn?["error"]))
+                                      status: status, error: Self.errorText(turn?["error"]),
+                                      errorInfo: Self.errorInfo(turn?["error"]))
                 return
             }
         case "item/agentMessage/delta":
@@ -159,6 +161,14 @@ public enum CodexNotification: Hashable, Sendable {
         return value["message"]?.stringValue
     }
 
+    /// Codex app-server v2 的 `TurnError.codexErrorInfo`：`"usageLimitExceeded"`，或 `{"httpConnectionFailed": {...}}`。
+    private static func errorInfo(_ value: JSONValue?) -> String? {
+        guard let info = value?["codexErrorInfo"], !info.isNull else { return nil }
+        if let text = info.stringValue { return text }
+        if case .object(let fields) = info, fields.count == 1 { return fields.keys.first }
+        return nil
+    }
+
     public var method: String {
         switch self {
         case .threadStarted: return "thread/started"
@@ -178,7 +188,7 @@ public enum CodexNotification: Hashable, Sendable {
         case .threadStarted(let id, _): return id
         case .threadStatusChanged(let id, _): return id
         case .turnStarted(let id, _): return id
-        case .turnCompleted(let id, _, _, _): return id
+        case .turnCompleted(let id, _, _, _, _): return id
         case .agentMessageDelta(let id, _, _): return id
         case .itemStarted(let id, _, _): return id
         case .itemCompleted(let id, _, _): return id
@@ -195,7 +205,7 @@ public enum CodexNotification: Hashable, Sendable {
         switch self {
         case .turnStarted:
             return .running
-        case .turnCompleted(_, _, let status, _):
+        case .turnCompleted(_, _, let status, _, _):
             switch status {
             case .completed: return .completed
             case .failed: return .failed
@@ -315,7 +325,7 @@ public struct CodexProcessExit: Hashable, Sendable {
 }
 
 /// `CodexAppServer` 抛出的一切。
-public struct CodexAppServerError: LocalizedError, Hashable, Sendable {
+public struct CodexAppServerError: LocalizedError, Hashable, Sendable, FailureDiagnosing {
     public enum Reason: Hashable, Sendable {
         /// 进程没起来、正在重启、或者已经 `stop()` 了。
         case notRunning
@@ -335,6 +345,8 @@ public struct CodexAppServerError: LocalizedError, Hashable, Sendable {
 
     public var reason: Reason
     public var message: String
+    /// 协议 3.7：连接器认出的失败原因。
+    public var diagnosis: FailureDiagnosis?
 
     public init(_ reason: Reason, _ message: String) {
         self.reason = reason

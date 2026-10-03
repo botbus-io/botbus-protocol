@@ -136,7 +136,10 @@ final class CodexSubprocess: CodexProcessHandle, @unchecked Sendable {
             outContinuation.finish()
             process.terminationHandler = nil
             exitBox.resume(returning: CodexProcessExit(status: -1, reason: "无法启动 \(executablePath)"))
-            throw CodexAppServerError(.launchFailed, "无法启动 \(executablePath)：\(String(describing: error))")
+            var failure = CodexAppServerError(.launchFailed, "无法启动 \(executablePath)：\(String(describing: error))")
+            // 可执行文件根本不在：手机上说「电脑上找不到 Codex」，而不是一串启动错误。
+            if !FileManager.default.isExecutableFile(atPath: executablePath) { failure.diagnosis = .agentNotInstalled }
+            throw failure
         }
         Self.log.info("codex app-server pid=\(self.process.processIdentifier, privacy: .public)")
     }

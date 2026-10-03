@@ -69,6 +69,8 @@ public actor AcpConnector {
     let registry: TaskContextRegistry
     let archive: AcpSessionArchive
     private let openCodeReader: OpenCodeSessionReader?
+    /// 自己拉起 agent 之前读一次工作目录（协议 3.7）。
+    private let directoryProbe: DirectoryProbe
     private var localTasks: [TaskRecord] = []
     private var localBaselined = false
     let now: @Sendable () -> Date
@@ -167,6 +169,7 @@ public actor AcpConnector {
                 registry: TaskContextRegistry = TaskContextRegistry(),
                 archive: AcpSessionArchive = AcpSessionArchive(url: nil),
                 openCodeReader: OpenCodeSessionReader? = nil,
+                directoryProbe: DirectoryProbe = .live(),
                 clientVersion: String = AgentIdentity.bundleVersion(),
                 idleTimeout: TimeInterval = AcpConnector.idleTimeout,
                 initializeTimeout: TimeInterval = AcpClient.initializeTimeout,
@@ -182,6 +185,7 @@ public actor AcpConnector {
         self.registry = registry
         self.archive = archive
         self.openCodeReader = openCodeReader
+        self.directoryProbe = directoryProbe
         self.clientVersion = clientVersion
         self.idleTimeout = idleTimeout
         self.initializeTimeout = initializeTimeout
@@ -258,13 +262,18 @@ public actor AcpConnector {
     // MARK: - 命令
 
     public func start(projectPath: String, prompt: String, images: [URL]) async throws -> ConnectorOutcome {
-        guard Self.isDirectory(projectPath) else { throw ConnectorError("项目目录不存在：\(projectPath)") }
+        guard Self.isDirectory(projectPath) else { throw ConnectorError.directory(.projectMissing, path: projectPath) }
         // spec「命令对应」：有声明了 `newSession` 的反向连接就走它，没有启动命令时也只能走它。
         if spec.executable == nil || links.values.contains(where: { $0.capabilities.newSession }) {
             return try await startOverReverse(projectPath: projectPath, prompt: prompt, images: images)
         }
         // 已知不收图就别为一条注定失败的命令拉起进程。
         if !images.isEmpty, knownCapabilities?.images == false { throw ConnectorError("这个 Agent 暂不支持发图") }
+        // 自己拉起的 agent 沿用 BotBus 的文件夹授权：BotBus 读不了的目录它也读不了，起之前说清楚（协议 3.7）。
+        // 反向连接上的 agent 不是 BotBus 起的，上面那条路不看这个。
+        if let diagnosis = await directoryProbe.diagnose(projectPath) {
+            throw ConnectorError.directory(diagnosis, path: projectPath)
+        }
         beginCommand()
         defer { endCommand() }
         let running = try await ensureRunning()
@@ -1005,7 +1014,7 @@ public actor AcpConnector {
         if let rpc = error as? JSONRPCError, rpc.code == AcpProtocol.authRequiredCode {
             let message = "请在电脑上登录 \(spec.name)"
             await report(.degraded, message)
-            return ConnectorError(message)
+            return ConnectorError(message, diagnosis: .notSignedIn)
         }
         if let rpc = error as? JSONRPCError, AcpConnectorError.isSessionLockError(rpc) {
             return AcpConnectorError(.sessionBusyElsewhere, message: "这个会话正开在电脑上的 \(spec.name) 里")

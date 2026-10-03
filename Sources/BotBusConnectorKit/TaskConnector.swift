@@ -14,10 +14,14 @@ public struct ConnectorOutcome: Hashable, Sendable {
     public var taskId: String
     /// 命令返回后连接器是否仍在实时驱动这个任务。true 时分发器不交还所有权。
     public var retainsLiveOwnership: Bool
+    /// 这一轮的进程是不是 BotBus 起的（协议 3.7，和 `TaskConnector.runsUnderBotBus` 同时为 true 才算）。
+    /// 例如 Claude 回答电脑上会话挂着的提问：回答经 hook 交给终端里的进程，这一轮不是 BotBus 起的，失败了不探测目录。
+    public var runsUnderBotBus: Bool
 
-    public init(taskId: String, retainsLiveOwnership: Bool = false) {
+    public init(taskId: String, retainsLiveOwnership: Bool = false, runsUnderBotBus: Bool = true) {
         self.taskId = taskId
         self.retainsLiveOwnership = retainsLiveOwnership
+        self.runsUnderBotBus = runsUnderBotBus
     }
 }
 
@@ -28,16 +32,32 @@ public struct ConnectorOutcome: Hashable, Sendable {
 /// `containsPrivateDetail`：消息里带了不该进公开日志的内容（例如 ACP agent 进程退出时的 stderr 末尾、
 /// 第三方 agent 自己回的错误文本）。它照样原样回给手机（`CommandResult.error`），分发器只是把它按
 /// `privacy: .private` 记日志。
-public struct ConnectorError: LocalizedError, Hashable, Sendable {
+public struct ConnectorError: LocalizedError, Hashable, Sendable, FailureDiagnosing {
     public let message: String
     public let containsPrivateDetail: Bool
+    /// 协议 3.7：连接器认出的失败原因，分发器原样放进 `CommandResult.diagnosis`。
+    public let diagnosis: FailureDiagnosis?
 
-    public init(_ message: String, containsPrivateDetail: Bool = false) {
+    public init(_ message: String, containsPrivateDetail: Bool = false, diagnosis: FailureDiagnosis? = nil) {
         self.message = message
         self.containsPrivateDetail = containsPrivateDetail
+        self.diagnosis = diagnosis
     }
 
     public var errorDescription: String? { message }
+
+    /// 启动前检查项目目录的结论（`DirectoryProbe`）换成错误：原话照旧是中文（旧手机看的就是它），诊断给新手机。
+    public static func directory(_ diagnosis: FailureDiagnosis, path: String) -> ConnectorError {
+        if diagnosis.kind == .folderAccessDenied {
+            return ConnectorError("BotBus 没有权限读取项目目录：\(path)", diagnosis: diagnosis)
+        }
+        return ConnectorError("项目目录不存在：\(path)", diagnosis: diagnosis)
+    }
+}
+
+/// 带着失败诊断（协议 3.7）的错误。分发器失败时取它的 `diagnosis` 放进回执。
+public protocol FailureDiagnosing: Error {
+    var diagnosis: FailureDiagnosis? { get }
 }
 
 /// 一个能真正执行命令的后端（Codex app-server、Claude Code hooks + CLI）。
@@ -51,6 +71,11 @@ public struct ConnectorError: LocalizedError, Hashable, Sendable {
 /// 产生的 `taskUpdated` 事件表达。
 public protocol TaskConnector: Sendable {
     var kind: ConnectorKind { get }
+
+    /// agent 进程是不是 BotBus 自己起的。macOS 的文件夹授权跟着起进程的 app 走：是的话 BotBus 读不了的目录
+    /// agent 也读不了，失败后可以拿 BotBus 自己读一次目录来判断（`DirectoryProbe`）。和别的 app 共用进程时
+    /// （Codex 与桌面版共用、OpenClaw 的 gateway、DeepSeek Harness 网页端）不是。
+    var runsUnderBotBus: Bool { get }
 
     /// 新建任务。返回的 id 会被填进 `CommandResult.taskId`——客户端发 `startTask` 时还不知道 id，
     /// 只能从回执里认领。
@@ -92,6 +117,8 @@ public protocol TaskConnector: Sendable {
 }
 
 public extension TaskConnector {
+    var runsUnderBotBus: Bool { true }
+
     /// 不带图的旧签名：多数调用方（与测试）只发文字，不必每处都写 `images: []`。
     public func start(projectPath: String, prompt: String) async throws -> ConnectorOutcome {
         try await start(projectPath: projectPath, prompt: prompt, images: [])

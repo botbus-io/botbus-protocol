@@ -75,6 +75,7 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(TaskRecord.self, "plain/task-with-system-permission.json"),
         roundTripCase(TaskRecord.self, "plain/task-acp.json"),
         roundTripCase(TaskRecord.self, "plain/task-with-model.json"),
+        roundTripCase(TaskRecord.self, "plain/task-with-diagnosis.json"),
     ] }
 
     private static var artifactCases: [FixtureCase] { [
@@ -114,6 +115,7 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(Event.self, "plain/event-task-removed.json"),
         roundTripCase(Event.self, "plain/event-command-result.json"),
         roundTripCase(Event.self, "plain/event-command-result-system-permission.json"),
+        roundTripCase(Event.self, "plain/event-command-result-diagnosis.json"),
         roundTripCase(Event.self, "plain/event-command-result-changes.json"),
         roundTripCase(Event.self, "plain/event-notify.json"),
         roundTripCase(Event.self, "plain/event-notify-done.json"),
@@ -229,6 +231,49 @@ final class FixtureRoundTripTests: XCTestCase {
         let plainResult = CommandResult(commandId: "plain", ok: false, finishedAt: result.finishedAt)
         let plainJSON = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(plainResult)) as! [String: Any]
         XCTAssertFalse(plainJSON.keys.contains("systemPermission"))
+    }
+
+    /// 协议 3.7：失败诊断随任务与命令结果走；`kind` / `folder` 是开集，不认得的值原样往返，省略时整键不写。
+    func testFailureDiagnosisRoundTripsAndIsAnOpenSet() throws {
+        let task = try decodeFixture(TaskRecord.self, "plain/task-with-diagnosis.json")
+        XCTAssertEqual(task.diagnosis, .folderAccessDenied(.documents))
+        let result = try XCTUnwrap(decodeFixture(Event.self, "plain/event-command-result-diagnosis.json").commandResult)
+        XCTAssertEqual(result.diagnosis, .usageLimit(resetsAt: "2026-10-03T16:00:00Z"))
+
+        let future = Data(#"{"kind":"diskFull","folder":"pictures"}"#.utf8)
+        let decoded = try ProtocolJSON.decoder().decode(FailureDiagnosis.self, from: future)
+        XCTAssertEqual(decoded.kind, .unknown("diskFull"))
+        XCTAssertEqual(decoded.folder, .unknown("pictures"))
+        let again = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(decoded)) as! [String: String]
+        XCTAssertEqual(again, ["kind": "diskFull", "folder": "pictures"])
+
+        let plain = CommandResult(commandId: "plain", ok: false, finishedAt: result.finishedAt)
+        let plainJSON = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(plain)) as! [String: Any]
+        XCTAssertFalse(plainJSON.keys.contains("diagnosis"))
+        let bare = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(FailureDiagnosis.projectMissing)) as! [String: Any]
+        XCTAssertEqual(bare.keys.sorted(), ["kind"])
+    }
+
+    /// 线上写法钉死：手写的 switch 里写错一个字母，往返测试不一定发现（读写同错），这里逐个核对。
+    func testFailureDiagnosisRawValuesArePinned() {
+        let kinds: [(FailureDiagnosis.Kind, String)] = [
+            (.folderAccessDenied, "folderAccessDenied"), (.agentNotInstalled, "agentNotInstalled"),
+            (.notSignedIn, "notSignedIn"), (.signInExpired, "signInExpired"),
+            (.usageLimit, "usageLimit"), (.projectMissing, "projectMissing"),
+        ]
+        for (kind, wire) in kinds {
+            XCTAssertEqual(kind.rawValue, wire)
+            XCTAssertEqual(FailureDiagnosis.Kind(rawValue: wire), kind)
+        }
+        let folders: [(FailureDiagnosis.Folder, String)] = [
+            (.desktop, "desktop"), (.documents, "documents"), (.downloads, "downloads"),
+            (.iCloudDrive, "iCloudDrive"), (.removableVolume, "removableVolume"),
+            (.networkVolume, "networkVolume"), (.other, "other"),
+        ]
+        for (folder, wire) in folders {
+            XCTAssertEqual(folder.rawValue, wire)
+            XCTAssertEqual(FailureDiagnosis.Folder(rawValue: wire), folder)
+        }
     }
 
     func testCommands() throws {

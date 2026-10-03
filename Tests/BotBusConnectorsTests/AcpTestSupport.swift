@@ -227,7 +227,8 @@ struct AcpHarness {
     static func make(behavior: FakeAcpBehavior = FakeAcpBehavior(), executable: String? = "/usr/local/bin/my-agent",
                      tools: AgentToolsConfiguration? = nil, idleTimeout: TimeInterval = 600,
                      identity: AcpTaskIdentity? = nil,
-                     initializeTimeout: TimeInterval = AcpClient.initializeTimeout) async -> AcpHarness {
+                     initializeTimeout: TimeInterval = AcpClient.initializeTimeout,
+                     directoryProbe: DirectoryProbe = .live()) async -> AcpHarness {
         let store = makeAcpStore()
         let agent = await FakeAcpAgent.make(behavior)
         let queue = FakeAgentQueue([agent])
@@ -236,6 +237,7 @@ struct AcpHarness {
         let spec = AcpAgentSpec(id: "my-agent", name: "My Agent", executable: executable, arguments: ["--acp"],
                                 environment: [:], origin: .manifest, defaultEnabled: true)
         let connector = AcpConnector(spec: spec, identity: identity, store: store, launcher: queue.factory, tools: { tools },
+                                     directoryProbe: directoryProbe,
                                      clientVersion: "1.0", idleTimeout: idleTimeout,
                                      initializeTimeout: initializeTimeout,
                                      onHealth: { _, status, message, handshakeFailed in

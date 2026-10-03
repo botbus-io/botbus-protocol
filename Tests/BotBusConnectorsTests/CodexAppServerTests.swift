@@ -77,9 +77,13 @@ final class FakeCodexProcess: CodexProcessHandle, @unchecked Sendable {
 final class FakeCodexLauncher: CodexProcessLauncher, @unchecked Sendable {
     private let state = Locked<[FakeCodexProcess]>([])
     private let failures = Locked(0)
+    private let failure = Locked<Error>(ConnectorError("假的启动失败"))
 
-    /// 接下来 `n` 次 `launch()` 抛错。
-    func failNextLaunches(_ n: Int) { failures.withLock { $0 = n } }
+    /// 接下来 `n` 次 `launch()` 抛 `error`。
+    func failNextLaunches(_ n: Int, with error: Error = ConnectorError("假的启动失败")) {
+        failures.withLock { $0 = n }
+        failure.withLock { $0 = error }
+    }
 
     var processes: [FakeCodexProcess] { state.current }
     var count: Int { state.current.count }
@@ -91,7 +95,7 @@ final class FakeCodexLauncher: CodexProcessLauncher, @unchecked Sendable {
             pending -= 1
             return true
         }
-        if shouldFail { throw ConnectorError("假的启动失败") }
+        if shouldFail { throw failure.current }
         let process = FakeCodexProcess()
         state.withLock { $0.append(process) }
         return process
@@ -450,7 +454,7 @@ final class CodexAppServerTests: XCTestCase {
         XCTAssertEqual(notifications[0], .turnStarted(threadId: "t1", turnId: "r1"))
         XCTAssertEqual(notifications[0].statusTransition, .running)
         XCTAssertEqual(notifications[1].statusTransition, .failed)
-        if case .turnCompleted(_, _, _, let error) = notifications[1] {
+        if case .turnCompleted(_, _, _, let error, _) = notifications[1] {
             XCTAssertEqual(error, "boom")
         } else {
             XCTFail("第二条应该是 turn/completed")
@@ -473,6 +477,37 @@ final class CodexAppServerTests: XCTestCase {
             .statusTransition, .running)
         collector.cancel()
         await server.stop()
+    }
+
+    func testTurnCompletedCarriesCodexErrorInfo() throws {
+        let params: JSONValue = .object([
+            "threadId": .string("t1"),
+            "turn": .object([
+                "id": .string("u1"), "status": .string("failed"),
+                "error": .object(["message": .string("You've hit your usage limit."),
+                                  "codexErrorInfo": .string("usageLimitExceeded")]),
+            ]),
+        ])
+        guard case .turnCompleted(_, _, _, let error, let info) = CodexNotification(method: "turn/completed", params: params) else {
+            return XCTFail("not turnCompleted")
+        }
+        XCTAssertEqual(error, "You've hit your usage limit.")
+        XCTAssertEqual(info, "usageLimitExceeded")
+
+        let objectForm: JSONValue = .object(["threadId": .string("t1"), "turn": .object([
+            "id": .string("u1"), "status": .string("failed"),
+            "error": .object(["message": .string("x"),
+                              "codexErrorInfo": .object(["httpConnectionFailed": .object(["httpStatusCode": .int(502)])])]),
+        ])])
+        guard case .turnCompleted(_, _, _, _, let objectInfo) = CodexNotification(method: "turn/completed", params: objectForm) else {
+            return XCTFail("not turnCompleted")
+        }
+        XCTAssertEqual(objectInfo, "httpConnectionFailed")
+        XCTAssertEqual(CodexConnector.diagnosis(errorInfo: "unauthorized"), .signInExpired)
+        XCTAssertEqual(CodexConnector.diagnosis(errorInfo: "usageLimitExceeded"), .usageLimit())
+        XCTAssertEqual(CodexConnector.diagnosis(errorInfo: "rateLimitExceeded"), .usageLimit())
+        XCTAssertNil(CodexConnector.diagnosis(errorInfo: "httpConnectionFailed"))
+        XCTAssertNil(CodexConnector.diagnosis(errorInfo: nil))
     }
 
     // MARK: 退出、重启与 resume
@@ -590,6 +625,40 @@ final class CodexAppServerTests: XCTestCase {
         sleeper.release(CodexAppServer.restartDelay)
         await assertEventually { launcher.count == 1 }
         await server.stop()
+    }
+
+    /// 协议 3.7：起不了子进程（找不到 codex）时，之后的请求抛的「还没就绪」带上这个原因；起成功了就不再带。
+    func testLaunchFailureDiagnosisReachesRequests() async {
+        let launcher = FakeCodexLauncher()
+        let sleeper = FakeSleeper()
+        var notInstalled = CodexAppServerError(.launchFailed, "无法启动 /nonexistent/codex")
+        notInstalled.diagnosis = .agentNotInstalled
+        launcher.failNextLaunches(1, with: notInstalled)
+        let server = makeServer(launcher: launcher, sleeper: sleeper)
+        await server.start()
+        do {
+            _ = try await server.request("thread/list")
+            XCTFail("子进程没起来，请求必须失败")
+        } catch let error as CodexAppServerError {
+            XCTAssertEqual(error.reason, .notRunning)
+            XCTAssertEqual(error.diagnosis, .agentNotInstalled)
+        } catch {
+            XCTFail("错误类型不对：\(error)")
+        }
+
+        await assertEventually { sleeper.requested.contains(CodexAppServer.restartDelay) }
+        sleeper.release(CodexAppServer.restartDelay)
+        await assertEventually { launcher.count == 1 }
+        await server.stop()
+        do {
+            _ = try await server.request("thread/list")
+            XCTFail("stop() 之后请求必须失败")
+        } catch let error as CodexAppServerError {
+            XCTAssertEqual(error.reason, .notRunning)
+            XCTAssertNil(error.diagnosis, "起成功过一次，旧的原因不能再带")
+        } catch {
+            XCTFail("错误类型不对：\(error)")
+        }
     }
 
     // MARK: 请求 id 的编解码

@@ -117,6 +117,19 @@ export const SystemPermissionNotice = z.object({
   screenshot: Artifact.optional(),
 });
 
+/**
+ * 协议 3.7：电脑对一次失败的诊断（认出的常见原因），手机据此给出本地化的操作步骤；原话照旧在 error / lastMessage 里。
+ * `kind` 与 `folder` 都是开集：任何字符串都透传（与 Swift / Kotlin 一致）；客户端不认得的 kind 当作没有诊断，不认得的 folder 当作 other。
+ */
+export const FailureDiagnosis = z.object({
+  /** folderAccessDenied / agentNotInstalled / notSignedIn / signInExpired / usageLimit / projectMissing。 */
+  kind: z.string(),
+  /** 只随 folderAccessDenied：desktop / documents / downloads / iCloudDrive / removableVolume / networkVolume / other；系统拒绝访问（EPERM，macOS 上就是文件夹授权）时带；普通的目录权限问题（EACCES）省略。其他平台照样填，客户端只在 Mac 上用它。 */
+  folder: z.string().optional(),
+  /** 只随 usageLimit：额度恢复时间（秒精度 UTC），电脑读得到时才有。 */
+  resetsAt: z.string().optional(),
+});
+
 /** 协议 2.6：新项目文件夹名的长度上限，与 Swift 的 `StartTask.maxNewProjectNameLength` 一致。 */
 export const MAX_NEW_PROJECT_NAME = 80;
 
@@ -159,6 +172,8 @@ export const Task = z.object({
   effort: ModelEffort.optional(),
   /** 协议 3.3：所在项目开了自动批准；只写 true。 */
   autoApprove: z.boolean().optional(),
+  /** 协议 3.7：电脑对这次失败的诊断，只在 status = failed 时出现。 */
+  diagnosis: FailureDiagnosis.optional(),
 })
   // 跨字段校验，不是字段本身的规则：`connectorId` 只跟 `source = acp` 一起出现。
   // `.extend()` / `.pick()` 出来的 schema 不带它，会把这条悄悄绕过去。
@@ -353,6 +368,8 @@ export const CommandResult = z.object({
   systemPermission: SystemPermissionNotice.optional(),
   /** 协议 2.11：`fetchChanges` 成功时，改动清单（WorkingChanges JSON）的产物 id。 */
   artifactId: z.string().min(1).optional(),
+  /** 协议 3.7：电脑对这次失败的诊断；任务尚未创建时也可随失败结果返回。 */
+  diagnosis: FailureDiagnosis.optional(),
 });
 
 /**
@@ -810,6 +827,7 @@ export type KeyEnvelope = z.infer<typeof KeyEnvelope>;
 export type ArtifactKind = z.infer<typeof ArtifactKind>;
 export type Artifact = z.infer<typeof Artifact>;
 export type SystemPermissionNotice = z.infer<typeof SystemPermissionNotice>;
+export type FailureDiagnosis = z.infer<typeof FailureDiagnosis>;
 export type ArtifactUploadResponse = z.infer<typeof ArtifactUploadResponse>;
 export type PreviewCreateRequest = z.infer<typeof PreviewCreateRequest>;
 export type PreviewCreateResponse = z.infer<typeof PreviewCreateResponse>;

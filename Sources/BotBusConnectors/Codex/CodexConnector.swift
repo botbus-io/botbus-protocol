@@ -100,6 +100,8 @@ public actor CodexConnector: TaskConnector {
         var owned: Bool
         /// 本轮是否已经收到过 `phase == final_answer` 的 agent 消息；收到之后就不再被 commentary 覆盖。
         var hasFinalAnswer: Bool
+        /// 协议 3.7：最近一次失败的 turn 带回的错误码换成的诊断。
+        var diagnosis: FailureDiagnosis? = nil
         /// 协议 3.2：线程下一轮的模型与思考强度（`thread/start` / `thread/resume` 的应答，或手机刚换过的）。
         var model: String? = nil
         var effort: String? = nil
@@ -591,9 +593,11 @@ public actor CodexConnector: TaskConnector {
             mutate(threadId) {
                 $0.currentTurnId = turnId.isEmpty ? nil : turnId
                 $0.hasFinalAnswer = false
+                // 上一轮的失败原因不带进这一轮：这一轮若因 systemError 失败，不能还说额度用完。
+                $0.diagnosis = nil
             }
             await claim(threadId)
-        case .turnCompleted(_, let turnId, _, _):
+        case .turnCompleted(_, let turnId, _, _, _):
             messageBuffers.removeValue(forKey: threadId)
             mutate(threadId) {
                 if turnId.isEmpty || $0.currentTurnId == turnId { $0.currentTurnId = nil }
@@ -623,10 +627,12 @@ public actor CodexConnector: TaskConnector {
             mutate(threadId) { $0.status = transition }
         }
         // 失败时把错误当作最后一条消息：TaskStore 的 TASK_FAILED 通知正文取的就是 lastMessage。
-        if case .turnCompleted(_, _, let status, let error) = notification, status == .failed,
-           let error, !error.isEmpty {
+        if case .turnCompleted(_, _, let status, let error, let errorInfo) = notification {
             mutate(threadId) {
-                $0.lastMessage = CodexThreadReader.truncate(error, limit: Self.messageLimit)
+                $0.diagnosis = status == .failed ? Self.diagnosis(errorInfo: errorInfo) : nil
+                if status == .failed, let error, !error.isEmpty {
+                    $0.lastMessage = CodexThreadReader.truncate(error, limit: Self.messageLimit)
+                }
             }
         }
 
@@ -1139,8 +1145,21 @@ public actor CodexConnector: TaskConnector {
                    controllable: true,
                    startedAt: ProtocolJSON.timestamp(thread.startedAt),
                    updatedAt: ProtocolJSON.timestamp(thread.updatedAt),
-                   model: thread.model, effort: thread.effort)
+                   model: thread.model, effort: thread.effort,
+                   diagnosis: thread.status == .failed ? thread.diagnosis : nil)
     }
+
+    /// Codex 的 `codexErrorInfo` → 协议 3.7 的诊断。`unauthorized` 是 token 不被认（没登录或已失效，手机上都让人重新 `codex login`）。
+    static func diagnosis(errorInfo: String?) -> FailureDiagnosis? {
+        switch errorInfo {
+        case "unauthorized": return .signInExpired
+        case "usageLimitExceeded", "rateLimitExceeded": return .usageLimit()
+        default: return nil
+        }
+    }
+
+    /// 和桌面版共用时 app-server 是桌面版起的，BotBus 的文件夹授权说明不了它（`TaskConnector.runsUnderBotBus`）。
+    public nonisolated var runsUnderBotBus: Bool { !sharedDesktop }
 
     static func protocolId(_ threadId: String) -> String { "\(ConnectorKind.codex.rawValue):\(threadId)" }
 

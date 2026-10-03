@@ -64,6 +64,40 @@ final class StreamJSONReaderTests: XCTestCase {
         XCTAssertEqual(result.value?.failed, false)
     }
 
+    /// 失败诊断（协议 3.7）只看报错的 `result` 行的原文：成功的 result 与 agent 的最后一段话都不算错误原文。
+    func testErrorTextComesOnlyFromAnErrorResultLine() throws {
+        func read(_ lines: [String]) throws -> StreamJSONReader.Result? {
+            let pipe = Pipe()
+            let finished = expectation(description: "stream finished")
+            let result = LockedResult()
+            let reader = StreamJSONReader(handle: pipe.fileHandleForReading)
+            reader.onFinished = { value in
+                result.value = value
+                finished.fulfill()
+            }
+            reader.start()
+            try pipe.fileHandleForWriting.write(contentsOf: Data((lines.joined(separator: "\n") + "\n").utf8))
+            try pipe.fileHandleForWriting.close()
+            wait(for: [finished], timeout: 2)
+            return result.value
+        }
+        let init_ = #"{"type":"system","subtype":"init","session_id":"s"}"#
+        let failed = try read([init_, #"{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}"#])
+        XCTAssertEqual(failed?.failed, true)
+        XCTAssertEqual(failed?.errorText, "Not logged in · Please run /login")
+        XCTAssertEqual(failed?.lastText, "Not logged in · Please run /login")
+
+        let succeeded = try read([init_, #"{"type":"result","subtype":"success","result":"You've hit your limit"}"#])
+        XCTAssertEqual(succeeded?.failed, false)
+        XCTAssertNil(succeeded?.errorText)
+
+        // 没等到 result 行：照样算失败，但最后一段话是 agent 说的，不是错误原文。
+        let cutOff = try read([init_, #"{"type":"assistant","message":{"content":[{"type":"text","text":"usage limit reached"}]}}"#])
+        XCTAssertEqual(cutOff?.failed, true)
+        XCTAssertEqual(cutOff?.lastText, "usage limit reached")
+        XCTAssertNil(cutOff?.errorText)
+    }
+
     /// `claude -p --resume` 配了 SessionStart hook 时，hook 行排在 `init` 前面，带的是临时 id。
     func testSessionIDComesFromInitNotFromEarlierHookLines() throws {
         let pipe = Pipe()

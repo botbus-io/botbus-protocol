@@ -28,13 +28,22 @@ public protocol DshHTTPTransport: Sendable {
     func post(_ url: URL, headers: [String: String], body: Data) async throws -> (status: Int, body: Data)
 }
 
-/// 生产用：ephemeral 会话、不存 cookie、15 秒超时。
+/// 生产用：ephemeral 会话、不存 cookie、不带 URLCache、15 秒超时。
+///
+/// 不带 URLCache 不只是为了不缓存：swift-corelibs-foundation（Linux / Windows，Swift 6.4.0 实测）上，配置里有
+/// URLCache 时（`.default`、`.ephemeral`、`URLSession.shared` 都有），`resume()` 先在后台 QoS 队列上查缓存，之后才建
+/// URLProtocol。等着 `data(for:)` 的 Swift 任务恰好在这段空当被取消（`DshConnector` 停掉任务时 POST 可能还在飞），
+/// `cancel()` 的回调排在 `startLoading` 后面；请求先做完、任务已从会话的登记表里拿掉，回调再跑就 trap
+/// （`TaskRegistry.swift`：`Trying to access a behaviour for a task that in not in the registry`）。没有 URLCache 时
+/// `resume()` 当场排上 `startLoading`，没有这段空当。连接器里别的 URLSession 也照这样配。
 public struct URLSessionDshHTTPTransport: DshHTTPTransport {
     public static let timeout: TimeInterval = 15
-    private let session: URLSession
+    let session: URLSession
 
     public init() {
         let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.httpShouldSetCookies = false
         configuration.httpCookieAcceptPolicy = .never
         configuration.timeoutIntervalForRequest = Self.timeout
