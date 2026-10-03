@@ -1,0 +1,12 @@
+{
+  "path": "/Users/me/Projects/demo",
+  "repoRoot": "/Users/me/Projects/demo",
+  "entries": [
+    { "name": "Sources", "kind": "dir", "mtimeMs": 1790000000000, "git": "M" },
+    { "name": "docs", "kind": "dir", "link": true, "mtimeMs": 1790000000000 },
+    { "name": "README.md", "kind": "file", "size": 1204, "mtimeMs": 1790000000000 },
+    { "name": "new.txt", "kind": "file", "size": 0, "mtimeMs": 1790000000000, "git": "?" },
+    { "name": ".env", "kind": "file", "size": 42, "mtimeMs": 1790000000000, "hidden": true }
+  ],
+  "truncated": true
+}

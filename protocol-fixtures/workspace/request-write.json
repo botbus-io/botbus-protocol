@@ -1,0 +1,8 @@
+{
+  "c": "AAECAwQFBgcICQoLDA0ODw",
+  "content": "+/8=",
+  "expect": { "mtimeMs": 1790000000123, "size": 2048 },
+  "p": "/fs/write",
+  "path": "/Users/me/Projects/demo/README.md",
+  "t": 1790000000500
+}

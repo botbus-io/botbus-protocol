@@ -21,7 +21,7 @@ const block = source.slice(start, end);
 const rcKey = await derive(crypto.getRandomValues(new Uint8Array(32)), "botbus/v1/remote-control");
 const agentId = "hV3nQ7pLxK2mR8sTfW4bZQ";
 globalThis.window = { __botbus: { key: base64url(rcKey), agentId } };
-const page = new Function(`${block}; return { rcReady, rcSeal, rcOpen, b64uEncode, b64uDecode, openJSON };`)();
+const page = new Function(`${block}; return { rcReady, rcSeal, rcOpen, b64uEncode, b64uDecode, openJSON, newChannel };`)();
 if (!(await page.rcReady())) throw new Error("页面没认出注入的密钥");
 const aad = `rc:${agentId}`;
 const enc = new TextEncoder(), dec = new TextDecoder();
@@ -41,6 +41,18 @@ const json = { armed: true, displays: [] };
 const response = { json: async () => ({ sealed: await seal(rcKey, enc.encode(JSON.stringify(json)), aad) }) };
 const openedJSON = await page.openJSON(response);
 if (JSON.stringify(openedJSON) !== JSON.stringify(json)) throw new Error("页面解不开 JSON");
+
+// 3.7：带通道号的请求，回复钉在请求上。
+const channel = page.newChannel();
+if (page.b64uDecode(channel).length !== 16 || channel.length !== 22) throw new Error("通道号不是 16 字节的 base64url");
+const stamp = Date.now();
+const boundAAD = `rc:${agentId}:res:${channel}:${stamp}`;
+const bound = { json: async () => ({ sealed: await seal(rcKey, enc.encode(JSON.stringify(json)), boundAAD) }) };
+const openedBound = await page.openJSON(bound, enc.encode(boundAAD));
+if (JSON.stringify(openedBound) !== JSON.stringify(json)) throw new Error("页面解不开钉在请求上的回复");
+let swapped = false;
+try { await page.openJSON(bound, enc.encode(`rc:${agentId}:res:${channel}:${stamp + 1}`)); } catch { swapped = true; }
+if (!swapped) throw new Error("页面收下了别的请求的回复");
 
 // 别的电脑（别的 AAD）封的：页面不认。
 let rejected = false;

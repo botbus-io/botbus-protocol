@@ -8,6 +8,8 @@ import Foundation
 /// Mac 的本机服务在 `/` 上也回它，只给本机调试用。Android、Windows 照同一份做（`loadDataWithBaseURL` 同理）。
 ///
 /// 密钥由 app 在页面加载前注入：`window.__botbus = {key: <K_rc 的 base64url>, agentId}`，不经 URL、不落盘。
+/// 3.7：`window.__botbus.embedded = true` 表示嵌在原生的「操作电脑」页里（锁由原生页头管，页面藏起解锁按钮）；
+/// 电脑的 `/status` 报了 `features` 时，输入另带通道号 `c`，回复钉在请求上（`SealingContext.remoteControlResponse`）。
 /// 画面包、状态、无障碍树、焦点都是密文（`0x01 ‖ nonce ‖ AES-256-GCM 密文 ‖ tag`，AAD `rc:<agentId>`），
 /// 输入封好再发，里面带请求路径 `p` 与严格递增的毫秒时间戳 `t`，Mac 据此挡住挪用与重放。
 ///
@@ -130,7 +132,7 @@ const log = m => $('log').textContent = m;
 // 密钥由 BotBus app 在加载前注入；直接在浏览器里打开这个页面时没有它，什么都解不开，也什么都发不出去。
 const BB = window.__botbus || null;
 const te = new TextEncoder(), td = new TextDecoder();
-let rcKey = null, lastStamp = 0;
+let rcKey = null, lastStamp = 0, rcChannel = null;
 function b64uDecode(s) {
   s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '=';
   return Uint8Array.from(atob(s), c => c.charCodeAt(0));
@@ -146,23 +148,25 @@ async function rcReady() {
   rcKey = await crypto.subtle.importKey('raw', b64uDecode(BB.key), 'AES-GCM', false, ['encrypt', 'decrypt']);
   return true;
 }
-async function rcOpen(bytes) {
+async function rcOpen(bytes, aad) {
   if (bytes[0] !== 1) throw new Error('sealed format');
   return new Uint8Array(await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: bytes.slice(1, 13), additionalData: rcAAD(), tagLength: 128 }, rcKey, bytes.slice(13)));
+    { name: 'AES-GCM', iv: bytes.slice(1, 13), additionalData: aad || rcAAD(), tagLength: 128 }, rcKey, bytes.slice(13)));
 }
-async function rcSeal(bytes) {
+async function rcSeal(bytes, aad) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = new Uint8Array(await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: rcAAD(), tagLength: 128 }, rcKey, bytes));
+    { name: 'AES-GCM', iv, additionalData: aad || rcAAD(), tagLength: 128 }, rcKey, bytes));
   const out = new Uint8Array(13 + ct.length);
   out[0] = 1; out.set(iv, 1); out.set(ct, 13);
   return out;
 }
-// 回来的 JSON 是 {"sealed": "..."}：解开后才是真的内容。
-async function openJSON(response) {
+// 3.7：电脑报了 features 才带通道号；带了通道号的请求，回复钉在那条请求上。
+function newChannel() { return b64uEncode(crypto.getRandomValues(new Uint8Array(16))); }
+// 回来的 JSON 是 {"sealed": "..."}：解开后才是真的内容。`aad` 省略时用旧的 rc:<agentId>。
+async function openJSON(response, aad) {
   const wrapper = await response.json();
-  return JSON.parse(td.decode(await rcOpen(b64uDecode(wrapper.sealed))));
+  return JSON.parse(td.decode(await rcOpen(b64uDecode(wrapper.sealed), aad)));
 }
 async function getJSON(path) { return openJSON(await fetch(path)); }
 
@@ -285,6 +289,7 @@ async function refreshStatus() {
   try {
     if (!(await rcReady())) return;
     const s = await getJSON('/status');
+    if (s.features && !rcChannel) rcChannel = newChannel();
     displays = s.displays || [];
     if (displayId === null && displays.length) displayId = displays[0].id;
     const display = displays.find(d => d.id === displayId) || displays[0];
@@ -335,14 +340,18 @@ const activeMods = () => [...document.querySelectorAll('.mod.on')].map(b => b.da
 const clearMods = () => document.querySelectorAll('.mod.on').forEach(b => b.classList.remove('on'));
 
 // 输入封好再发：路径 p 与严格递增的时间戳 t 进密文，Mac 据此拒绝被挪用、被重放的请求。
+// 3.7 的电脑另带通道号 c：防重放按通道记，回复钉在这条请求上。
 async function call(path, body) {
   if (!(await rcReady())) return null;
   lastStamp = Math.max(lastStamp + 1, Date.now());
-  const plain = JSON.stringify(Object.assign({}, body || {}, { p: path, t: lastStamp }));
+  const stamp = lastStamp, channel = rcChannel;
+  const fields = { p: path, t: stamp };
+  if (channel) fields.c = channel;
+  const plain = JSON.stringify(Object.assign({}, body || {}, fields));
   const sealed = b64uEncode(await rcSeal(te.encode(plain)));
   const response = await fetch(path, { method: 'POST', body: JSON.stringify({ sealed }) });
   if (!response.ok) return null;
-  return openJSON(response);
+  return openJSON(response, channel ? te.encode('rc:' + BB.agentId + ':res:' + channel + ':' + stamp) : undefined);
 }
 
 // 焦点决定手机怎么弹键盘。Chrome 不给网页内容建 AX 树，读不到焦点是常态，
@@ -621,6 +630,12 @@ $('armBtn').onclick = async () => {
 
 for (const id of ['width', 'fps', 'bitrate']) {
   $(id).addEventListener('change', () => openStream());
+}
+
+// 嵌在「操作电脑」页里时锁由原生页头管：藏起自己的解锁按钮和标题。单独打开（旧客户端、自动开的预览）不受影响。
+if (BB && BB.embedded) {
+  $('armBtn').style.display = 'none';
+  document.querySelector('header b').style.display = 'none';
 }
 
 hint();

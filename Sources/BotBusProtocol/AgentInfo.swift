@@ -286,10 +286,13 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
     public var worktrees: Bool?
     /// 协议 3.5：宿主能力，见 `HostCapabilities`。nil = 全部支持（现在的 Mac）。
     public var capabilities: HostCapabilities?
+    /// 协议 3.7：这台电脑提供「操作电脑」的工作区服务（文件，之后是终端），`remoteControl` 命令在没有屏幕的宿主上也能用。
+    /// 只写 true，nil = 没有。不放进 `HostCapabilities`：那里「省略 = 支持」，什么都不报的旧电脑会被当成有。
+    public var workspace: Bool?
 
     public init(agentId: String, name: String, platform: AgentPlatform = .macos, online: Bool,
                 lastSeenAt: String, appVersion: String, connectors: [ConnectorInfo], projectsRoot: String? = nil,
-                worktrees: Bool? = nil, capabilities: HostCapabilities? = nil) {
+                worktrees: Bool? = nil, capabilities: HostCapabilities? = nil, workspace: Bool? = nil) {
         self.agentId = agentId
         self.name = name
         self.platform = platform
@@ -300,10 +303,12 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         self.projectsRoot = projectsRoot
         self.worktrees = worktrees
         self.capabilities = capabilities
+        self.workspace = workspace
     }
 
     private enum CodingKeys: String, CodingKey {
         case agentId, name, platform, online, lastSeenAt, appVersion, connectors, projectsRoot, worktrees, capabilities
+        case workspace
     }
 
     /// 校验集中在这里：Connector 最多 16 个且按 (kind, connectorId) 去重。数量下限没有——空数组合法。
@@ -319,6 +324,7 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         projectsRoot = try container.decodeIfPresent(String.self, forKey: .projectsRoot)
         worktrees = try container.decodeIfPresent(Bool.self, forKey: .worktrees)
         capabilities = try container.decodeIfPresent(HostCapabilities.self, forKey: .capabilities)
+        workspace = try container.decodeIfPresent(Bool.self, forKey: .workspace)
 
         guard connectors.count <= Self.maxConnectors else {
             throw DecodingError.dataCorruptedError(
@@ -333,6 +339,10 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         if worktrees == false {
             throw DecodingError.dataCorruptedError(forKey: .worktrees, in: container,
                                                    debugDescription: "worktrees is only written as true")
+        }
+        if workspace == false {
+            throw DecodingError.dataCorruptedError(forKey: .workspace, in: container,
+                                                   debugDescription: "workspace is only written as true")
         }
     }
 }

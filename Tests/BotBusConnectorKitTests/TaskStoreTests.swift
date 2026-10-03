@@ -171,6 +171,17 @@ final class TaskStoreTests: XCTestCase {
         XCTAssertNil(win.capabilities)
     }
 
+    /// 协议 3.7：装了工作区服务的电脑报 `workspace: true`；没有的整个键省略。
+    func testAgentInfoReportsWorkspaceOnlyWhenSupported() async throws {
+        let identity = AgentIdentity(agentId: "agent-1", name: "本机", appVersion: "1.0")
+        let with = TaskStore(identity: identity, supportsWorkspace: true)
+        let reported = await with.snapshot().agents.first?.workspace
+        XCTAssertEqual(reported, true)
+        let without = TaskStore(identity: identity)
+        let omitted = await without.snapshot().agents.first?.workspace
+        XCTAssertNil(omitted)
+    }
+
     /// 协议 3.6：Linux 宿主要求手机 ≥ 3.5（更早的手机见到 `platform: "linux"` 会拒收整份快照），Mac 不要求。
     func testHostMinimumPhoneProtocol() {
         XCTAssertNil(HostIdentity.mac.minClientProtocol)

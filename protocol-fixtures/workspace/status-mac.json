@@ -1,0 +1,13 @@
+{
+  "features": ["files", "screen"],
+  "armed": true,
+  "armedUntil": 1790000600000,
+  "home": "/Users/me",
+  "platform": "macos",
+  "accessibility": true,
+  "screenCapture": true,
+  "secureInput": false,
+  "streaming": false,
+  "frontmost": "Safari",
+  "displays": [{ "id": 1, "x": 0, "y": 0, "width": 1512, "height": 982 }]
+}

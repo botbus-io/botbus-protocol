@@ -121,7 +121,9 @@ public struct Sealer: Sendable {
         Data(SHA256.hash(data: Data(aad.utf8)).prefix(Sealed.nonceLength))
     }
 
-    public func seal(_ plaintext: Data, aad: String) throws -> Sealed {
+    /// 原始字节的信封：`0x01 ‖ nonce ‖ AES-256-GCM 密文 ‖ tag`，不经 base64url。画面包、文件块这类大块数据直接用它，
+    /// `seal` 只是在它外面再包一层 base64url。
+    public func sealRaw(_ plaintext: Data, aad: String) throws -> Data {
         let nonceBytes = nonce(aad)
         let box = try AES.GCM.seal(plaintext, using: SymmetricKey(data: key),
                                    nonce: AES.GCM.Nonce(data: nonceBytes),
@@ -130,25 +132,33 @@ public struct Sealer: Sendable {
         bytes.append(nonceBytes)
         bytes.append(box.ciphertext)
         bytes.append(box.tag)
-        return Sealed(text: Base64URL.encode(bytes))
+        return bytes
     }
 
-    public func open(_ sealed: Sealed, aad: String) throws -> Data {
-        guard let bytes = Base64URL.decode(sealed.text),
-              bytes.count >= 1 + Sealed.nonceLength + Sealed.tagLength else { throw SealingError.malformed }
-        let version = bytes[bytes.startIndex]
+    public func openRaw(_ envelope: Data, aad: String) throws -> Data {
+        guard envelope.count >= 1 + Sealed.nonceLength + Sealed.tagLength else { throw SealingError.malformed }
+        let version = envelope[envelope.startIndex]
         guard version == Sealed.formatVersion else { throw SealingError.unsupportedVersion(version) }
-        let nonceStart = bytes.startIndex + 1
+        let nonceStart = envelope.startIndex + 1
         let cipherStart = nonceStart + Sealed.nonceLength
-        let tagStart = bytes.endIndex - Sealed.tagLength
+        let tagStart = envelope.endIndex - Sealed.tagLength
         do {
-            let box = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: bytes[nonceStart..<cipherStart]),
-                                            ciphertext: bytes[cipherStart..<tagStart],
-                                            tag: bytes[tagStart..<bytes.endIndex])
+            let box = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: envelope[nonceStart..<cipherStart]),
+                                            ciphertext: envelope[cipherStart..<tagStart],
+                                            tag: envelope[tagStart..<envelope.endIndex])
             return try AES.GCM.open(box, using: SymmetricKey(data: key), authenticating: Data(aad.utf8))
         } catch {
             throw SealingError.cannotOpen
         }
+    }
+
+    public func seal(_ plaintext: Data, aad: String) throws -> Sealed {
+        Sealed(text: Base64URL.encode(try sealRaw(plaintext, aad: aad)))
+    }
+
+    public func open(_ sealed: Sealed, aad: String) throws -> Data {
+        guard let bytes = Base64URL.decode(sealed.text) else { throw SealingError.malformed }
+        return try openRaw(bytes, aad: aad)
     }
 
     /// 明文是 `ProtocolJSON`（键排序）编码的 JSON。
@@ -175,8 +185,19 @@ public enum SealingContext {
     public static let clientName = "client"
     public static func artifact(agentId: String, artifactId: String) -> String { "artifact:\(agentId):\(artifactId)" }
     public static func keyEnvelope(agentId: String) -> String { "key-envelope:\(agentId)" }
-    /// 远程操作不钉预览 id：服务端口固定、预览可能换，挪用与重放靠密文里的路径与时间戳挡（见 `RemoteControlPage`）。
+    /// 远程操作不钉预览 id：同一个工作区服务可能同时有几份预览（不同任务各一份）共用它，预览也会换，
+    /// 挪用与重放靠密文里的路径与时间戳挡（见 `RemoteControlPage`）。
     public static func remoteControl(agentId: String) -> String { "rc:\(agentId)" }
+
+    /// 3.7：带通道号 `c` 的请求，回复钉在这一条请求上——Relay 把别的请求的回复挪过来解不开。
+    public static func remoteControlResponse(agentId: String, channel: String, stamp: Int64) -> String {
+        "rc:\(agentId):res:\(channel):\(stamp)"
+    }
+
+    /// 3.7：流式回复（`/fs/read`）的第 `index` 个包（从 0 起）。换序、丢包、拿别的文件的块都解不开。
+    public static func remoteControlPacket(agentId: String, channel: String, stamp: Int64, index: Int) -> String {
+        "rc:\(agentId):res:\(channel):\(stamp):\(index)"
+    }
 }
 
 /// 无填充的 base64url，与 Relay 的 `auth.ts` 同一套。
