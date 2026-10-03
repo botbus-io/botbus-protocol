@@ -125,6 +125,7 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "agent-info-acp.json": P.AgentInfo,
   "agent-info-models.json": P.AgentInfo,
   "agent-info-worktrees.json": P.AgentInfo,
+  "agent-info-workspace.json": P.AgentInfo,
   "agent-info-linux.json": P.AgentInfo,
   "agent-info-other-platform.json": P.AgentInfo,
   "connector-info-unavailable.json": P.ConnectorInfo,
@@ -210,6 +211,7 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
   "command-start-task-worktree-openclaw.json": P.Command,
   "command-start-task-worktree-outside-project.json": P.Command,
   "agent-info-worktrees-false.json": P.AgentInfo,
+  "agent-info-workspace-false.json": P.AgentInfo,
   "connector-info-effort-not-listed.json": P.ConnectorInfo,
   "event-system-permission-missing-dialog-text.json": P.Event,
   "pending-question-missing-options.json": P.Task,
@@ -223,13 +225,13 @@ describe("fixture 目录与对照表一一对应", () => {
     expect([...validFixtures.keys()].sort()).toEqual(Object.keys(SCHEMA).sort());
     expect(validFixtures.size).toBe(77);
     expect([...plainFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_SCHEMA).sort());
-    expect(plainFixtures.size).toBe(66);
+    expect(plainFixtures.size).toBe(67);
   });
   it("每个 invalid fixture 都在 MUST_REJECT / PLAIN_MUST_REJECT 表里", () => {
     expect([...invalidFixtures.keys()].sort()).toEqual(Object.keys(MUST_REJECT).sort());
     expect(invalidFixtures.size).toBe(4);
     expect([...plainInvalidFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_MUST_REJECT).sort());
-    expect(plainInvalidFixtures.size).toBe(18);
+    expect(plainInvalidFixtures.size).toBe(19);
   });
 });
 

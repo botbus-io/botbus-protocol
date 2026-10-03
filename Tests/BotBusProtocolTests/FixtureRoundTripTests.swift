@@ -144,6 +144,7 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(AgentInfo.self, "plain/agent-info-worktrees.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-linux.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-other-platform.json"),
+        roundTripCase(AgentInfo.self, "plain/agent-info-workspace.json"),
     ] }
 
     private static var relayCases: [FixtureCase] { [
@@ -190,6 +191,7 @@ final class FixtureRoundTripTests: XCTestCase {
         "plain/invalid/command-start-task-worktree-openclaw.json",
         "plain/invalid/command-start-task-worktree-outside-project.json",
         "plain/invalid/agent-info-worktrees-false.json",
+        "plain/invalid/agent-info-workspace-false.json",
     ]
 
     // MARK: - 往返
@@ -532,6 +534,13 @@ final class FixtureRoundTripTests: XCTestCase {
         XCTAssertThrowsError(try ProtocolJSON.decoder().decode(Command.StartTask.self, from: Data(empty.utf8)))
         let falsy = #"{"source":"claude","projectPath":"/p","prompt":"hi","worktree":false}"#
         XCTAssertThrowsError(try ProtocolJSON.decoder().decode(Command.StartTask.self, from: Data(falsy.utf8)))
+    }
+
+    /// 协议 3.7：`workspace` 只写 true，旧样本没有这个键。
+    func testWorkspaceFlagIsTrueOnly() throws {
+        XCTAssertEqual(try decodeFixture(AgentInfo.self, "plain/agent-info-workspace.json").workspace, true)
+        XCTAssertNil(try decodeFixture(AgentInfo.self, "plain/agent-info.json").workspace)
+        XCTAssertThrowsError(try decodeFixture(AgentInfo.self, "plain/invalid/agent-info-workspace-false.json"))
     }
 
     /// 协议 3.3：项目级自动批准。能力与状态都只写 true（没有时整键省略）；命令里 true / false 都有意义。

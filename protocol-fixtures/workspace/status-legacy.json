@@ -1,0 +1,9 @@
+{
+  "armed": false,
+  "accessibility": true,
+  "screenCapture": true,
+  "secureInput": false,
+  "streaming": false,
+  "frontmost": "Finder",
+  "displays": [{ "id": 1, "x": 0, "y": 0, "width": 1512, "height": 982 }]
+}

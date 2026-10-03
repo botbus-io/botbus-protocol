@@ -125,6 +125,8 @@ public actor TaskStore {
     private let hiddenTasksURL: URL?
     /// 这台电脑能不能从手机开 worktree 会话（`AgentInfo.worktrees`）：装了 `WorktreeManaging` 才是 true。
     private let supportsWorktrees: Bool
+    /// 这台电脑有没有「操作电脑」的工作区服务（`AgentInfo.workspace`，协议 3.7）：AgentHost 建了 `WorkspaceService` 才是 true。
+    private let supportsWorkspace: Bool
     /// 宿主平台与能力（协议 3.5），见 `HostIdentity`。
     private let host: HostIdentity
 
@@ -139,6 +141,7 @@ public actor TaskStore {
     ///   - autoApproveURL: 自动批准的项目设置；nil = 只在内存里（测试默认）。app 传 `defaultAutoApproveURL`。
     ///   - hiddenTasksURL: 隐藏会话的持久化文件；nil = 只在内存里。app 传 `defaultHiddenTasksURL`。
     ///   - supportsWorktrees: 分发器装了 `WorktreeManaging` 时传 true，快照的 `AgentInfo.worktrees` 随之为 true。
+    ///   - supportsWorkspace: 宿主建了工作区服务时传 true，快照的 `AgentInfo.workspace` 随之为 true。
     ///   - host: 宿主平台与能力（协议 3.5），原样进快照的 `AgentInfo.platform` / `capabilities`。
     public init(identity: AgentIdentity = AgentIdentity(),
                 host: HostIdentity = .mac,
@@ -148,6 +151,7 @@ public actor TaskStore {
                 autoApproveURL: URL? = nil,
                 hiddenTasksURL: URL? = nil,
                 supportsWorktrees: Bool = false,
+                supportsWorkspace: Bool = false,
                 artifactSaveDelay: TimeInterval = TaskStore.defaultArtifactSaveDelay,
                 outsideProjects: OutsideProjectRule = OutsideProjectRule(),
                 worktrees: WorktreeResolver = WorktreeResolver(),
@@ -164,6 +168,7 @@ public actor TaskStore {
         self.autoApproveURL = autoApproveURL
         self.hiddenTasksURL = hiddenTasksURL
         self.supportsWorktrees = supportsWorktrees
+        self.supportsWorkspace = supportsWorkspace
         self.artifactSaveDelay = artifactSaveDelay
         self.systemPermissionInspector = systemPermissionInspector
         self.systemPermissionInspectionTimeout = systemPermissionInspectionTimeout
@@ -600,7 +605,8 @@ public actor TaskStore {
                            connectors: connectors.connectors(taskCounts: counts),
                            projectsRoot: outsideProjects.projectsRoot,
                            worktrees: supportsWorktrees ? true : nil,
-                           capabilities: host.capabilities)
+                           capabilities: host.capabilities,
+                           workspace: supportsWorkspace ? true : nil)
         return Snapshot(agents: [me], tasks: visible, projects: mergedProjects(),
                         recentResults: [], seq: 0, generatedAt: generatedAt)
     }

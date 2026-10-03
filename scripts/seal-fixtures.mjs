@@ -30,6 +30,7 @@ const INFO = {
   content: "botbus/v1/content",
   notify: "botbus/v1/notify",
   artifactId: "botbus/v1/artifact-id",
+  remoteControl: "botbus/v1/remote-control",
   keyEnvelope: "botbus/v1/key-envelope",
 };
 
@@ -125,6 +126,7 @@ export const aad = {
   clientName: "client",
   artifact: (agentId, artifactId) => `artifact:${agentId}:${artifactId}`,
   keyEnvelope: (agentId) => `key-envelope:${agentId}`,
+  remoteControl: (agentId) => `rc:${agentId}`,
 };
 
 // ---- 领域对象 → 密封形状（与 Swift `SealedTypes.swift` 一致） ----
@@ -314,7 +316,50 @@ async function main() {
       { id: "c1RhbmRhcmQz", sealedName: androidName, addedAt: "2026-09-21T09:14:00Z" },
     ],
   });
-  console.log(`sealed ${count} fixtures + pairing fixtures into ${FIXTURES}`);
+  await writeWorkspaceSealed();
+  console.log(`sealed ${count} fixtures + pairing fixtures + workspace sample into ${FIXTURES}`);
+}
+
+/**
+ * 工作区（协议 3.7）的密封样本：`protocol-fixtures/workspace/sealed.json`。
+ * 用远程操作密钥 K_rc、固定的电脑 id / 通道号 / 时间戳，覆盖请求、一次性回复与 `/fs/read` 的流式回复三种形状，
+ * Swift 与 Kotlin 都拿同一份逐字节核对。明文请求取自同目录的 `request-write.json`。
+ */
+async function writeWorkspaceSealed() {
+  const rc = await derive(FIXTURE_ROOT_KEY, INFO.remoteControl);
+  const agentId = FIXTURE_AGENT_ID;
+  const channel = "AAECAwQFBgcICQoLDA0ODw";
+  const stamp = 1790000000500;
+  const text = (value) => new TextEncoder().encode(value);
+  const requestPlain = JSON.parse(readFileSync(join(FIXTURES, "workspace", "request-write.json"), "utf8"));
+  const replyPlain = { mtimeMs: 1790000000999, size: 3 };
+  const replyAad = `rc:${agentId}:res:${channel}:${stamp}`;
+
+  const parts = [
+    { kind: 0, payload: text(canonical({ contentType: "text/plain; charset=utf-8", mtimeMs: 1790000000123, size: 6 })) },
+    { kind: 1, payload: text("hello\n") },
+    { kind: 2, payload: text(canonical({ size: 6 })) },
+  ];
+  // 流：每包 `[u32 大端长度][密封后的原始字节]`，第 n 包的 AAD 带下标 n。
+  const frames = [];
+  for (const [n, part] of parts.entries()) {
+    const sealed = fromBase64url(await seal(rc, Uint8Array.from([part.kind, ...part.payload]), `${replyAad}:${n}`));
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(sealed.length);
+    frames.push(length, Buffer.from(sealed));
+  }
+
+  write("workspace/sealed.json", {
+    agentId,
+    channel,
+    stamp,
+    request: { plaintext: requestPlain, body: { sealed: await seal(rc, text(canonical(requestPlain)), aad.remoteControl(agentId)) } },
+    reply: { plaintext: replyPlain, sealed: await seal(rc, text(canonical(replyPlain)), replyAad) },
+    read: {
+      packets: parts.map((part) => ({ kind: part.kind, payload: base64url(part.payload) })),
+      stream: base64url(Buffer.concat(frames)),
+    },
+  });
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

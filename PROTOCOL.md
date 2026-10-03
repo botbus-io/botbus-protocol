@@ -1,6 +1,6 @@
 # BotBus 协议
 
-版本 **3.6**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
+版本 **3.7**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
 
 Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，Kotlin 实现（Android）是 `Protocol.kt`，密封层在同目录的 `Sealing.kt` / `SealedTypes.kt`。在 app 仓库里它们分别位于 `Packages/BotBusProtocol`、`relay/src/protocol.ts` 与 `android/core/src/main/kotlin/io/botbus/core/`；公开仓库 `botbus-io/botbus-protocol` 由 app 仓库自动同步，前两者在那里是 `Sources/BotBusProtocol` 与 `src/protocol.ts`。三端都必须通过 `protocol-fixtures/` 下全部样本的往返测试，且拒绝 `invalid/` 下的样本：顶层是线上的密封形状，`plain/` 是密文里的明文结构（见文末「Fixture 与类型对应」）。Swift 中 `Task` 命名为 `TaskRecord`。
 
@@ -14,7 +14,7 @@ Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，K
 | 三、审批与提问 | PendingRequest、PendingQuestion、`approve`、SystemPermissionNotice |
 | 四、对话与附件 | Message、MessageAttachment、MessageFileRef、TaskMessages、`fetchMessages` / `fetchFile` |
 | 五、产物与文件 | Artifact、产物字节的加密、WorkingChanges、`fetchChanges` |
-| 六、屏幕共享与远程操作 | `remoteControl`、远程操作的加密、预览主机与隧道 |
+| 六、屏幕共享与远程操作 | `remoteControl`、远程操作的加密、「操作电脑」工作区（3.7）、预览主机与隧道 |
 | 七、通知 | Notify、推送的加密与 APNs / FCM 载荷 |
 | 八、配对、凭据与设备 | 配对链接与密钥信封、配对码、多份客户端凭据 |
 | 附录 A | 版本沿革：每个版本加了什么、发布顺序 |
@@ -88,6 +88,8 @@ Relay 收到 `notify` 后按设备平台转成 APNs 或 FCM，不改 Snapshot，
 | 产物字节 | `artifact:<agentId>:<artifactId>`（手机上传的图钉的是目标电脑的 agentId） |
 | 密钥信封 | `key-envelope:<agentId>` |
 | 远程操作（用 `K_rc`） | `rc:<agentId>` |
+| 工作区带通道号的请求的 JSON 回复（3.7，用 `K_rc`） | `rc:<agentId>:res:<c>:<t>`（`c` 通道号、`t` 请求里的毫秒时间戳） |
+| 工作区流式回复（`/fs/read`）的第 n 个包（3.7，用 `K_rc`） | `rc:<agentId>:res:<c>:<t>:<n>`（n 从 0 起） |
 
 AAD 不含 pairId：跨组挪密文本来就解不开（K 不同），而 Mac 在收到 hello 之前不知道自己的 pairId。
 
@@ -216,6 +218,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 | projectsRoot | string? | 2.6 起。手机新建项目时 Agent 在这个目录（绝对路径）下建子文件夹；省略表示这台电脑不接受新建项目，手机不显示「新建项目」。Mac 默认是「文稿」里的 `BotBusProjects`，可在设置里改。这个目录本身算「不在项目中」 |
 | worktrees | true? | 3.4 起。电脑能从手机开 worktree 会话（`startTask.worktree`）、能 `mergeWorktree`；只写 true，不能时省略 |
 | capabilities | HostCapabilities? | 3.5 起。宿主能力；省略 = 全部支持（现在的 Mac 不报） |
+| workspace | true? | 3.7 起。电脑提供「操作电脑」的工作区服务（文件，之后是终端；见「工作区（3.7）」），没有屏幕的宿主也接受 `remoteControl`；只写 true，没有时省略。目前只有 Mac 报。不放进 `HostCapabilities`：那里省略 = 支持，什么都不报的旧电脑会被误判成有工作区 |
 
 ### HostCapabilities
 
@@ -223,7 +226,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 
 | 字段 | 类型 | 为 false 时手机怎么做 |
 |---|---|---|
-| remoteControl | boolean? | 不显示「电脑屏幕」入口、不发 `remoteControl` 命令 |
+| remoteControl | boolean? | 不显示屏幕那一段、不发 `remoteControl` 命令；3.7 起报了 `workspace` 的电脑例外：它没有屏幕也接受 `remoteControl`（预览里只有文件），手机照发 |
 | previews | boolean? | 不列 `preview` 产物 |
 | fetchFile | boolean? | 不显示还没取回的文件卡片、不发 `fetchFile` |
 | fetchChanges | boolean? | 不显示「未提交的改动」入口、不发 `fetchChanges` 探测（worktree 会话因此也没有合并按钮） |
@@ -414,7 +417,7 @@ ChangedFile：`path` string（相对 `directory`）；`oldPath` string?（改名
 
 ### 命令：remoteControl
 
-- remoteControl：`enabled` boolean（2.12 起。远程操作这台电脑的桌面——人不在电脑前、agent 卡在只有人能做的那一步时（登录、密码、确认弹窗），在手机上接管鼠标键盘。`true` 时 Mac 起本机的远程操作服务并按 `.port` 分享成一个预览，预览产物 id 放进 `CommandResult.artifactId`，手机换一次性入口打开它就是电脑屏幕；`false` 时停服务、撤分享。重复开启复用同一份，不叠开第二个。Relay 只转发，画面与输入都走既有的预览隧道，没有新端点。没允许录屏时回 `ok: false`；**没有辅助功能权限仍然成功**，只是那个预览只能看不能操作，页面顶部会说明。回执不带 `taskId`：它不属于任何一个任务。3.5 起宿主报了 `capabilities.remoteControl: false` 时手机不发这条命令，宿主收到也回 `ok: false`）
+- remoteControl：`enabled` boolean（2.12 起。远程操作这台电脑的桌面——人不在电脑前、agent 卡在只有人能做的那一步时（登录、密码、确认弹窗），在手机上接管鼠标键盘。`true` 时 Mac 起本机的远程操作服务并按 `.port` 分享成一个预览，预览产物 id 放进 `CommandResult.artifactId`，手机换一次性入口打开它就是电脑屏幕；`false` 时停服务、撤分享。重复开启复用同一份，不叠开第二个。Relay 只转发，画面与输入都走既有的预览隧道，没有新端点。没允许录屏时回 `ok: false`（3.7 起不再，见下）；**没有辅助功能权限仍然成功**，只是那个预览只能看不能操作，页面顶部会说明。回执不带 `taskId`：它不属于任何一个任务。3.5 起宿主报了 `capabilities.remoteControl: false` 时手机不发这条命令，宿主收到也回 `ok: false`。3.7 起报了 `AgentInfo.workspace` 的电脑：没有屏幕也接受 `enabled: true`（回的预览里只有文件）；没允许录屏不再回 `ok: false`，屏幕那段由页面说明；`enabled: false` 撤掉**全部**工作区预览（含 agent 卡在密码框时自动开的），第二期起另结束全部终端会话，细节见「工作区（3.7）」的生命周期。手机关页面时不发 `enabled: false`）
 
 远程操作的画面是 H.264（VideoToolbox 编码，AVCC + `avcC` 参数集，浏览器侧用 WebCodecs `VideoDecoder` 解），不是一帧帧的图片。**实测**（1280 宽 10fps）：静止桌面 JPEG 逐帧要 982 KB/s（3.4 GB/小时）而 H.264 只要 38 KB/s，打字 19 倍、持续滚动 7 倍。JPEG 几乎不随内容变化——它每帧都重传整张图；而「盯着一个卡住的页面想下一步」正是这个功能的主要姿势。靠比较字节来跳过没变的帧在真实桌面上无效：光标闪烁与菜单栏时钟让空闲帧常年为 0。
 
@@ -427,8 +430,105 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 查看页（`RemoteControlPage`，在 Protocol 包里）由客户端从自己的 app 包里加载，base URL 是预览主机，**不执行 Relay 送来的任何 HTML**：客户端先在原生层请求一次性入口（不跟随重定向），从 `Set-Cookie` 取会话 cookie 放进 WebView，再在文档开始前注入 `window.__botbus = {key: <K_rc 的 base64url>, agentId}`。之后：
 
 - Mac 回的 JSON（`/status`、`/focus`、`/elements`、输入的回执）是 `{"sealed": <信封>}`；`/stream` 的每个包是 `[u32 大端长度][密封的 [u8 类型][负载]]`（类型与负载同 2.12）。
-- 输入是 `POST` `{"sealed": <信封>}`，明文 JSON 里除原有字段外必须有请求路径 `p` 与严格递增的毫秒时间戳 `t`：Mac 拒绝路径对不上（把 `/click` 的密文挪到 `/type`）、时间戳不比上一条新（重放）、或偏离本机时钟两分钟以上的请求，一律 403。明文输入一律 403。
+- 输入是 `POST` `{"sealed": <信封>}`，明文 JSON 里除原有字段外必须有请求路径 `p` 与严格递增的毫秒时间戳 `t`：Mac 拒绝路径对不上（把 `/click` 的密文挪到 `/type`）、时间戳不比上一条新（重放）、或偏离本机时钟两分钟以上的请求，一律 403。明文输入一律 403。3.7 起请求还可带通道号 `c`，防重放与回复的钉法见下一节。
 - 没有组密钥时 Mac 的远程操作服务整个不可用；远程操作的预览产物带 `Artifact.remoteControl = true`，客户端据此选用加密查看页。
+
+### 工作区（3.7）
+
+3.7 起 `remoteControl` 回的预览是「操作电脑」的**工作区**：电脑在本进程里处理 `/status`、`/arm`、`/fs/*`，其余路径（屏幕的 `/stream`、`/click`……）转给 Mac 的屏幕服务，没有屏幕时 404。工作区由 `AgentInfo.workspace` 声明，目前只有 Mac 报。线上类型在 Protocol 包的 `Workspace.swift`，样本在 `protocol-fixtures/workspace/`。终端（第二期）不在本节。
+
+加密沿用上一节的预览隧道与 `K_rc`，Relay 只转发、看不到也不解析；没有组密钥时整个工作区不可用（403），不会退回明文。
+
+#### 状态与锁
+
+- **`GET /status`**：回 `{"sealed": …}`，AAD 仍是 `rc:<agentId>`（GET 没有请求体，回复钉不到请求上；旧 Mac 也有这个端点，手机靠它认出新功能）。明文是 `WorkspaceStatus`：`features`（`files` / `terminal` / `screen` 的子集，开集：不认得的值忽略；Mac 报 `["files", "screen"]`，没有屏幕的宿主只有 `["files"]`，`terminal` 第二期才有；3.6 的 Mac 没有这个键，按只有屏幕处理）、`armed`、`armedUntil`（解锁时是到期的毫秒时间戳，锁着时省略）、`home`（电脑上的主目录）、`platform`（`macos` / `linux` / `windows`），以及有屏幕服务时才有的屏幕字段（`accessibility`、`screenCapture`、`secureInput`、`streaming`、`frontmost`、`displays`，与 2.12 相同）。`POST /status` 回同样的内容，只是请求走下面的密封请求。
+- **锁**：屏幕的点击与键入、所有文件写操作（`/fs/write`、`/fs/mkdir`、`/fs/create`、`/fs/rename`、`/fs/trash`、`/fs/upload/*`）共用一把。默认锁着；`/arm` 带 `on` 开关并回 `WorkspaceStatus`，请求体解不开按「锁上」处理并照常回状态：出了岔子时落在更安全的一边，手机从回复里看得到。解锁后闲置 10 分钟锁回，每次真实输入或写操作顺延 10 分钟。读（`/fs/list`、`/fs/read`、`/status`、屏幕画面）不受锁限制；写在锁着时回失败 `locked`。
+
+#### 请求与防重放
+
+- **请求**：`POST {"sealed": <信封>}`，AAD 是 `rc:<agentId>`。明文是请求体的 JSON 对象并上 `p`（请求路径）、`t`（毫秒时间戳）和 `c`（通道号）；请求体自己不能带 `p` / `t` / `c`。`c` 是手机每次打开页面生成的 16 个随机字节的 base64url：恰好 22 个字符、只用 `[A-Za-z0-9_-]`、末位是规范写法（只有 `A` `Q` `g` `w`）。一个页面从打开到关闭只用一个 `c`，重试、重连都不换；同一通道里 `t` 不能重复，同一毫秒内连续发请求时加一。`/fs/*` 只收带 `c` 的请求；`/status`、`/arm` 与屏幕的输入不带 `c` 也收（旧页面、旧手机）。页面与原生只在 `GET /status` 报了 `features` 时才带 `c`，旧 Mac 不认它。
+- **核对**：`p` 对不上、`t` 偏离电脑时钟两分钟以上、解不开（不是这台手机封的）、重放、`c` 带了但不合规（数字、`null`、写法不对），一律是不加密的 `403 rejected`，不透露是哪一种；进程内处理的路径（`/status`、`/arm`、`/fs/*`）里 `GET /status` 之外只收 POST（否则 405），请求体超过 16 MiB 回 413；转给屏幕服务的路径不受这条限制（`/stream`、`/focus`、`/elements` 是 GET，输入是 POST，照 2.12）。不带 `c` 的请求要求 `t` 比上一条不带 `c` 的更大（全局严格递增，旧行为）；带 `c` 的请求按通道记两分钟窗口里见过的 `t`，重复的拒，允许经 Relay 乱序到达（手机同时列目录又在打字不会被误挡）。
+- **表有上限**：最多同时记 64 个通道、每个通道 4096 个时间戳（两分钟里点不到这么多）。表满时先腾出整个都在窗口之外的通道，不提前赶走还在窗口里的；还满就回不加密的 **`503 busy`**（正文是 `busy`；Relay 自己回的 503 是 HTML 说明页）：这条请求没被记账，可以原样重发（只要 `t` 还在两分钟窗口里，否则换新的 `t`）。
+- **全局下限**：窗口里过期的时间戳会被剪掉、通道被腾出去时它的时间戳也一起丢掉，但丢掉的不是白丢——其中最大的记成一条全局下限，之后 `t` 不大于它的带 `c` 请求一律当重放，所以电脑的时钟往回跳（睡眠醒来后 NTP 校时）也放不回已经收过的请求。BotBus 重启、换组密钥或解除配对（凭据真的变了）时，两套记录（带 `c` 的窗口与不带 `c` 的全局计数）清空，两条下限都抬到「当时 − 1 毫秒」：时间戳早于那一刻的请求不能再收；用旧钥匙解开、却在重置之后才到记账那一步的请求同样拒。凭据没变时（Relay 的 hello 帧只改了 pairId 提示、重复写入同一份凭据）什么都不动，Relay 借不到清空重放记录的机会。下限只升不降。
+- **时钟的两个注意**：下限假定手机的时钟不比电脑快过「重置所花的时间」（重启、重新配对）——否则上一个进程收过的、盖着更靠前的未来时间戳的请求，重启之后可能再被收一次；要完全堵上得把见过的最大时间戳落盘，刻意不做。反过来，重置那一刻电脑的时钟若快了很多，校准之后要等真实时间追上（或再重启 BotBus）才收得进请求；手机的时钟比电脑慢时同理，要等手机的时间走过重置那一刻（慢多少等多久）：宁可拒绝，不放重放。
+
+#### 回复
+
+- **钉在请求上**：带 `c` 的请求，JSON 回复的 AAD 是 `rc:<agentId>:res:<c>:<t>`，流式回复（`/fs/read`）的第 n 个包是 `rc:<agentId>:res:<c>:<t>:<n>`（n 从 0 起）。Relay 把别的请求的回复、别的文件的块、换了序的包挪过来都解不开——否则 Relay 换掉文件内容，手机编辑后保存就会把错的内容写回去。不带 `c` 的请求照旧用 `rc:<agentId>`。屏幕的 `/stream` 是另一套：包照旧用 `rc:<agentId>` 与自己的分帧，不钉在请求上。
+- **JSON 回复**：HTTP 200 `{"sealed": <信封>}`，明文是下表的结果对象，失败是 `{"failure": …}`。手机先看顶层有没有 `failure` 键：有就是失败，哪怕里面的内容坏了。
+- **`/fs/read` 的流**：HTTP 200 `application/octet-stream`，body 是一串 `[u32 大端长度][密封包]`，每个密封包 ≤ 1 MiB（长度为 0 或大于 1 MiB 时这条流不能再用，整条丢掉），明文是 `[u8 类型][负载]`：`0` 头 `{size, mtimeMs, contentType?}`，`1` 文件字节（每包 ≤ 256 KiB），`2` 结束 `{size}`（总字节数）。**没收到结束包的流（中途出错、隧道断开）一律算失败**，别把残缺的内容当成文件。流开始之前的失败（找不到、不是普通文件、没权限）是上面的 JSON 失败回复，不是流。**客户端看响应头 `content-type` 区分**：`application/octet-stream` 是包流；`application/json` 是密封的失败回复（`/fs/read` 的 JSON 回复只会是失败）；`text/plain` 是不加密的 403 / 503 等。流开始之后出错，流以隧道的 `error` 结束，没有失败体。
+
+| 路径 | 明文请求 | 回复 |
+|---|---|---|
+| `/status`（POST） | — | `WorkspaceStatus` |
+| `/arm` | `on` | `WorkspaceStatus` |
+| `/fs/list` | `path`, `hidden?` | `{path, entries: [{name, kind: file\|dir\|other, link?, size?, mtimeMs, hidden?, git?}], truncated?, repoRoot?}` |
+| `/fs/read` | `path` | 分块流（见上） |
+| `/fs/write` | `path`, `content`（**标准 base64**）, `expect?: {mtimeMs, size}` | `{mtimeMs, size}` |
+| `/fs/mkdir`、`/fs/create` | `path` | `{}` |
+| `/fs/rename` | `from`, `to` | `{}` |
+| `/fs/trash` | `path` | `{}` |
+| `/fs/upload/begin` | `dir`, `name`, `size` | `{uploadId}` |
+| `/fs/upload/chunk` | `uploadId`, `offset`, `bytes`（**标准 base64**） | `{received}` |
+| `/fs/upload/commit` | `uploadId` | `{path}` |
+
+**`content` 与 `bytes` 是标准 base64**：字母表 `A-Za-z0-9+/`，带 `=` 补位，不含换行——不是协议别处用的无填充 base64url。电脑用 Foundation 严格的 `Data(base64Encoded:)` 解，写成 base64url（`-` `_`）、缺补位或夹了换行的一律回 `invalid`。样本 `workspace/request-write.json` 的 `content` 是 `+/8=`（字节 `0xFB 0xFF`），就是为了覆盖这几处。
+
+#### 失败
+
+失败是 HTTP 200 加密封的 `{"failure": {code, detail?, current?}}`，手机按 `code` 显示本地化文案；`detail` 是给排查看的英文，不直接显示。`code` 是开集：不认得的按 `failed`（目录项的 `kind` 也一样，不认得的按 `other`），不拒收整份回复。
+
+| code | 什么时候 |
+|---|---|
+| notFound | 路径不存在；对断掉的软链接写 |
+| notDirectory | 要目录，给了文件 |
+| exists | 新建、改名、上传落地时名字已被占 |
+| tooLarge | 写超过 1 000 000 字节、上传块超过 4 MiB、上传文件超过 2 GiB、块写出了声明的大小 |
+| invalid | 路径不是绝对路径或含 NUL；请求体对不上这条路由要的形状、`content` / `bytes` 不是标准 base64；要普通文件却给了设备、管道、目录；上传的名字不合法、偏移对不上、没收齐就提交；跨文件系统改名；移 `/` 进废纸篓 |
+| denied | 没有权限（`EACCES`、`EROFS`；Mac 上被锁定的文件、系统目录里的 `EPERM`） |
+| tcc | Mac 的隐私保护拒绝（见「文件」） |
+| timeout | 操作超过 20 秒；`detail: "busy"` 时是电脑上同时卡住的操作太多，或同一个上传正在写（见下） |
+| locked | 锁着时的写操作 |
+| conflict | `/fs/write` 的 `expect` 对不上，带电脑上现在的 `current: {mtimeMs, size}` |
+| uploadGone | 上传不存在、已被清理或作废 |
+| failed | 其余：没空间、同时的上传太多（`too many uploads`）、这个平台还不支持（Linux / Windows 的废纸篓、Windows 的文件） |
+
+**忙与超时。** 文件操作都在电脑上一个专用的队列里跑：第一次进「文稿」「桌面」等受保护目录时系统会在电脑上弹授权框、调用一直卡着，网络卷也一样。每个操作最多等 20 秒（也留出了 Relay 等 `res` 的 30 秒），超时回 `timeout`。线程在系统调用里没法取消，所以**超时只是不再等它，操作可能仍在继续、之后才完成**；同时在途的操作（含已经超时、线程仍卡着的）最多 8 个，再来的立刻回 `timeout`（`detail: "busy"`）。两种「忙」的重试语义不同：
+
+- 明文 `503 busy`：通道表或时间戳表满了，这条请求没被记账，可以原样重发。
+- 密封的 `timeout`（包括 `detail: "busy"`）：这条请求已经被记账，重试必须换一个新的 `t` 重新封装，否则会被当成重放回 403。写操作（`/fs/write`、新建、改名、移到废纸篓、上传的块与提交）收到 `timeout` 不能假定它没生效：先重新列目录（或读文件的 `{mtimeMs, size}`）再决定怎么重试；`/fs/write` 带着 `expect` 重发，冲突时会回 `conflict`；上传的块与提交本身是幂等的（见「上传」）。
+
+#### 文件
+
+路径一律是电脑上的绝对路径，不限制在项目目录里（终端本来就能碰到整台电脑，这里是同一份权限的另一个界面）。电脑按字面规范化路径：丢掉空段与 `.`，`..` 退一层但不会越过根（`/..` 就是 `/`），不解析软链接，不含 NUL，不以 `/` 开头的一律 `invalid`；回复里的路径是规范化之后的。Windows 的盘符路径本期不支持（回 `failed`）。
+
+- **列目录**：目录在前，再按名字（不分大小写）；最多 5000 项，多了截断并标 `truncated`；点开头的名字默认不列，请求 `hidden: true` 才列并标 `hidden: true`。软链接按它指向的东西报（`kind`、`size`、`mtimeMs` 都取目标的）并标 `link: true`，指向目录的能点进去；断掉的或读不了的是 `other`。`size` 只有文件有。
+- **读**：只读普通文件（软链接跟到它指向的文件）；设备、管道、目录回 `invalid`——先 `stat` 确认再打开，不去打开它们（打开设备节点本身有副作用）。头里的 `contentType` 按扩展名猜（软链接取它指向的文件的扩展名），猜不出是 `application/octet-stream`；这只是个提示，手机另按内容判断是不是文本。
+- **写**（`/fs/write`）：整份文本，≤ 1 000 000 字节（先按 base64 的长度挡一道，超了回 `tooLarge`，不先解码）。目标已存在时必须是（软链接指向的）普通文件并且可写，否则 `invalid` / `denied`，不会把目录、管道换掉；断掉的软链接回 `notFound`、链接原样留着；写软链接就是写它指向的文件。目标不存在时新建（0644 去掉 umask）；带了 `expect` 却不存在回 `notFound`。写到同目录的临时文件 `.botbus-write-<id>`（先 0600 创建，写完、定好权限、`fsync`）再原子改名替换：保留原文件的权限位（不含 setuid / setgid / sticky），Mac 上另带过去 ACL 与扩展属性（隔离标记等，尽力而为），**不保留属主、创建时间与硬链接关系**（硬链接的文件保存后与别的名字脱钩）——这是原子替换的代价。带 `expect` 时在改名之前再比一次修改时间与大小（agent 可能正在改它），对不上回 `conflict` 并带上现在的样子；「检查之后又被改」的空当在没有文件锁的文件系统上消除不了。成功回写完之后的 `{mtimeMs, size}`。
+- **新建**：`/fs/mkdir`（0755）、`/fs/create`（空文件，0644 去掉 umask）；已存在（含断掉的软链接）回 `exists`，不清空。
+- **改名**（`/fs/rename`）：从不覆盖，目标已存在（含断掉的软链接、空目录）回 `exists`。Mac 用 `renamex_np(RENAME_EXCL)`，是原子的「目标不存在才改」，只改大小写的改名在大小写不敏感的卷上也行；其他平台先查再改，有极小的空当，目标与源是同一个条目的两个名字（同设备同 inode，且是目录或链接数为 1）时才放行。只在原地改：跨文件系统回 `invalid`，不做复制再删除。
+- **移到废纸篓**（`/fs/trash`）：目前只有 Mac（`FileManager.trashItem`），软链接本身进废纸篓、不跟链接，不永久删除、移不进去时（跨卷、网络盘）回错误；`/` 回 `invalid`。Linux（XDG Trash）与 Windows（回收站）第三期做，之前回 `failed`。
+- **Mac 的隐私保护（TCC）**：访问「文稿」「桌面」「下载」等受保护目录被系统拒绝时底层是 `EPERM`，回 `tcc`，页面要提示用户回电脑上允许一次（授权框弹在电脑上，手机按不到）。但 `EPERM` 也是「文件被锁定（`uchg` / `schg`）」「SIP 保护的系统目录」的错误：路径本身或上一级带 immutable 标志、或在 `/System`、`/bin`、`/sbin`、`/usr`（`/usr/local` 除外）之下时回 `denied`；看不出来的按 `tcc`。普通权限不足（`EACCES`）是 `denied`。
+
+#### 上传
+
+隧道单个请求体最多 16 MiB，所以文件拆成「开始 / 分块 / 提交」三步：
+
+- `begin {dir, name, size}`：`dir` 必须是已有的目录；`name` 非空、不是 `.` 或 `..`、不含 `/` 与 NUL、≤ 255 字节，否则 `invalid`；`size` 在 0 到 2 GiB 之外回 `tooLarge`。电脑在 `dir` 里建临时文件 `.botbus-upload-<id>`，回 `{uploadId}`。没提交的上传同时最多 16 个，满了回 `failed`（`too many uploads`）。
+- `chunk {uploadId, offset, bytes}`：每块解出来 ≤ 4 MiB（先按 base64 的长度挡一道再解码）；`offset` 必须等于已收到的字节数，回 `{received}`。重发已经收过的块（回执丢了）不再写、原样回当前进度；缺了一块（`offset` 超前）回 `invalid`；超出声明的 `size` 回 `tooLarge`；同一个上传上另一块还在写、或正在提交时回 `timeout`（`detail: "busy"`），用新的 `t` 稍后重试。写块失败这个上传就作废（连临时文件一起丢），之后回 `uploadGone`。
+- `commit {uploadId}`：必须收齐（已收到 = `size`），否则 `invalid`。原子落地、从不覆盖：目标名字已存在就依次试「名字 2.扩展名」「名字 3.扩展名」……（与 Finder 一样；整个名字不超过 255 字节，需要时截短主体、不截扩展名；最多试 1000 个，都占着回 `exists`）；名字在检查之后又被别人占了也只是换下一个。回 `{path}`。重复提交已经提交过的上传回同一个路径（记录保留 10 分钟，供回执丢了时重发）。落地失败时不删临时文件、上传还在，可以再提交。
+- 10 分钟没有新块的上传连同临时文件一起被清掉（有上传在时每 60 秒扫一次，正在写或提交的不动），之后回 `uploadGone`。停掉工作区时全部没提交的上传立刻作废、临时文件在后台删掉。BotBus 崩溃或被强退时，`.botbus-upload-*`、`.botbus-write-*` 临时文件会留在目录里，暂不自动清理。
+
+#### git 标记
+
+`/fs/list` 的 `entries[].git` 与 `repoRoot`，一眼看出 agent 改过哪些文件。标记是 `M`（修改）、`A`（新增）、`D`（删除）、`?`（未跟踪）、`U`（冲突）；只给所列这一层的名字，目录里有改动时目录标 `M`（有冲突标 `U`，压过一切），改名按删除加新增算。读的是只读的 git 命令（`diff HEAD`、`ls-files --others` 等），**不执行仓库里的任何东西**：仓库自带的 `filter.<名>` 驱动在命令行上被清空，外部 diff 与 textconv 关闭，不进子模块，不许缺对象时联网懒加载，不用会写回索引的 `git status`。代价是只改了修改时间、内容没变的文件也会标成 `M`。
+
+**标记可以缺**：不在仓库里、仓库根是 `/`、主目录或包着主目录的目录（家目录里放 dotfiles 仓库很常见，扫整个家目录既慢又会碰到隐私授权）、仓库根不是所列目录本身或它的祖先（`core.worktree` 指到别处的不去那里扫）、整个进程里同时在算的已有 2 份、任何一条命令超过 2 秒、起不了 git、仓库里有没法安全废掉的过滤器驱动（名字含非可打印 ASCII 或 `=`，或超过 32 个）时，列表照常出来，只是没有 `git` 与 `repoRoot`。手机不能把「没有标记」读成「没有改动」或「不是仓库」。
+
+#### 生命周期
+
+- **开启**：手机发 `remoteControl {enabled: true}`，回预览产物 id；agent 停下来等人、电脑上又有密码框聚焦时，Mac 也会自动开一份挂在那条任务上的（要同时有辅助功能、录屏权限与聚焦的密码框，标题是「电脑屏幕」）。工作区预览共用一个来源：同一个任务再开会替换旧的那份，不同任务的可以并存。没有组密钥时开启失败，不会退回明文；没允许录屏不影响开启，文件照常能用，`/status` 里 `screenCapture: false`，屏幕那段由页面说明原因。
+- **停止**：`remoteControl {enabled: false}` 撤掉**全部**工作区预览（包括自动开的、挂在任务上的），锁回输入、丢掉没提交的上传、停屏幕服务；手机关页面时不发它。预览因别的原因结束（到期、被顶掉、菜单里停止分享）时，没有别的工作区预览在用就同样收尾，还有别的在用则什么都不动。BotBus 退出、解除配对或配对被撤销也一样收尾，退出时不等磁盘。
 
 ### 预览主机与隧道
 
@@ -551,6 +651,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - 版本 3.4 加入**手机开 worktree 会话与合并回检出分支**：`startTask.worktree`、`AgentInfo.worktrees`、`WorkingChanges.mergeTarget` 与命令 `mergeWorktree`。都在密文里：Relay 只改版本号，两条最低线不动。
 - 版本 3.5 加入**宿主能力与新平台**（为 Linux 宿主准备，之后是 Windows）：`AgentPlatform` 新增 `linux`、`windows` 并改为开集（三端遇到不认得的值按「其他」处理）；`AgentInfo.capabilities`（`remoteControl` / `previews` / `fetchFile` / `fetchChanges`，均为可选布尔，省略 = 支持），Linux 报 `remoteControl: false`（没有屏幕）与 `previews: false`（第一版的预览隧道依赖静态 Linux 构建不支持的 WebSocket），手机据此隐藏入口、不发探测（`previews: false` 在预览隧道换掉 URLSession 的 WebSocket 后去掉）。都在密文里：Relay 只改版本号，眼下两条最低线不动；Linux 宿主发布时手机要 3.5（原计划抬全局 `MIN_CLIENT_PROTOCOL`，3.6 改成按组要求）。同一批还加入了**命令 ack**：Agent 收到命令回 `{"type":"ack","commandIds":[…]}`，Relay 对回 ack 的 Agent 按「至少一次」投递（见「连接语义」）；最早带 ack 的构建报的还是 3.4，所以 Relay 也把回过 ack 的连接当作会回 ack。
 - 版本 3.6 加入**按组的手机最低版本**：Agent 的 `ready` 帧可带 `minClientProtocol`（在信封外面，Relay 路由用的元数据），Linux 宿主报 3.5、Mac 不报；组里各台电脑的最高值就是这一组对手机的要求，版本不够的手机在 PairObject 里收与全局最低线同样的 412（已连着的推送连接以 4002 关闭），只有 Mac 的组照旧服务 3.1 起的手机，全局 `MIN_CLIENT_PROTOCOL` 不抬。带 `minClientProtocol` 的电脑要求 Relay ≥ 3.6。同时 Relay 按 Agent 握手报的版本分开投递语义：≥ 3.5（或回过 ack 的连接）至少一次，更早的（Mac 1.0）用 ack 之前的语义，免得它的命令在每次重连时重发、到期补假的 `expired`。发布顺序：部署 Relay 3.6 → 发 Linux 宿主（要求 3.5 的 iOS / Android 已上架）。
+- 版本 3.7 加入**「操作电脑」的工作区**（见「工作区（3.7）」）：`AgentInfo.workspace`；`remoteControl` 回的预览里多了 `/fs/*`（浏览、读写、上传文件），没有屏幕的宿主也能开；请求可带通道号 `c`，防重放改成按通道记窗口并另有全局下限，回复钉在请求上。都在密文里、走既有的预览隧道：Relay 只改版本号，两条最低线不动；旧手机照常只用屏幕，3.6 的 Mac 不报 `workspace`，新手机连它只有屏幕那一段。
 
 ## 附录 B：Fixture 与类型对应
 
@@ -633,6 +734,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | command-start-task-worktree-auto-approve.json | Command（3.4 startTask 同时带 3.3 的 `autoApprove` 与 `worktree`） |
 | command-merge-worktree.json | Command（3.4 合并 worktree 会话回检出分支） |
 | agent-info-worktrees.json | AgentInfo（3.4 带 `worktrees: true`） |
+| agent-info-workspace.json | AgentInfo（3.7 带 `workspace: true`） |
 | agent-info-linux.json | AgentInfo（3.5 `platform: linux`，`capabilities` 报 `remoteControl: false, previews: false`，其余省略） |
 | agent-info-other-platform.json | AgentInfo（3.5 不认得的平台 `freebsd` 原样往返；`capabilities` 四个键都写了，`fetchFile: true` 与省略同义） |
 | working-changes-merge-target.json | WorkingChanges（3.4 带 `mergeTarget`） |
@@ -657,3 +759,6 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | invalid/command-start-task-worktree-openclaw.json | 必须被拒绝：`source = openclaw` 却带 `worktree` |
 | invalid/command-start-task-worktree-outside-project.json | 必须被拒绝：`projectPath` 为空串（不在项目中）却带 `worktree` |
 | invalid/agent-info-worktrees-false.json | 必须被拒绝：`worktrees` 只写 true，不能写 false |
+| invalid/agent-info-workspace-false.json | 必须被拒绝：`workspace` 只写 true，不能写 false |
+
+`protocol-fixtures/workspace/` 是工作区（3.7）的样本，Relay 不读：明文的 `WorkspaceStatus`（`status-mac.json`、`status-linux.json`、3.6 Mac 的 `status-legacy.json`）、`WorkspaceListing`（`listing.json`）、失败外形（`failure-conflict.json`，以及带不认得的 code 的 `failure-unknown-code.json`）、请求明文（`request-write.json`），以及由 `node scripts/seal-fixtures.mjs` 生成的 `sealed.json`（固定钥匙与确定性 nonce 封的请求、钉在请求上的回复、3 个包的 `/fs/read` 流，不要手改）。Swift 的 `WorkspaceWireTests` 逐字节核对它们；`android/core` 要在手机端实现时补上对应的测试（目前只有 Swift 一边核对）。

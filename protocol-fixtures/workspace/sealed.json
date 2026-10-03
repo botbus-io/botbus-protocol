@@ -1,0 +1,45 @@
+{
+  "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+  "channel": "AAECAwQFBgcICQoLDA0ODw",
+  "stamp": 1790000000500,
+  "request": {
+    "plaintext": {
+      "c": "AAECAwQFBgcICQoLDA0ODw",
+      "content": "+/8=",
+      "expect": {
+        "mtimeMs": 1790000000123,
+        "size": 2048
+      },
+      "p": "/fs/write",
+      "path": "/Users/me/Projects/demo/README.md",
+      "t": 1790000000500
+    },
+    "body": {
+      "sealed": "ATokqbZxauRGjZetT9Dv-kpGb63r2JZKmsbNTx7uBwZxJHJ_sHGTKStewF1lH4DH9mE6n4OZHwZqRJKOx8j_bgA4sGulPvFsuB4MLcgQGHy2_SPVMZZYImdHsJ9JfjHp7r_P3B56vDp58OZmzzk41zoQDVBxYOz3-N9UyzycMoURAKLKzmmJyaXGdjV4eIm6dvw2eY4HmtP6uXQM24cm6s6x2Eho2qGVqUCwWmlJCuCouNXaA2vKRtDQ6oN5Yt-5FGuJw10vlfw"
+    }
+  },
+  "reply": {
+    "plaintext": {
+      "mtimeMs": 1790000000999,
+      "size": 3
+    },
+    "sealed": "AZgoBNnietoKdJ7iW572CKlZVnxCqucpRZQCR_ixwnuRANhE-BOCEbV9Tf_BihmjQRxkyePJCrsJYsrxoeq3"
+  },
+  "read": {
+    "packets": [
+      {
+        "kind": 0,
+        "payload": "eyJjb250ZW50VHlwZSI6InRleHQvcGxhaW47IGNoYXJzZXQ9dXRmLTgiLCJtdGltZU1zIjoxNzkwMDAwMDAwMTIzLCJzaXplIjo2fQ"
+      },
+      {
+        "kind": 1,
+        "payload": "aGVsbG8K"
+      },
+      {
+        "kind": 2,
+        "payload": "eyJzaXplIjo2fQ"
+      }
+    ],
+    "stream": "AAAAagHpMBgQyu8xt-QgF1Reqvq99P0XdpyIUBzsvayWYH1BIMp9w0jauawzlVOAi9E8X7rL2wNB5awwjJ1ptro3o4sAIARsm2NxI8MCIid17Yi-b3fIX_QNqCm5H2r_0EBqEuavnNNVlcwZNOwAAAAkATqr1FP8TEtKrzb00o52RtJQecmGrbNoNNHQTPncY7FbTcIcAAAAKAH002TwsUHLOiK7kROsduS6co9_z55JtUBFBSCLHwxcx8JvUrHYgAU"
+  }
+}

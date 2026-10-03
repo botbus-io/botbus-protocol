@@ -327,6 +327,8 @@ export const AgentInfo = z.object({
   worktrees: z.literal(true).optional(),
   /** 协议 3.5：宿主能力；省略 = 全部支持。 */
   capabilities: HostCapabilities.optional(),
+  /** 协议 3.7：电脑提供「操作电脑」的工作区服务（文件，之后是终端）。只写 true。 */
+  workspace: z.literal(true).optional(),
 });
 
 // ---- Snapshot ----
