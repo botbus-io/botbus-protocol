@@ -228,6 +228,27 @@ enum ClaudeSessionHistory {
         return nil
     }
 
+    // MARK: - 电脑上处理过这次工具调用没有
+
+    /// transcript 末尾 `tailBytes` 里有没有这个 `tool_use_id` 的 `tool_result`：hook 超时后电脑上的权限框里
+    /// 批过（工具跑完了）或拒过，都会写一条。只解析含这个 id 的行；读不到当作没有。
+    /// 批了但工具还在跑的那段时间还没有结果，分辨不出来。
+    static func hasToolResult(for toolUseID: String, inTranscriptAt path: String) -> Bool {
+        guard !toolUseID.isEmpty, let handle = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return false }
+        let offset = size > UInt64(tailBytes) ? size - UInt64(tailBytes) : 0
+        guard (try? handle.seek(toOffset: offset)) != nil, let data = try? handle.readToEnd() else { return false }
+        let marker = Data(toolUseID.utf8)
+        return lines(data, dropFirst: offset > 0, dropLast: false).contains { line in
+            guard line.range(of: marker) != nil,
+                  let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
+                  object["type"] as? String == "user",
+                  let blocks = (object["message"] as? [String: Any])?["content"] as? [[String: Any]] else { return false }
+            return blocks.contains { $0["type"] as? String == "tool_result" && $0["tool_use_id"] as? String == toolUseID }
+        }
+    }
+
     // MARK: - 解析细节
 
     static func titleValue(_ object: [String: Any], _ key: String) -> String? {

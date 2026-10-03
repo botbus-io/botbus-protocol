@@ -164,15 +164,17 @@ public enum ClaudeHookInstaller {
         try? FileManager.default.removeItem(at: scriptURL(in: supportDirectory))
     }
 
-    /// 用户装过——settings 里有我们的条目——才升级；没装过的不碰，装 hook 要用户在设置里点头。两种旧装：
+    /// 用户装过——settings 里有我们的条目——才升级；没装过的不碰，装 hook 要用户在设置里点头。三种旧装：
     /// - settings 不是全套（老版本少 `StopFailure` / `SessionEnd`）：按当前版本重装一遍；
+    /// - `PermissionRequest` 的超时不是当前值（2 分钟时代装的是 130 秒，Claude Code 到点就掐掉 hook）：同样重装；
     /// - 脚本不是当前版本（例如 v1 不带 hook 密钥）：只重写脚本，settings 一个字节不动。
     /// 返回是否改了东西。
     @discardableResult
     public static func upgradeIfNeeded(paths: ClaudePaths, supportDirectory: URL) throws -> Bool {
         let settings = try loadSettings(at: paths.settingsFile)
         guard hasAnyOfOurs(in: settings) else { return false }
-        if !isInstalled(in: settings, scriptPath: scriptURL(in: supportDirectory).path) {
+        if !isInstalled(in: settings, scriptPath: scriptURL(in: supportDirectory).path)
+            || !hasCurrentPermissionTimeout(in: settings) {
             try install(paths: paths, supportDirectory: supportDirectory)
             return true
         }
@@ -184,6 +186,15 @@ public enum ClaudeHookInstaller {
     /// 支持目录里的脚本和当前版本逐字节相同？整份比较：模板改了哪怕一个字（`scriptVersion` 每次改都要加一）都算旧。
     static func isScriptCurrent(in supportDirectory: URL) -> Bool {
         FileManager.default.contents(atPath: scriptURL(in: supportDirectory).path) == Data(script.utf8)
+    }
+
+    /// 我们的 `PermissionRequest` 条目带的是不是当前的超时。不算进 `isInstalled`：设置页照样显示已安装，
+    /// 只由 `upgradeIfNeeded` 悄悄改对。
+    static func hasCurrentPermissionTimeout(in settings: [String: Any]) -> Bool {
+        let matchers = (settings["hooks"] as? [String: Any])?[ClaudeHookEvent.Kind.permissionRequest.rawValue]
+            as? [[String: Any]] ?? []
+        let ours = matchers.flatMap { $0["hooks"] as? [[String: Any]] ?? [] }.filter(isOurs)
+        return !ours.isEmpty && ours.allSatisfy { ($0["timeout"] as? Int) == permissionTimeoutSeconds }
     }
 
     /// 这份 settings 里有没有任何一条本工具的 hook。
