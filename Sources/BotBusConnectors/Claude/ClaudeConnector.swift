@@ -194,6 +194,8 @@ public actor ClaudeConnector: TaskConnector {
     /// 正在起 `--resume`、还没拿到 session id 的会话。这几秒里 `ownProcesses` 还没登记，
     /// 期间到达的续聊同样要排队（actor 在等 id 时会重入）。
     private var launching: Set<String> = []
+    /// 最近一次 `publish` 的那一趟：后来的等它推完再推，见 `publish(notify:)`。
+    private var lastPublish: Task<Void, Never>?
     /// `--resume` 分支出新 session 后，旧 session id 就放在这里。
     /// 之后从桌面来的 hook 事件照样带着旧 id，如果放行就会把旧会话重新拉进列表，
     /// 用户在手机上又看到两条——所以这里拦截，让旧会话安静地留在电脑上。
@@ -853,8 +855,23 @@ public actor ClaudeConnector: TaskConnector {
     /// 协议里没有项目事件，只能靠它触发一份全量快照。`reconcile` 传空任务列表是安全的：
     /// 它只会删掉 observer 拥有的 id，而我们的都是 live。
     ///
+    /// 一趟接一趟地推，不并发：一趟里每个会话之间都要 await store，actor 在这些点上可重入。两趟交错时，
+    /// 先开始的那趟拿着旧的会话副本，可能在后一趟之后才写进 store——比如 `start` 推「运行中」时这一轮
+    /// 已经退出、`finish` 推了 failed，store 最后停在「运行中」，之后再也没人推。排队之后，每趟都在前一趟
+    /// 写完之后才读会话，最后写进 store 的总是最后一次改动之后读到的状态。
+    ///
     /// - Parameter notify: false = 静默写入，给启动补历史用——那是基线，不是变化。
     private func publish(notify: Bool = true) async {
+        let previous = lastPublish
+        let pass = Task {
+            await previous?.value
+            await publishNow(notify: notify)
+        }
+        lastPublish = pass
+        await pass.value
+    }
+
+    private func publishNow(notify: Bool) async {
         for session in sessions.values {
             await store.claimLive(taskId(for: session.sessionID))
             await store.upsert(record(session), notify: notify)
