@@ -41,10 +41,13 @@ final class UnixSocketTests: XCTestCase {
         try server.start()
         defer { server.stop() }
 
-        for _ in 0..<20 {
+        for accepted in 1...20 {
             let client = try UnixSocketConnection.connect(path: directory + "/s.sock")
             client.write("hello")
             client.closeAfterPendingWrites()
+            // 等服务端接走这个连接再连下一个：监听队列只有 16（macOS 上排满了 `connect` 直接 ECONNREFUSED），
+            // 机器一忙 accept 跟不上，一口气连 20 个就会被拒。
+            await assertEventually(timeout: 5) { counter.current == accepted }
         }
         await assertEventually(timeout: 5) { closed.current.count == 20 }
         XCTAssertEqual(Set(received.current.values), ["hello\n"])

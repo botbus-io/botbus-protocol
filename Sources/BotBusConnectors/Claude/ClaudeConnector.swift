@@ -42,6 +42,9 @@ public actor ClaudeConnector: TaskConnector {
     #endif
     /// `claude` 一行 init 都没吐就退出了（参数不认、没登录……）。新建时认它来决定要不要去掉 `--name` 重起。
     static let exitedWithoutSessionID = ConnectorError("claude 退出了，没有拿到 session id")
+    /// `claude` 退出后最多再等 stdout 的 EOF 这么久。它起的后台进程（Bash 工具、MCP server）会继承 stdout，
+    /// 它们不退，EOF 就不来；平常进程一退 EOF 就到，不靠这个上限。
+    static let drainTimeout: TimeInterval = 2
     /// 标题上限，对齐协议里 Claude 取首条 prompt 截断 80 字。
     static let titleLimit = 80
     /// 只发图、不写字新建任务时的标题，与 `CodexConnector.imageOnlyTitle` 一致。仍记为占位，之后第一条带字的 prompt 会换掉它。
@@ -923,16 +926,17 @@ public actor ClaudeConnector: TaskConnector {
                                                          model: chosen.model, effort: chosen.effort, name: name),
                                workingDirectory: projectPath, environment: injection?.environment ?? [:], stdin: input)
         }
-        let sessionID: String
+        let launched: Launch
         do {
-            sessionID = try await launch(name)
+            launched = try await launch(name)
         } catch let error as ConnectorError where name != nil && error == Self.exitedWithoutSessionID {
             // 老版本 claude 不认 `--name`，一行 init 都没吐就退了（这时什么都还没做）：不带名字再起一次。
             // 别的原因（没登录……）早退的，第二次照样报同一个错。
             Self.log.info("claude 没吐 init 就退出了，去掉 --name 再起一次")
-            sessionID = try await launch(nil)
+            launched = try await launch(nil)
             binaryWithoutName = executable
         }
+        let sessionID = launched.sessionID
         // 先记下会话再 await：这一轮的审批随时可能从 stdout 到（见 `handleControl`），得找得到它。
         var session = makeSession(id: sessionID, projectPath: projectPath, origin: .watch)
         session.chosenModel = chosen.model
@@ -943,6 +947,7 @@ public actor ClaudeConnector: TaskConnector {
             session.pendingRequest = existing.pendingRequest
         }
         sessions[sessionID] = session
+        launched.registered()
         if let injection { await registry.bind(injection.token, taskId: taskId(for: sessionID)) }
         await publish()
         return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
@@ -981,9 +986,10 @@ public actor ClaudeConnector: TaskConnector {
         let input = try Self.stdinMessage(prompt: prompt, images: images)
         let turn = QueuedTurn(prompt: prompt, input: input, hasImages: !images.isEmpty,
                               model: chosen.model, effort: chosen.effort)
-        // 我们自己起的那一轮还没跑完：排队，等它结束再 `--resume`。同时起两个 `claude -p --resume`
+        // 我们自己起的那一轮还没收尾：排队，等它结束再 `--resume`。同时起两个 `claude -p --resume`
         // 会把 transcript 分叉成两支，后一条看不到前一条的回答（手机在运行中也能发送）。
-        if launching.contains(sessionID) || ownProcesses[sessionID]?.isRunning == true {
+        // 看登记而不是 `isRunning`：进程退出后 `finish` 还要等读完输出，这时另起一轮，`finish` 会把新进程的登记与 stdin 一起收掉。
+        if isOwnTurn(sessionID) {
             queued[sessionID, default: []].append(turn)
             return ConnectorOutcome(taskId: sessionID, retainsLiveOwnership: true)
         }
@@ -1002,10 +1008,11 @@ public actor ClaudeConnector: TaskConnector {
         launching.insert(sessionID)
         defer { launching.remove(sessionID) }
         let injection = await AgentToolsInjection.make(tools(), registry: registry, reusing: self.taskId(for: sessionID))
-        let newID = try await run(arguments: Self.arguments(resuming: sessionID, injection: injection,
-                                                            model: turn.model, effort: turn.effort),
-                                  workingDirectory: workingDirectory, environment: injection?.environment ?? [:],
-                                  stdin: turn.input)
+        let launched = try await run(arguments: Self.arguments(resuming: sessionID, injection: injection,
+                                                               model: turn.model, effort: turn.effort),
+                                     workingDirectory: workingDirectory, environment: injection?.environment ?? [:],
+                                     stdin: turn.input)
+        let newID = launched.sessionID
         // 会话先改好再 await（绑 token）：这一轮的审批随时可能从 stdout 到（见 `handleControl`）。
         if newID != sessionID {
             var branched = makeSession(id: newID, projectPath: workingDirectory, origin: .watch)
@@ -1031,6 +1038,7 @@ public actor ClaudeConnector: TaskConnector {
                 session, _ in if !earlyCard { session.status = .running }
             }
         }
+        launched.registered()
         // 先把「开始跑了」推给 store，再 await 绑 token：进程若立刻失败，`finish` 会趁这个空当发布 failed，
         // store 就没见过 running——`turnEndCount` 不涨，「BotBus 起的这一轮」的标记漏给下一轮。
         await publish()
@@ -1262,6 +1270,16 @@ public actor ClaudeConnector: TaskConnector {
         base.merging(extra) { _, injected in injected }
     }
 
+    /// `run` 起好的一轮。调用方把会话记好（新建、分支或标成在跑）之后调 `registered()`，这一轮的 `finish` 才会跑：
+    /// claude 早早退出（没登录……）时，读端收尾的 `Task` 可能比 `run` 的返回先抢到 actor，找不到会话就把结果丢了，
+    /// 任务一直挂在「运行中」。
+    private struct Launch {
+        let sessionID: String
+        let gate: OneShotContinuation<Void>
+
+        func registered() { gate.resume(returning: ()) }
+    }
+
     /// 起一个 `claude -p …` 并**只等到 session id 出现就返回**。
     ///
     /// 剩下的输出在后台接着读，用来把任务推进到结束——命令回执是"已接受"，不是"已完成"，
@@ -1270,7 +1288,7 @@ public actor ClaudeConnector: TaskConnector {
     /// stdin 是一根管道：起来后先写 `stdin`（这一轮的 user 消息），之后留着写控制协议的回答，
     /// 读到 `result`（或进程退出）时关掉。
     private func run(arguments: [String], workingDirectory: String,
-                     environment extra: [String: String] = [:], stdin: Data) async throws -> String {
+                     environment extra: [String: String] = [:], stdin: Data) async throws -> Launch {
         guard let executable = binary() else {
             throw ConnectorError("本机没找到 claude 可执行文件", diagnosis: .agentNotInstalled)
         }
@@ -1299,14 +1317,20 @@ public actor ClaudeConnector: TaskConnector {
         }
         // 一轮结束：关 stdin（EOF），claude 才会退出。
         reader.onResult = { channel.close() }
+        let launched = OneShotContinuation<Void>()
         reader.onFinished = { [weak self] result in
-            Task { await self?.finish(result) }
+            // 一行 init 都没读到就结束了：别让调用方一直等到超时。
+            sessionID.resume(throwing: Self.exitedWithoutSessionID)
+            Task {
+                try? await launched.value()
+                await self?.finish(result)
+            }
         }
         process.terminationHandler = { _ in
-            // 一行 init 都没吐出来就退了：别让调用方一直等到超时。
-            sessionID.resume(throwing: Self.exitedWithoutSessionID)
             channel.close()
-            reader.finish()
+            // 收尾等读到 EOF：进程退出时 init / result 可能还在管道里没读，这时收尾会把它们丢掉
+            // （没读到 init 还会被当成不认 `--name`，同一句话再跑一遍）。孙进程攥着 stdout 时 EOF 不来，过一会儿就不等了。
+            DispatchQueue.global().asyncAfter(deadline: .now() + Self.drainTimeout) { reader.finish() }
         }
 
         do {
@@ -1327,11 +1351,13 @@ public actor ClaudeConnector: TaskConnector {
             id = try await awaitSessionID(sessionID)
         } catch {
             channel.close()
+            // 没有会话可登记：这一轮的 `finish` 照常跑（找不到会话就不管）。
+            launched.resume(returning: ())
             throw error
         }
         ownProcesses[id] = process
         controls[id] = channel
-        return id
+        return Launch(sessionID: id, gate: launched)
     }
 
     /// 等 session id，带硬超时。两条路径抢的是同一个 `OneShotContinuation`，
