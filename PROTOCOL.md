@@ -415,7 +415,7 @@ agent 回传给手机的一件产物（2.3 起），挂在 `Task.artifacts` 上�
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| id | string | image / file / video / link：Agent 生成，22 字符 base64url（16 随机字节）；preview：Relay 分配的 26 字符小写 base32（`[a-z2-7]`），同时是预览主机名 `p-<id>` 的一部分 |
+| id | string | image / file / video / link：Agent 生成，22 字符 base64url（16 随机字节）；preview：Relay 分配的 26 字符小写 base32（`[a-z2-7]`），同时是预览主机名 `p-<id>[<后缀>]` 的一部分 |
 | kind | `image` \| `file` \| `video` \| `preview` \| `link` | 闭集，未知值拒绝整条 |
 | title | string | 截断 80 字。image / file / video 的客户端拿它当下载后的文件名，没有扩展名时按 `contentType` 补；Agent 保证 file 的标题带原文件的扩展名 |
 | createdAt | string | |
@@ -613,9 +613,9 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 
 ### 预览主机与隧道
 
-预览入口是 `https://p-<previewId>.<PREVIEW_DOMAIN>`（线上为 `botbus.io`；只用一级通配子域，免费 Universal SSL 才覆盖得到）。Worker 在所有路径路由之前按 `Host` 分流（主机名不区分大小写）：
+预览入口是 `https://p-<previewId>[<后缀>].<PREVIEW_DOMAIN>`（线上为 `p-<previewId>.botbus.io`，测试环境 `relay-test.botbus.io` 的后缀是 `-t`，即 `p-<previewId>-t.botbus.io`；只用一级通配子域，免费 Universal SSL 才覆盖得到）。后缀是 Relay 的部署配置（`PREVIEW_HOST_SUFFIX`），客户端不拼主机名，只用 `session` 返回的完整 URL。Worker 在所有路径路由之前按 `Host` 分流（主机名不区分大小写）：
 
-- `^p-([a-z2-7]{26})\.<PREVIEW_DOMAIN>$` 交给该预览——这个主机上的任何路径都属于预览，不会落到 API；`<PREVIEW_DOMAIN>` 本身与其他子域原样回源，不拦截别的站点；其余主机（`*.workers.dev`）照常是 API。
+- `^p-([a-z2-7]{26})<后缀>\.<PREVIEW_DOMAIN>$` 交给该预览——这个主机上的任何路径都属于预览，不会落到 API；`<PREVIEW_DOMAIN>` 本身与其他子域原样回源，不拦截别的站点；其余主机（`*.workers.dev`）照常是 API。线上 Relay 另把测试环境的预览主机（`p-<id>-t`）原样转给测试 Relay（Cloudflare 内部的 service binding），对客户端透明。
 - 预览不存在或已过期 → 404 HTML 页（预览已结束）。停止分享或过期那一刻还在途的请求回 502（电脑连接中断，见下），之后的新请求才是 404。
 - `GET /__botbus/auth?ticket=<t>`：ticket 一次性、60 秒有效。通过后签发会话 token（Relay 只存哈希，有效到预览过期），回 `302 Location: /` 与 `Set-Cookie: __botbus_preview=<token>; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=<剩余秒数>`（cookie 不带 `Domain`，只对这一个预览主机有效）；失败回 401 简短 HTML 说明页。这个路径不会转给 Mac。
 - 其余请求先校验这个 cookie（无效 → 401 HTML 页，提示回 BotBus 重新打开），把 `__botbus_preview` 从转发的 `Cookie` 头里删掉后经隧道转给 Mac；隧道未连接 → 503 HTML 页（电脑离线或已停止分享）。
