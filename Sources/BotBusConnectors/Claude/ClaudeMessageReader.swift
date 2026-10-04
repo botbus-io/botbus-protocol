@@ -63,6 +63,11 @@ public struct ClaudeMessageReader: MessageReader {
     /// 不使用 hook 的任意路径，拒绝目录/文件软链接越界与非 UUID 的路径注入。
     static func deleteTranscript(sessionID: String, in projectsDirectory: URL) throws {
         guard UUID(uuidString: sessionID) != nil else { throw ConnectorError("会话 id 不合法") }
+        // swift-corelibs-foundation（Linux / Windows）枚举一个普通文件不报错、只回空列表：先认定它是目录。
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: projectsDirectory.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+            throw ConnectorError("会话记录目录不可用，不能删除")
+        }
         // 删除不能复用只读查找的 try?：没有权限枚举不等于已经删除。
         let directories: [URL]
         do {
@@ -84,13 +89,16 @@ public struct ClaudeMessageReader: MessageReader {
         }
     }
 
+    /// 按真实路径比：解析后必须正好是 `<projects>/<一层目录>/<sessionId>.jsonl`。不比 `resolvingSymlinksInPath()`
+    /// 出来的 `URL`：Windows 上两边的写法对不上，正常的记录也会被拒（`realPath` 与 `PlatformPath` 管分隔符与大小写）。
     private static func removeTranscript(_ url: URL, sessionID: String, in projectsDirectory: URL) throws {
-        let root = projectsDirectory.resolvingSymlinksInPath().standardizedFileURL
-        let resolved = url.resolvingSymlinksInPath().standardizedFileURL
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
         guard values.isRegularFile == true, values.isSymbolicLink != true,
-              resolved.deletingLastPathComponent().deletingLastPathComponent() == root,
-              resolved.lastPathComponent == "\(sessionID).jsonl" else {
+              let root = TranscriptFileRefs.realPath(projectsDirectory.path),
+              let resolved = TranscriptFileRefs.realPath(url.path),
+              let relative = PlatformPath.relativePath(of: resolved, under: root),
+              case let parts = PlatformPath.components(String(relative)), parts.count == 2,
+              PlatformPath.same(String(parts[1]), "\(sessionID).jsonl") else {
             throw ConnectorError("会话记录路径不安全，不能删除")
         }
         try FileManager.default.removeItem(at: url)

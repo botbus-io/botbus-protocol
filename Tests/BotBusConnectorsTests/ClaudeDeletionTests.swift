@@ -38,8 +38,24 @@ final class ClaudeDeletionTests: XCTestCase {
         let id = UUID().uuidString.lowercased()
         let outside = root.appendingPathComponent("\(id).jsonl")
         try Data("keep".utf8).write(to: outside)
-        try FileManager.default.createSymbolicLink(at: project.appendingPathComponent("\(id).jsonl"), withDestinationURL: outside)
+        try makeSymbolicLink(at: project.appendingPathComponent("\(id).jsonl"), withDestinationURL: outside)
         XCTAssertThrowsError(try ClaudeMessageReader.deleteTranscript(sessionID: id, in: root.appendingPathComponent("projects")))
+        XCTAssertEqual(try String(contentsOf: outside, encoding: .utf8), "keep")
+    }
+
+    /// 项目目录本身是指到外面的软链接：不跟进去，外面的同名文件不删。
+    func testIgnoresProjectDirectorySymlinkOutsideAgentData() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("claude-delete-dir-link-\(UUID())")
+        let projects = root.appendingPathComponent("projects")
+        let elsewhere = root.appendingPathComponent("elsewhere")
+        try FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID().uuidString.lowercased()
+        let outside = elsewhere.appendingPathComponent("\(id).jsonl")
+        try Data("keep".utf8).write(to: outside)
+        try makeSymbolicLink(at: projects.appendingPathComponent("encoded-project"), withDestinationURL: elsewhere)
+        try? ClaudeMessageReader.deleteTranscript(sessionID: id, in: projects)
         XCTAssertEqual(try String(contentsOf: outside, encoding: .utf8), "keep")
     }
 }
