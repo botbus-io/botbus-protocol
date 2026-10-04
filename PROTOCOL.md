@@ -447,7 +447,7 @@ ChangedFile：`path` string（相对 `directory`）；`oldPath` string?（改名
 
 ### 命令：remoteControl
 
-- remoteControl：`enabled` boolean（2.12 起。远程操作这台电脑的桌面——人不在电脑前、agent 卡在只有人能做的那一步时（登录、密码、确认弹窗），在手机上接管鼠标键盘。`true` 时 Mac 起本机的远程操作服务并按 `.port` 分享成一个预览，预览产物 id 放进 `CommandResult.artifactId`，手机换一次性入口打开它就是电脑屏幕；`false` 时停服务、撤分享。重复开启复用同一份，不叠开第二个。Relay 只转发，画面与输入都走既有的预览隧道，没有新端点。没允许录屏时回 `ok: false`（3.7 起不再，见下）；**没有辅助功能权限仍然成功**，只是那个预览只能看不能操作，页面顶部会说明。回执不带 `taskId`：它不属于任何一个任务。3.5 起宿主报了 `capabilities.remoteControl: false` 时手机不发这条命令，宿主收到也回 `ok: false`。3.7 起报了 `AgentInfo.workspace` 的电脑：没有屏幕也接受 `enabled: true`（回的预览里只有文件）；没允许录屏不再回 `ok: false`，屏幕那段由页面说明；`enabled: false` 撤掉**全部**工作区预览（含 agent 卡在密码框时自动开的），第二期起另结束全部终端会话，细节见「工作区（3.7）」的生命周期。手机关页面时不发 `enabled: false`）
+- remoteControl：`enabled` boolean（2.12 起。远程操作这台电脑的桌面——人不在电脑前、agent 卡在只有人能做的那一步时（登录、密码、确认弹窗），在手机上接管鼠标键盘。`true` 时 Mac 起本机的远程操作服务并按 `.port` 分享成一个预览，预览产物 id 放进 `CommandResult.artifactId`，手机换一次性入口打开它就是电脑屏幕；`false` 时停服务、撤分享。重复开启（同一台或另一台手机）复用还活着的那一份、回同一个产物 id，不叠开第二个，也不顶掉别的手机正在看的；离到期不到 10 分钟时才新开一份替换它（3.7 起的细节见「工作区（3.7）」的生命周期）。Relay 只转发，画面与输入都走既有的预览隧道，没有新端点。没允许录屏时回 `ok: false`（3.7 起不再，见下）；**没有辅助功能权限仍然成功**，只是那个预览只能看不能操作，页面顶部会说明。回执不带 `taskId`：它不属于任何一个任务。3.5 起宿主报了 `capabilities.remoteControl: false` 时手机不发这条命令，宿主收到也回 `ok: false`。3.7 起报了 `AgentInfo.workspace` 的电脑：没有屏幕也接受 `enabled: true`（回的预览里只有文件）；没允许录屏不再回 `ok: false`，屏幕那段由页面说明；`enabled: false` 撤掉**全部**工作区预览（含 agent 卡在密码框时自动开的），第二期起另结束全部终端会话，细节见「工作区（3.7）」的生命周期。手机关页面时不发 `enabled: false`）
 
 远程操作的画面是 H.264（VideoToolbox 编码，AVCC + `avcC` 参数集，浏览器侧用 WebCodecs `VideoDecoder` 解），不是一帧帧的图片。**实测**（1280 宽 10fps）：静止桌面 JPEG 逐帧要 982 KB/s（3.4 GB/小时）而 H.264 只要 38 KB/s，打字 19 倍、持续滚动 7 倍。JPEG 几乎不随内容变化——它每帧都重传整张图；而「盯着一个卡住的页面想下一步」正是这个功能的主要姿势。靠比较字节来跳过没变的帧在真实桌面上无效：光标闪烁与菜单栏时钟让空闲帧常年为 0。
 
@@ -477,6 +477,7 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 #### 请求与防重放
 
 - **请求**：`POST {"sealed": <信封>}`，AAD 是 `rc:<agentId>`。明文是请求体的 JSON 对象并上 `p`（请求路径）、`t`（毫秒时间戳）和 `c`（通道号）；请求体自己不能带 `p` / `t` / `c`。`c` 是手机每次打开页面生成的 16 个随机字节的 base64url：恰好 22 个字符、只用 `[A-Za-z0-9_-]`、末位是规范写法（只有 `A` `Q` `g` `w`）。一个页面从打开到关闭只用一个 `c`，重试、重连都不换；同一通道里 `t` 不能重复，同一毫秒内连续发请求时加一。`/fs/*` 只收带 `c` 的请求；`/status`、`/arm` 与屏幕的输入不带 `c` 也收（旧页面、旧手机）。页面与原生只在 `GET /status` 报了 `features` 时才带 `c`，旧 Mac 不认它。
+- **不认得的端点**：密封与防重放都核对通过、路径在 `/fs/` 下却是这台电脑不认得的（比电脑新的手机用了新端点），回不加密的 **`501 unsupported`**（`text/plain`，正文是 `unsupported`），不回 404——404 是 Relay 的「预览已结束」，手机据此会白白重开一份预览。手机按「这台电脑不支持这项操作」处理（提示升级电脑上的 BotBus），不重开预览、不重试；这条请求已经记账，确实要重发得换新的 `t`。
 - **核对**：`p` 对不上、`t` 偏离电脑时钟两分钟以上、解不开（不是这台手机封的）、重放、`c` 带了但不合规（数字、`null`、写法不对），一律是不加密的 `403 rejected`，不透露是哪一种；进程内处理的路径（`/status`、`/arm`、`/fs/*`）里 `GET /status` 之外只收 POST（否则 405），请求体超过 16 MiB 回 413；转给屏幕服务的路径不受这条限制（`/stream`、`/focus`、`/elements` 是 GET，输入是 POST，照 2.12）。不带 `c` 的请求要求 `t` 比上一条不带 `c` 的更大（全局严格递增，旧行为）；带 `c` 的请求按通道记两分钟窗口里见过的 `t`，重复的拒，允许经 Relay 乱序到达（手机同时列目录又在打字不会被误挡）。
 - **表有上限**：最多同时记 64 个通道、每个通道 4096 个时间戳（两分钟里点不到这么多）。表满时先腾出整个都在窗口之外的通道，不提前赶走还在窗口里的；还满就回不加密的 **`503 busy`**（正文是 `busy`；Relay 自己回的 503 是 HTML 说明页）：这条请求没被记账，可以原样重发（只要 `t` 还在两分钟窗口里，否则换新的 `t`）。
 - **全局下限**：窗口里过期的时间戳会被剪掉、通道被腾出去时它的时间戳也一起丢掉，但丢掉的不是白丢——其中最大的记成一条全局下限，之后 `t` 不大于它的带 `c` 请求一律当重放，所以电脑的时钟往回跳（睡眠醒来后 NTP 校时）也放不回已经收过的请求。BotBus 重启、换组密钥或解除配对（凭据真的变了）时，两套记录（带 `c` 的窗口与不带 `c` 的全局计数）清空，两条下限都抬到「当时 − 1 毫秒」：时间戳早于那一刻的请求不能再收；用旧钥匙解开、却在重置之后才到记账那一步的请求同样拒。凭据没变时（Relay 的 hello 帧只改了 pairId 提示、重复写入同一份凭据）什么都不动，Relay 借不到清空重放记录的机会。下限只升不降。
@@ -486,7 +487,7 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 
 - **钉在请求上**：带 `c` 的请求，JSON 回复的 AAD 是 `rc:<agentId>:res:<c>:<t>`，流式回复（`/fs/read`）的第 n 个包是 `rc:<agentId>:res:<c>:<t>:<n>`（n 从 0 起）。Relay 把别的请求的回复、别的文件的块、换了序的包挪过来都解不开——否则 Relay 换掉文件内容，手机编辑后保存就会把错的内容写回去。不带 `c` 的请求照旧用 `rc:<agentId>`。屏幕的 `/stream` 是另一套：包照旧用 `rc:<agentId>` 与自己的分帧，不钉在请求上。
 - **JSON 回复**：HTTP 200 `{"sealed": <信封>}`，明文是下表的结果对象，失败是 `{"failure": …}`。手机先看顶层有没有 `failure` 键：有就是失败，哪怕里面的内容坏了。
-- **`/fs/read` 的流**：HTTP 200 `application/octet-stream`，body 是一串 `[u32 大端长度][密封包]`，每个密封包 ≤ 1 MiB（长度为 0 或大于 1 MiB 时这条流不能再用，整条丢掉），明文是 `[u8 类型][负载]`：`0` 头 `{size, mtimeMs, contentType?}`，`1` 文件字节（每包 ≤ 256 KiB），`2` 结束 `{size}`（总字节数）。**没收到结束包的流（中途出错、隧道断开）一律算失败**，别把残缺的内容当成文件。流开始之前的失败（找不到、不是普通文件、没权限）是上面的 JSON 失败回复，不是流。**客户端看响应头 `content-type` 区分**：`application/octet-stream` 是包流；`application/json` 是密封的失败回复（`/fs/read` 的 JSON 回复只会是失败）；`text/plain` 是不加密的 403 / 503 等。流开始之后出错，流以隧道的 `error` 结束，没有失败体。
+- **`/fs/read` 的流**：HTTP 200 `application/octet-stream`，body 是一串 `[u32 大端长度][密封包]`，每个密封包 ≤ 1 MiB（长度为 0 或大于 1 MiB 时这条流不能再用，整条丢掉），明文是 `[u8 类型][负载]`：`0` 头 `{size, mtimeMs, contentType?}`，`1` 文件字节（每包 ≤ 256 KiB），`2` 结束 `{size}`（总字节数）。**没收到结束包的流（中途出错、隧道断开）一律算失败**，别把残缺的内容当成文件。流开始之前的失败（找不到、不是普通文件、没权限）是上面的 JSON 失败回复，不是流。**客户端看响应头 `content-type` 区分**：`application/octet-stream` 是包流；`application/json` 是密封的失败回复（`/fs/read` 的 JSON 回复只会是失败）；`text/plain` 是不加密的 403 / 501 / 503 等。流开始之后出错，流以隧道的 `error` 结束，没有失败体。
 
 | 路径 | 明文请求 | 回复 |
 |---|---|---|
@@ -526,7 +527,8 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 **忙与超时。** 文件操作都在电脑上一个专用的队列里跑：第一次进「文稿」「桌面」等受保护目录时系统会在电脑上弹授权框、调用一直卡着，网络卷也一样。每个操作最多等 20 秒（也留出了 Relay 等 `res` 的 30 秒），超时回 `timeout`。线程在系统调用里没法取消，所以**超时只是不再等它，操作可能仍在继续、之后才完成**；同时在途的操作（含已经超时、线程仍卡着的）最多 8 个，再来的立刻回 `timeout`（`detail: "busy"`）。两种「忙」的重试语义不同：
 
 - 明文 `503 busy`：通道表或时间戳表满了，这条请求没被记账，可以原样重发。
-- 密封的 `timeout`（包括 `detail: "busy"`）：这条请求已经被记账，重试必须换一个新的 `t` 重新封装，否则会被当成重放回 403。写操作（`/fs/write`、新建、改名、移到废纸篓、上传的块与提交）收到 `timeout` 不能假定它没生效：先重新列目录（或读文件的 `{mtimeMs, size}`）再决定怎么重试；`/fs/write` 带着 `expect` 重发，冲突时会回 `conflict`；上传的块与提交本身是幂等的（见「上传」）。
+- 密封的 `timeout` 且 `detail: "busy"`：在途的操作已满，或同一个上传上另一块还在写 / 正在提交。电脑在**动手之前**就拒了它，没有任何副作用（至多顺延了锁的闲置计时），所以任何请求（写操作也一样）都可以重发；但这条请求已经被记账，重发必须换一个新的 `t` 重新封装，否则会被当成重放回 403。
+- 密封的 `timeout`（不带 `busy`）：等了 20 秒没等到，操作可能仍在继续、之后才完成。写操作（`/fs/write`、新建、改名、移到废纸篓、上传的块与提交）收到它不能假定它没生效：先重新列目录（或读文件的 `{mtimeMs, size}`）再决定怎么重试；`/fs/write` 带着 `expect` 重发，冲突时会回 `conflict`；上传的块与提交本身是幂等的（见「上传」），换新的 `t` 重发即可。
 
 #### 文件
 
@@ -557,7 +559,7 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 
 #### 生命周期
 
-- **开启**：手机发 `remoteControl {enabled: true}`，回预览产物 id；agent 停下来等人、电脑上又有密码框聚焦时，Mac 也会自动开一份挂在那条任务上的（要同时有辅助功能、录屏权限与聚焦的密码框，标题是「电脑屏幕」）。工作区预览共用一个来源：同一个任务再开会替换旧的那份，不同任务的可以并存。没有组密钥时开启失败，不会退回明文；没允许录屏不影响开启，文件照常能用，`/status` 里 `screenCapture: false`，屏幕那段由页面说明原因。
+- **开启**：手机发 `remoteControl {enabled: true}`，回预览产物 id；agent 停下来等人、电脑上又有密码框聚焦时，Mac 也会自动开一份挂在那条任务上的（要同时有辅助功能、录屏权限与聚焦的密码框，标题是「电脑屏幕」）。工作区预览共用一个来源：同一个任务再开（手机主动开的都算同一个，taskId 为空）时，那份还活着就**复用**它、回同一个产物 id——两台手机都点「操作电脑」看到的是同一份，而不是互相顶掉；那份离到期不到 10 分钟时才新开一份替换它（旧的那份上的手机会看到预览结束，重新开就拿到新的）。不同任务的可以并存。共用一份时每台手机各自换一次性入口、拿各自的会话 cookie，请求按各自的通道号 `c` 防重放，互不干扰；输入锁与屏幕画面是这台电脑共用的：一台解了锁，另一台也能点击、键入与写文件，任何一台发 `enabled: false` 都会撤掉这一份（见下）。没有组密钥时开启失败，不会退回明文；没允许录屏不影响开启，文件照常能用，`/status` 里 `screenCapture: false`，屏幕那段由页面说明原因。
 - **停止**：`remoteControl {enabled: false}` 撤掉**全部**工作区预览（包括自动开的、挂在任务上的），锁回输入、丢掉没提交的上传、停屏幕服务；手机关页面时不发它。预览因别的原因结束（到期、被顶掉、菜单里停止分享）时，没有别的工作区预览在用就同样收尾，还有别的在用则什么都不动。BotBus 退出、解除配对或配对被撤销也一样收尾，退出时不等磁盘。
 
 ### 预览主机与隧道
@@ -565,10 +567,10 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 预览入口是 `https://p-<previewId>.<PREVIEW_DOMAIN>`（线上为 `botbus.io`；只用一级通配子域，免费 Universal SSL 才覆盖得到）。Worker 在所有路径路由之前按 `Host` 分流（主机名不区分大小写）：
 
 - `^p-([a-z2-7]{26})\.<PREVIEW_DOMAIN>$` 交给该预览——这个主机上的任何路径都属于预览，不会落到 API；`<PREVIEW_DOMAIN>` 本身与其他子域原样回源，不拦截别的站点；其余主机（`*.workers.dev`）照常是 API。
-- 预览不存在或已过期 → 404 HTML 页（预览已结束）。
+- 预览不存在或已过期 → 404 HTML 页（预览已结束）。停止分享或过期那一刻还在途的请求回 502（电脑连接中断，见下），之后的新请求才是 404。
 - `GET /__botbus/auth?ticket=<t>`：ticket 一次性、60 秒有效。通过后签发会话 token（Relay 只存哈希，有效到预览过期），回 `302 Location: /` 与 `Set-Cookie: __botbus_preview=<token>; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=<剩余秒数>`（cookie 不带 `Domain`，只对这一个预览主机有效）；失败回 401 简短 HTML 说明页。这个路径不会转给 Mac。
 - 其余请求先校验这个 cookie（无效 → 401 HTML 页，提示回 BotBus 重新打开），把 `__botbus_preview` 从转发的 `Cookie` 头里删掉后经隧道转给 Mac；隧道未连接 → 503 HTML 页（电脑离线或已停止分享）。
-- 所有预览响应带 `X-Robots-Tag: noindex`。Relay 自己回的说明页：401 链接或会话失效、404 预览已结束、413 请求体过大、502 Mac 回 `error` / 隧道中途断开 / 本地 WebSocket 连不上、503 隧道未连接或在途请求已满、504 等 `res` 超时。
+- 所有预览响应带 `X-Robots-Tag: noindex`。Relay 自己回的说明页：401 链接或会话失效、404 预览已结束、413 请求体过大、502 Mac 回 `error` / 隧道中途断开 / 停止分享或过期时还在途 / 本地 WebSocket 连不上、503 隧道未连接或在途请求已满、504 等 `res` 超时。
 
 隧道是 `GET /agent/previews/:previewId/tunnel` 升级出的 WebSocket，每条都是二进制消息：
 
@@ -605,7 +607,7 @@ WebSocket（三期）的细节：
 
 - Relay 收到浏览器的升级请求后发 `wsopen`，**等到 `wsaccept` 才回浏览器 101**；10 秒内没有答复 → 502，并给 Mac 发 `wsclose {code: 1001}` 让它放弃本地连接；Mac 以 `wsclose` 答复 → 502。`wsopen.headers` 不含 `sec-websocket-*`（握手头由 Mac 的 WebSocket 客户端自己生成），子协议在 `protocols` 里；`wsaccept.protocol` 只有在浏览器提议过时才回给浏览器。
 - Mac 的 `wsclose.code` 不能出现在关闭帧里（如 1005 / 1006）时浏览器收到 1011，缺省时 1000。Mac 先关的连接 Relay 不再回 `wsclose`。
-- 隧道关闭或被顶掉时，属于它的浏览器 WebSocket 以 1011 关闭、在途 HTTP 请求 502；停止分享或过期时浏览器 WebSocket 以 1001 关闭。
+- 隧道关闭或被顶掉时，属于它的浏览器 WebSocket 以 1011 关闭、在途 HTTP 请求 502；停止分享或过期时浏览器 WebSocket 以 1001 关闭、在途 HTTP 请求同样 502（之后的新请求才是 404）。
 
 隧道关闭码：4000 被同一预览的新连接顶掉；4001 预览被停止或已过期（之后重连得到 404，Mac 不应再重连）。
 
@@ -798,4 +800,4 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 
 3.8 样本（`plain/` 内）：`command-delete-task.json` / `command-remove-project.json` → Command；`agent-info-list-management.json` → AgentInfo；`invalid/command-delete-task-missing-payload.json` / `invalid/command-remove-project-missing-payload.json` → 必须拒绝（kind 同名载荷缺失）。两条 Command 的根目录密封版由 `scripts/seal-fixtures.mjs` 生成，三端解密与重封核对。
 
-`protocol-fixtures/workspace/` 是工作区（3.7）的样本，Relay 不读：明文的 `WorkspaceStatus`（`status-mac.json`、`status-linux.json`、3.6 Mac 的 `status-legacy.json`）、`WorkspaceListing`（`listing.json`）、失败外形（`failure-conflict.json`，以及带不认得的 code 的 `failure-unknown-code.json`）、请求明文（`request-write.json`），以及由 `node scripts/seal-fixtures.mjs` 生成的 `sealed.json`（固定钥匙与确定性 nonce 封的请求、钉在请求上的回复、3 个包的 `/fs/read` 流，不要手改）。Swift 的 `WorkspaceWireTests` 逐字节核对它们；`android/core` 要在手机端实现时补上对应的测试（目前只有 Swift 一边核对）。
+`protocol-fixtures/workspace/` 是工作区（3.7）的样本，Relay 不读：明文的 `WorkspaceStatus`（`status-mac.json`、`status-linux.json`、3.6 Mac 的 `status-legacy.json`）、`WorkspaceListing`（`listing.json`）、失败外形（`failure-conflict.json`，以及带不认得的 code 的 `failure-unknown-code.json`）、请求明文（`request-write.json`），以及由 `node scripts/seal-fixtures.mjs` 生成的 `sealed.json`（固定钥匙与确定性 nonce 封的请求、钉在请求上的回复、3 个包的 `/fs/read` 流，不要手改）。Swift 的 `WorkspaceWireTests` 与 Android 的 `WorkspaceWireTest` 逐字节核对它们；手机端的 `WorkspaceSealerTests` / `WorkspaceSealerTest` 另用 `sealed.json` 核对手机自己封的请求。
