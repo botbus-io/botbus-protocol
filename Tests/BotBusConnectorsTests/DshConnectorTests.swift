@@ -284,7 +284,6 @@ final class DshConnectorTests: XCTestCase {
         }
         let lines = [JSONValue.object(header)] + events
         let file = directory.appendingPathComponent("session.v3.jsonl")
-        try (lines.map { $0.encodedString() }.joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)
         var rows: [String: JSONValue] = ["turnBoundary": ["val": ["lastTurn": blank ? 0 : 1]]]
         if let title { rows["title"] = ["val": .string(title)] }
         rows["sessionListMetadata"] = ["val": ["blank": .bool(blank)]]
@@ -293,10 +292,21 @@ final class DshConnectorTests: XCTestCase {
                                                           "rows": .object(rows)]]
         let cacheFile = DshPaths(home: home).projectionCacheFile(sessionId: sessionId)
         try FileManager.default.createDirectory(at: cacheFile.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try cache.encodedString().write(to: cacheFile, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: file.path)
-        try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: cacheFile.path)
+        // 缓存先就位：扫盘一见到日志就去读缓存。
+        try place(cache.encodedString(), at: cacheFile, modified: modified)
+        try place(lines.map { $0.encodedString() }.joined(separator: "\n") + "\n", at: file, modified: modified)
         return file
+    }
+
+    /// 在扫盘看不到的地方写好内容、改好修改时间，再一步挪到位。连接器每 50 毫秒扫一次 `sessions/`、会打开日志读头行：
+    /// 原地写完再改时间，Windows 上 Foundation 改时间要以写方式重新打开文件，撞上扫盘开着的读句柄就报
+    /// `ERROR_SHARING_VIOLATION`（CI 上的 Win32 错误 32）；别的平台上扫盘也可能先看到一个"刚刚改过"的日志。
+    private func place(_ text: String, at destination: URL, modified: Date) throws {
+        let staging = root.appendingPathComponent("staging-\(UUID().uuidString)")
+        try text.write(to: staging, atomically: false, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: staging.path)
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.moveItem(at: staging, to: destination)
     }
 
     private static func userMessage(_ text: String, seq: Int64, at date: Date) -> JSONValue {
@@ -550,7 +560,7 @@ final class DshConnectorTests: XCTestCase {
 
     func testDesktopHandoffUsesSameRealDirectoryAsAcpForSymlinkProject() async throws {
         let alias = root.appendingPathComponent("alias")
-        try FileManager.default.createSymbolicLink(atPath: alias.path, withDestinationPath: project)
+        try makeSymbolicLink(at: alias, withDestinationURL: URL(fileURLWithPath: project, isDirectory: true))
         let real = try XCTUnwrap(TranscriptFileRefs.realPath(project))
         let behavior = FakeAcpBehavior()
         behavior.capabilities = Self.resumeOnly
