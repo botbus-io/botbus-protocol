@@ -84,6 +84,12 @@ public actor CommandDispatcher {
     /// 新建命令还没有 taskId，用真实 cwd 与 worktree 合并互斥。
     private var activeStartDirectories: [String: Int] = [:]
     private var remoteControl: (any RemoteControlling)?
+    /// 重启 Agent（协议 3.9 的 `restartConnector`）。nil = 这台电脑不支持，命令回失败；装了就必须让
+    /// `TaskStore(supportsConnectorRestart:)` 也是 true，否则手机看不到「重启」。
+    private let restarter: (any ConnectorRestarting)?
+    /// 手机发起、还没做完的重启与开关。同一个 Agent 上的第二条（id 不同，去重表挡不住）一律拒绝；
+    /// 检查与登记之间没有挂起点，两台手机几乎同时发的停止与重启只有一条开跑。
+    private var restartingConnectors: Set<ConnectorRef> = []
     private let directoryProbe: DirectoryProbe?
     private var systemPermissionInspector: SystemPermissionInspector?
     private let systemPermissionInspectionTimeout: TimeInterval
@@ -100,6 +106,7 @@ public actor CommandDispatcher {
                 files: (any FileFetching)? = nil,
                 changes: (any WorkingChangesUploading)? = nil,
                 worktrees: (any WorktreeManaging)? = nil,
+                restarter: (any ConnectorRestarting)? = nil,
                 systemPermissionInspector: SystemPermissionInspector? = nil,
                 systemPermissionInspectionTimeout: TimeInterval = 10,
                 directoryProbe: DirectoryProbe? = nil,
@@ -110,6 +117,7 @@ public actor CommandDispatcher {
         self.files = files
         self.changes = changes
         self.worktrees = worktrees
+        self.restarter = restarter
         self.systemPermissionInspector = systemPermissionInspector
         self.systemPermissionInspectionTimeout = systemPermissionInspectionTimeout
         self.directoryProbe = directoryProbe
@@ -214,8 +222,35 @@ public actor CommandDispatcher {
     // MARK: - 执行
 
     private func execute(_ command: Command) async -> CommandResult {
-        // setConnectorEnabled 不经连接器：开关与随之而来的全量快照都归 TaskStore。
-        if command.kind == .setConnectorEnabled { return await store.handle(command).result }
+        // setConnectorEnabled 不经连接器：开关与随之而来的全量快照都归 TaskStore。同一个 Agent 正在重启、启停时
+        // 不叠加（协议 3.9）：重启做完会把它重新启用，中途关掉的开关等于白关。
+        if command.kind == .setConnectorEnabled {
+            guard let ref = command.setConnectorEnabled?.ref else { return await store.handle(command).result }
+            // 先登记再等宿主：登记之前不挂起，同时到的重启会看到它在途。
+            guard restartingConnectors.insert(ref).inserted else {
+                return CommandResult(commandId: command.id, ok: false, error: Self.connectorBusyMessage,
+                                     finishedAt: timestamp())
+            }
+            defer { restartingConnectors.remove(ref) }
+            if await restarter?.isControllingConnector(ref) ?? false {
+                return CommandResult(commandId: command.id, ok: false, error: Self.connectorBusyMessage,
+                                     finishedAt: timestamp())
+            }
+            return await store.handle(command).result
+        }
+        // restartConnector 同样不经连接器：收掉、再启用都归宿主，重新启用之后才回执。
+        if command.kind == .restartConnector {
+            do {
+                guard let payload = command.restartConnector else { throw DispatchFailure("缺少 restartConnector 载荷") }
+                try await restartConnector(payload.ref)
+                return CommandResult(commandId: command.id, ok: true, finishedAt: timestamp())
+            } catch {
+                let message = Self.describe(error)
+                Self.log.error("命令 \(command.id, privacy: .public) 失败：\(message, privacy: .public)")
+                return CommandResult(commandId: command.id, ok: false, error: Self.truncate(message),
+                                     finishedAt: timestamp())
+            }
+        }
         let inspectionGeneration = systemPermissionGeneration
         do {
             // fetchChanges 的回执要多带一个产物 id，单独走。
@@ -282,19 +317,75 @@ public actor CommandDispatcher {
         }
     }
 
-    /// 在 `TaskStore.projectsRoot` 下建新项目的文件夹，返回它的路径。
+    // MARK: - 重启 Agent（协议 3.9）
+
+    static let connectorBusyMessage = "这个 Agent 正在启动或停止，稍后再试"
+
+    /// 交给宿主重启：先认得出这个 Agent，再登记在途，宿主重新启用之后才返回。
+    private func restartConnector(_ ref: ConnectorRef) async throws {
+        guard let restarter else { throw DispatchFailure("这台电脑不支持重启 Agent") }
+        if ref.kind == .acp {
+            guard let id = ref.id, store.connectors.acpIds.contains(id) else {
+                throw DispatchFailure("本机没有这个 ACP agent：\(ref.id ?? "")")
+            }
+        } else {
+            guard store.connectors.kinds.contains(ref.kind) else {
+                throw DispatchFailure("本机没有 \(ref.kind.rawValue) 连接器")
+            }
+        }
+        // 检查与登记之间没有挂起点：两条同时到的重启只有一条开跑。
+        guard restartingConnectors.insert(ref).inserted else { throw DispatchFailure(Self.connectorBusyMessage) }
+        defer { restartingConnectors.remove(ref) }
+        do {
+            try await restarter.restartConnector(ref)
+        } catch let refusal as ConnectorControlRefusal {
+            switch refusal {
+            case .busy: throw DispatchFailure(Self.connectorBusyMessage)
+            case .unavailable: throw DispatchFailure("电脑还没准备好或正在退出，Agent 没有重新启用")
+            }
+        }
+    }
+
+    // MARK: - 新建项目（协议 2.6 / 3.9）
+
+    /// 协议 3.9：手机指定的新项目存放位置。必须是绝对路径（Windows 的 `C:\…` 也算，见 `PlatformPath.isAbsolute`）、
+    /// 已存在、是目录（软链接按解析后的目标算）、可写。只查不建：放在下载图之前，不合适时什么都不留下。
+    private func projectParentDirectory(_ parent: String) throws -> URL {
+        guard store.supportsProjectParent else { throw DispatchFailure("这台电脑不支持选择新项目的位置") }
+        guard PlatformPath.isAbsolute(parent) else {
+            throw DispatchFailure("新项目的位置必须是完整路径：\(parent)")
+        }
+        var isDirectory: ObjCBool = false
+        // fileExists 跟随软链接：指向目录的软链接算目录，断掉的软链接算不存在。
+        guard FileManager.default.fileExists(atPath: parent, isDirectory: &isDirectory) else {
+            throw DispatchFailure("放新项目的文件夹不存在：\(parent)")
+        }
+        guard isDirectory.boolValue else { throw DispatchFailure("放新项目的位置不是文件夹：\(parent)") }
+        guard FileManager.default.isWritableFile(atPath: parent) else {
+            throw DispatchFailure("没有权限在这个文件夹里新建项目：\(parent)")
+        }
+        return URL(fileURLWithPath: parent, isDirectory: true)
+    }
+
+    /// 建新项目的文件夹，返回它的路径：`parent` 为 nil 时建在 `TaskStore.projectsRoot` 下，否则建在 `parent`
+    /// （`projectParentDirectory` 查过的）下。
     ///
     /// 手机给的只是一个文件夹名：名字不合法（多层、`..`、隐藏目录）直接拒绝，目录只可能落在存放目录下面。
     /// 同名目录已经在了也拒绝，不复用——把 Agent 放进一个旧目录里比报错更糟，旧项目应当从项目列表里选。
-    private func createProjectDirectory(named rawName: String) async throws -> String {
+    private func createProjectDirectory(named rawName: String, in parent: URL?) async throws -> String {
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard Command.StartTask.isValidNewProjectName(name) else {
             throw DispatchFailure("项目名「\(name)」不能用：只能是一层文件夹名，不能含 / \\ :，也不能以 . 开头")
         }
-        guard let root = await store.projectsRoot, !root.isEmpty else {
-            throw DispatchFailure("这台电脑没有设置新项目的存放目录")
+        let rootURL: URL
+        if let parent {
+            rootURL = parent
+        } else {
+            guard let root = await store.projectsRoot, !root.isEmpty else {
+                throw DispatchFailure("这台电脑没有设置新项目的存放目录")
+            }
+            rootURL = URL(fileURLWithPath: (root as NSString).expandingTildeInPath, isDirectory: true)
         }
-        let rootURL = URL(fileURLWithPath: (root as NSString).expandingTildeInPath, isDirectory: true)
         let target = rootURL.appendingPathComponent(name, isDirectory: true)
         // 名字已经挡掉了 `/` 与 `..`，这里再按标准化路径核一遍：目录必须恰好是存放目录的直接子目录。
         guard target.standardizedFileURL.deletingLastPathComponent().path == rootURL.standardizedFileURL.path else {
@@ -343,13 +434,19 @@ public actor CommandDispatcher {
                     throw DispatchFailure("不在项目中的会话不能开自动批准")
                 }
             }
+            // 协议 3.9：新项目放在手机选的目录下。能力、路径都在下载图、建目录之前查。
+            var projectParent: URL?
+            if let parent = payload.newProjectParent {
+                guard payload.newProject != nil else { throw DispatchFailure("newProjectParent 只能和 newProject 一起用") }
+                projectParent = try projectParentDirectory(parent)
+            }
             // 先找连接器再下载：连接器停用、来源不收图时都不白下一趟图。下载也排在建新项目文件夹之前，
             // 图取不下来时不留空目录。
             let images = try await receiveImages(command, payload.attachments, kind: kind)
             var projectPath = payload.projectPath
             if let name = payload.newProject {
                 // 协议 2.6：先在存放目录下建好新项目的文件夹，再在里面开始。连接器可用才建，免得留下空目录。
-                projectPath = try await createProjectDirectory(named: name)
+                projectPath = try await createProjectDirectory(named: name, in: projectParent)
             } else if kind != .openclaw, projectPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 // 协议 2.6：空目录 = 「不在项目中」。OpenClaw 自己会退回它的默认工作区，其余在主目录下跑。
                 projectPath = await store.homeDirectory
@@ -504,7 +601,7 @@ public actor CommandDispatcher {
         case .mergeWorktree:
             guard let payload = command.mergeWorktree else { throw DispatchFailure("缺少 mergeWorktree 载荷") }
             return RunResult(taskId: try await mergeWorktree(payload))
-        case .setConnectorEnabled, .fetchChanges, .remoteControl:
+        case .setConnectorEnabled, .restartConnector, .fetchChanges, .remoteControl:
             return RunResult() // 走不到：execute 已经先分出去了。
         }
     }
@@ -923,7 +1020,7 @@ public actor CommandDispatcher {
         case .mergeWorktree: command.mergeWorktree?.taskId
         case .deleteTask: command.deleteTask?.taskId
         case .removeProject: nil
-        case .startTask, .setConnectorEnabled, .remoteControl: nil
+        case .startTask, .setConnectorEnabled, .restartConnector, .remoteControl: nil
         }
     }
 

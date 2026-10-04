@@ -150,6 +150,11 @@ public actor TaskStore {
     private let supportsWorktrees: Bool
     /// 这台电脑有没有「操作电脑」的工作区服务（`AgentInfo.workspace`，协议 3.7）：AgentHost 建了 `WorkspaceService` 才是 true。
     private let supportsWorkspace: Bool
+    /// 这台电脑能不能从手机重启 Agent（`AgentInfo.canRestartConnectors`，协议 3.9）：分发器装了 `ConnectorRestarting` 才是 true。
+    private let supportsConnectorRestart: Bool
+    /// 新建项目时能不能指定放在哪个目录下（`AgentInfo.canChooseProjectParent`，协议 3.9）。分发器按它决定收不收
+    /// `startTask.newProjectParent`，报出去的与收的是同一个值。
+    public nonisolated let supportsProjectParent: Bool
     /// 宿主平台与能力（协议 3.5），见 `HostIdentity`。
     private let host: HostIdentity
 
@@ -165,6 +170,8 @@ public actor TaskStore {
     ///   - hiddenTasksURL: 隐藏会话的持久化文件；nil = 只在内存里。app 传 `defaultHiddenTasksURL`。
     ///   - supportsWorktrees: 分发器装了 `WorktreeManaging` 时传 true，快照的 `AgentInfo.worktrees` 随之为 true。
     ///   - supportsWorkspace: 宿主建了工作区服务时传 true，快照的 `AgentInfo.workspace` 随之为 true。
+    ///   - supportsConnectorRestart: 分发器装了 `ConnectorRestarting` 时传 true，快照的 `AgentInfo.canRestartConnectors` 随之为 true。
+    ///   - supportsProjectParent: 传 true 时快照报 `AgentInfo.canChooseProjectParent`，分发器也才收 `startTask.newProjectParent`。
     ///   - host: 宿主平台与能力（协议 3.5），原样进快照的 `AgentInfo.platform` / `capabilities`。
     private var projectDismissals = ListDismissals()
     private let projectDismissalsURL: URL?
@@ -178,6 +185,8 @@ public actor TaskStore {
                 hiddenTasksURL: URL? = nil,
                 supportsWorktrees: Bool = false,
                 supportsWorkspace: Bool = false,
+                supportsConnectorRestart: Bool = false,
+                supportsProjectParent: Bool = false,
                 artifactSaveDelay: TimeInterval = TaskStore.defaultArtifactSaveDelay,
                 outsideProjects: OutsideProjectRule = OutsideProjectRule(),
                 worktrees: WorktreeResolver = WorktreeResolver(),
@@ -201,6 +210,8 @@ public actor TaskStore {
         }
         self.supportsWorktrees = supportsWorktrees
         self.supportsWorkspace = supportsWorkspace
+        self.supportsConnectorRestart = supportsConnectorRestart
+        self.supportsProjectParent = supportsProjectParent
         self.artifactSaveDelay = artifactSaveDelay
         self.systemPermissionInspector = systemPermissionInspector
         self.systemPermissionInspectionTimeout = systemPermissionInspectionTimeout
@@ -670,7 +681,7 @@ public actor TaskStore {
             publish(events)
             return (CommandResult(commandId: command.id, ok: true, finishedAt: finishedAt), events)
         case .startTask, .followUp, .approve, .interrupt, .fetchMessages, .fetchFile, .fetchChanges, .remoteControl,
-             .mergeWorktree, .deleteTask, .removeProject:
+             .mergeWorktree, .deleteTask, .removeProject, .restartConnector:
             // 这些都归 CommandDispatcher（要连接器或 MessageReader）；走到这里说明调用方绕过了它。
             return failure("这个版本的 Agent 还不支持 \(command.kind.rawValue)")
         }
@@ -692,7 +703,9 @@ public actor TaskStore {
                            projectsRoot: outsideProjects.projectsRoot,
                            worktrees: supportsWorktrees ? true : nil,
                            capabilities: host.capabilities,
-                           workspace: supportsWorkspace ? true : nil, canRemoveProjects: true)
+                           workspace: supportsWorkspace ? true : nil, canRemoveProjects: true,
+                           canRestartConnectors: supportsConnectorRestart ? true : nil,
+                           canChooseProjectParent: supportsProjectParent ? true : nil)
         return Snapshot(agents: [me], tasks: visible, projects: mergedProjects(),
                         recentResults: [], seq: 0, generatedAt: generatedAt)
     }

@@ -109,6 +109,8 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(Command.self, "plain/command-merge-worktree.json"),
         roundTripCase(Command.self, "plain/command-delete-task.json"),
         roundTripCase(Command.self, "plain/command-remove-project.json"),
+        roundTripCase(Command.self, "plain/command-restart-connector.json"),
+        roundTripCase(Command.self, "plain/command-start-task-new-project-parent.json"),
     ] }
 
     private static var eventCases: [FixtureCase] { [
@@ -150,6 +152,7 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(AgentInfo.self, "plain/agent-info-other-platform.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-workspace.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-list-management.json"),
+        roundTripCase(AgentInfo.self, "plain/agent-info-agent-control.json"),
     ] }
 
     private static var relayCases: [FixtureCase] { [
@@ -199,6 +202,9 @@ final class FixtureRoundTripTests: XCTestCase {
         "plain/invalid/agent-info-workspace-false.json",
         "plain/invalid/command-delete-task-missing-payload.json",
         "plain/invalid/command-remove-project-missing-payload.json",
+        "plain/invalid/command-restart-connector-missing-payload.json",
+        "plain/invalid/command-start-task-parent-without-new-project.json",
+        "plain/invalid/agent-info-can-restart-connectors-false.json",
     ]
 
     // MARK: - 往返

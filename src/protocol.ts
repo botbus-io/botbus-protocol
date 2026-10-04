@@ -132,6 +132,8 @@ export const FailureDiagnosis = z.object({
 
 /** 协议 2.6：新项目文件夹名的长度上限，与 Swift 的 `StartTask.maxNewProjectNameLength` 一致。 */
 export const MAX_NEW_PROJECT_NAME = 80;
+/** 协议 3.9：`startTask.newProjectParent` 的长度上限。 */
+export const MAX_NEW_PROJECT_PARENT = 1024;
 
 export const Task = z.object({
   id: z.string(),
@@ -346,6 +348,10 @@ export const AgentInfo = z.object({
   /** 协议 3.7：电脑提供「操作电脑」的工作区服务（文件与终端）。只写 true。 */
   workspace: z.literal(true).optional(),
   canRemoveProjects: z.boolean().optional(),
+  /** 协议 3.9：能从手机重启 Agent（restartConnector）。只写 true。 */
+  canRestartConnectors: z.literal(true).optional(),
+  /** 协议 3.9：新建项目能指定父目录（startTask.newProjectParent）。只写 true。 */
+  canChooseProjectParent: z.literal(true).optional(),
 });
 
 // ---- Snapshot ----
@@ -424,10 +430,13 @@ export const WorkingChanges = z.object({
 });
 
 // ---- Command ----
-/** 协议 2.9 起加入 fetchFile，2.11 起加入 fetchChanges，2.12 起加入 remoteControl，3.4 起加入 mergeWorktree。 */
+/**
+ * 协议 2.9 起加入 fetchFile，2.11 起加入 fetchChanges，2.12 起加入 remoteControl，3.4 起加入 mergeWorktree，
+ * 3.8 起加入 deleteTask / removeProject，3.9 起加入 restartConnector。
+ */
 export const CommandKind = z.enum([
   "startTask", "followUp", "approve", "interrupt", "setConnectorEnabled", "fetchMessages", "fetchFile",
-  "fetchChanges", "remoteControl", "mergeWorktree", "deleteTask", "removeProject",
+  "fetchChanges", "remoteControl", "mergeWorktree", "deleteTask", "removeProject", "restartConnector",
 ]);
 
 export const Command = z
@@ -458,9 +467,14 @@ export const Command = z
         autoApprove: z.boolean().optional(),
         /** 协议 3.4：在项目仓库新开的 git worktree 里跑。只和非空 projectPath 一起出现，不配 newProject，openclaw 不收。 */
         worktree: z.literal(true).optional(),
+        /** 协议 3.9：新项目文件夹建在哪个目录下（电脑上的绝对路径），只和 newProject 一起出现。 */
+        newProjectParent: z.string().min(1).max(MAX_NEW_PROJECT_PARENT).optional(),
       })
       .superRefine((s, ctx) => {
         acpConnectorIdRule(s.source === "acp", s.connectorId, ctx);
+        if (s.newProjectParent !== undefined && s.newProject === undefined) {
+          ctx.addIssue({ code: "custom", path: ["newProjectParent"], message: "newProjectParent needs newProject" });
+        }
         if (s.worktree && (s.newProject !== undefined || s.source === "openclaw" || s.projectPath.trim() === "")) {
           ctx.addIssue({ code: "custom", path: ["worktree"],
             message: "worktree needs a non-empty projectPath, no newProject, and a source other than openclaw" });
@@ -511,6 +525,11 @@ export const Command = z
     mergeWorktree: z.object({ taskId: z.string().min(1) }).optional(),
     deleteTask: z.object({ taskId: z.string().min(1) }).optional(),
     removeProject: z.object({ projectPath: z.string().min(1) }).optional(),
+    /** 协议 3.9：在电脑上重启一个 Agent（先停用、等收尾，再启用）。 */
+    restartConnector: z
+      .object({ connector: ConnectorKind, connectorId: AcpConnectorId.optional() })
+      .superRefine((s, ctx) => acpConnectorIdRule(s.connector === "acp", s.connectorId, ctx))
+      .optional(),
   })
   .superRefine((c, ctx) => {
     if (c[c.kind] === undefined) {

@@ -295,10 +295,15 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
     public var workspace: Bool?
     /// 协议 3.8：支持移出 BotBus 项目列表，省略 = 不支持。
     public var canRemoveProjects: Bool?
+    /// 协议 3.9：能从手机重启 Agent（`restartConnector`）。只写 true，省略 = 不能。
+    public var canRestartConnectors: Bool?
+    /// 协议 3.9：新建项目时能指定放在哪个目录下（`startTask.newProjectParent`）。只写 true，省略 = 只能放在 `projectsRoot` 下。
+    public var canChooseProjectParent: Bool?
 
     public init(agentId: String, name: String, platform: AgentPlatform = .macos, online: Bool,
                 lastSeenAt: String, appVersion: String, connectors: [ConnectorInfo], projectsRoot: String? = nil,
-                worktrees: Bool? = nil, capabilities: HostCapabilities? = nil, workspace: Bool? = nil, canRemoveProjects: Bool? = nil) {
+                worktrees: Bool? = nil, capabilities: HostCapabilities? = nil, workspace: Bool? = nil, canRemoveProjects: Bool? = nil,
+                canRestartConnectors: Bool? = nil, canChooseProjectParent: Bool? = nil) {
         self.agentId = agentId
         self.name = name
         self.platform = platform
@@ -311,11 +316,13 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         self.capabilities = capabilities
         self.workspace = workspace
         self.canRemoveProjects = canRemoveProjects
+        self.canRestartConnectors = canRestartConnectors
+        self.canChooseProjectParent = canChooseProjectParent
     }
 
     private enum CodingKeys: String, CodingKey {
         case agentId, name, platform, online, lastSeenAt, appVersion, connectors, projectsRoot, worktrees, capabilities
-        case workspace, canRemoveProjects
+        case workspace, canRemoveProjects, canRestartConnectors, canChooseProjectParent
     }
 
     /// 校验集中在这里：Connector 最多 16 个且按 (kind, connectorId) 去重。数量下限没有——空数组合法。
@@ -333,6 +340,8 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         capabilities = try container.decodeIfPresent(HostCapabilities.self, forKey: .capabilities)
         workspace = try container.decodeIfPresent(Bool.self, forKey: .workspace)
         canRemoveProjects = try container.decodeIfPresent(Bool.self, forKey: .canRemoveProjects)
+        canRestartConnectors = try container.decodeIfPresent(Bool.self, forKey: .canRestartConnectors)
+        canChooseProjectParent = try container.decodeIfPresent(Bool.self, forKey: .canChooseProjectParent)
 
         guard connectors.count <= Self.maxConnectors else {
             throw DecodingError.dataCorruptedError(
@@ -351,6 +360,14 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
         if workspace == false {
             throw DecodingError.dataCorruptedError(forKey: .workspace, in: container,
                                                    debugDescription: "workspace is only written as true")
+        }
+        if canRestartConnectors == false {
+            throw DecodingError.dataCorruptedError(forKey: .canRestartConnectors, in: container,
+                                                   debugDescription: "canRestartConnectors is only written as true")
+        }
+        if canChooseProjectParent == false {
+            throw DecodingError.dataCorruptedError(forKey: .canChooseProjectParent, in: container,
+                                                   debugDescription: "canChooseProjectParent is only written as true")
         }
     }
 }

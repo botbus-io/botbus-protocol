@@ -43,6 +43,21 @@ final class AcpHubTests: XCTestCase {
         return agent
     }
 
+    func testRunningAgentIdsReflectProcessExitAndStop() async throws {
+        let store = makeAcpStore([])
+        let agent = await FakeAcpAgent.make(FakeAcpBehavior())
+        let hub = hub(store: store, agents: ["gemini": agent])
+        await hub.sync([spec("gemini")])
+        _ = try await hub.start(connectorId: "gemini", projectPath: project, prompt: "hi", images: [])
+        let running = await hub.runningAgentIds()
+        XCTAssertEqual(running, ["gemini"])
+        agent.crash(reason: "exited")
+        await assertEventually { await hub.runningAgentIds().isEmpty }
+        await hub.stop()
+        let stopped = await hub.runningAgentIds()
+        XCTAssertTrue(stopped.isEmpty)
+    }
+
     func testSyncPublishesRegistryEntries() async {
         let store = makeAcpStore([])
         let hub = hub(store: store, agents: [String: FakeAcpAgent]())

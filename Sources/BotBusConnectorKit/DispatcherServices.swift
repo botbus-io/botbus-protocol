@@ -115,3 +115,24 @@ public protocol RemoteControlling: Sendable {
     func startSession() async throws -> Artifact
     func stopSession() async
 }
+
+/// 重启 Agent（协议 3.9 的 `restartConnector`）：像停用那样收掉这个 Agent 的连接与后台进程，等收尾完再启用。
+/// 实现在宿主（AgentCore 的 `AgentHost`，与 Mac 菜单的「重启」同一条路径、同一份持久化开关）。
+public protocol ConnectorRestarting: Sendable {
+    /// 重新启用之后才返回。没执行时抛 `ConnectorControlRefusal`（同一个 Agent 已有启停 / 重启在途、宿主没就绪或正在退出）。
+    func restartConnector(_ ref: ConnectorRef) async throws
+    /// 这个 Agent 是否有宿主自己发起的启停 / 重启在途（例如 Mac 菜单点的）。手机的 `setConnectorEnabled` 据此拒绝叠加。
+    func isControllingConnector(_ ref: ConnectorRef) async -> Bool
+}
+
+extension ConnectorRestarting {
+    public func isControllingConnector(_ ref: ConnectorRef) async -> Bool { false }
+}
+
+/// `ConnectorRestarting.restartConnector` 没执行的原因，分发器换成给手机看的文案。
+public enum ConnectorControlRefusal: Error, Sendable, Equatable {
+    /// 同一个 Agent 已有启停 / 重启在途。
+    case busy
+    /// 宿主还没就绪，或正在退出（重启做到一半开始退出也算：没有重新启用）。
+    case unavailable
+}

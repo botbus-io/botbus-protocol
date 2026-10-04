@@ -72,6 +72,16 @@ public actor AcpHub: MultiAgentConnector, MessageReader {
         self.makeConnector = makeConnector
     }
 
+    /// 本机菜单的进程状态：启用/已安装不等于子进程仍然活着。
+    public func runningAgentIds() async -> Set<String> {
+        guard !isShutDown else { return [] }
+        var ids = Set<String>()
+        for (id, connector) in connectors {
+            if await connector.isRunning, !isShutDown, isActive(id) { ids.insert(id) }
+        }
+        return ids
+    }
+
     // MARK: - 发现结果
 
     /// 换一批发现结果：新来的建连接器，消失的停掉，配置变了的更新。然后同步注册表并对账。

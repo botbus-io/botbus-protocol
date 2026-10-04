@@ -10,6 +10,24 @@ final class ProtocolFreezeTests: XCTestCase {
         XCTAssertThrowsError(try decoder.decode(Command.DeleteTask.self, from: Data(#"{"taskId":""}"#.utf8)))
         XCTAssertThrowsError(try decoder.decode(Command.RemoveProject.self, from: Data(#"{"projectPath":""}"#.utf8)))
     }
+    func testRestartConnectorNeedsConnectorIdExactlyForAcp() throws {
+        let decoder = ProtocolJSON.decoder()
+        XCTAssertNoThrow(try decoder.decode(Command.RestartConnector.self, from: Data(#"{"connector":"codex"}"#.utf8)))
+        XCTAssertNoThrow(try decoder.decode(Command.RestartConnector.self,
+                                            from: Data(#"{"connector":"acp","connectorId":"gemini"}"#.utf8)))
+        XCTAssertThrowsError(try decoder.decode(Command.RestartConnector.self, from: Data(#"{"connector":"acp"}"#.utf8)))
+        XCTAssertThrowsError(try decoder.decode(Command.RestartConnector.self,
+                                                from: Data(#"{"connector":"codex","connectorId":"x"}"#.utf8)))
+    }
+    func testNewProjectParentOnlyComesWithNewProject() throws {
+        let decoder = ProtocolJSON.decoder()
+        XCTAssertNoThrow(try decoder.decode(Command.StartTask.self, from: Data(
+            #"{"source":"claude","projectPath":"","prompt":"hi","newProject":"demo","newProjectParent":"/Users/me/Projects"}"#.utf8)))
+        XCTAssertThrowsError(try decoder.decode(Command.StartTask.self, from: Data(
+            #"{"source":"claude","projectPath":"","prompt":"hi","newProjectParent":"/Users/me/Projects"}"#.utf8)))
+        XCTAssertThrowsError(try decoder.decode(Command.StartTask.self, from: Data(
+            #"{"source":"claude","projectPath":"","prompt":"hi","newProject":"demo","newProjectParent":""}"#.utf8)))
+    }
     private func assertFrozen<E: CaseIterable & RawRepresentable>(_ type: E.Type, _ expected: [String],
                                                                   file: StaticString = #filePath, line: UInt = #line)
     where E.RawValue == String {
@@ -44,7 +62,8 @@ final class ProtocolFreezeTests: XCTestCase {
 
     func testCommandKindIsFrozen() {
         assertFrozen(Command.Kind.self, ["startTask", "followUp", "approve", "interrupt", "setConnectorEnabled",
-                                         "fetchMessages", "fetchFile", "fetchChanges", "remoteControl", "mergeWorktree", "deleteTask", "removeProject"])
+                                         "fetchMessages", "fetchFile", "fetchChanges", "remoteControl", "mergeWorktree", "deleteTask", "removeProject",
+                                         "restartConnector"])
     }
 
     func testEventKindIsFrozen() {
@@ -64,6 +83,6 @@ final class ProtocolFreezeTests: XCTestCase {
     }
 
     func testProtocolVersionMatchesTheFrozenContract() {
-        XCTAssertEqual(ProtocolVersion.current, "3.8")
+        XCTAssertEqual(ProtocolVersion.current, "3.9")
     }
 }

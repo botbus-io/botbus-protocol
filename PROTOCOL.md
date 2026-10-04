@@ -1,6 +1,6 @@
 # BotBus 协议
 
-版本 **3.8**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
+版本 **3.9**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
 
 Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，Kotlin 实现（Android）是 `Protocol.kt`，密封层在同目录的 `Sealing.kt` / `SealedTypes.kt`。在 app 仓库里它们分别位于 `Packages/BotBusProtocol`、`relay/src/protocol.ts` 与 `android/core/src/main/kotlin/io/botbus/core/`；公开仓库 `botbus-io/botbus-protocol` 由 app 仓库自动同步，前两者在那里是 `Sources/BotBusProtocol` 与 `src/protocol.ts`。三端都必须通过 `protocol-fixtures/` 下全部样本的往返测试，且拒绝 `invalid/` 下的样本：顶层是线上的密封形状，`plain/` 是密文里的明文结构（见文末「Fixture 与类型对应」）。Swift 中 `Task` 命名为 `TaskRecord`。
 
@@ -9,7 +9,7 @@ Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，K
 | 章 | 内容 |
 |---|---|
 | 总则 | Snapshot / Event / Command 三种载体、端到端加密、WebSocket 帧、版本握手、Relay HTTP 一览 |
-| 一、电脑与连接器 | AgentInfo、ConnectorInfo、ModelOption、Project、`setConnectorEnabled` |
+| 一、电脑与连接器 | AgentInfo、ConnectorInfo、ModelOption、Project、`setConnectorEnabled`、`restartConnector` |
 | 二、任务与状态 | Task、TaskStatus、`startTask` / `followUp` / `interrupt` |
 | 三、审批与提问 | PendingRequest、PendingQuestion、`approve`、SystemPermissionNotice |
 | 四、对话与附件 | Message、MessageAttachment、MessageFileRef、TaskMessages、`fetchMessages` / `fetchFile` |
@@ -38,7 +38,7 @@ Relay 另设防御性上限：合并后 `tasks` 最多保留 400 条（按 updat
 
 ### Command 一览
 
-`id` string（客户端生成 UUID）；`createdAt` string；`agentId` string（必填，指明目标电脑，Relay 据此路由）；`kind` `startTask` \| `followUp` \| `approve` \| `interrupt` \| `setConnectorEnabled` \| `fetchMessages` \| `fetchFile` \| `fetchChanges` \| `remoteControl` \| `mergeWorktree`；与 kind 同名的 payload 字段必须存在（两端解码时校验）；其余 payload 字段应省略，接收方以 kind 为准并忽略多余载荷。
+`id` string（客户端生成 UUID）；`createdAt` string；`agentId` string（必填，指明目标电脑，Relay 据此路由）；`kind` `startTask` \| `followUp` \| `approve` \| `interrupt` \| `setConnectorEnabled` \| `restartConnector` \| `fetchMessages` \| `fetchFile` \| `fetchChanges` \| `remoteControl` \| `mergeWorktree` \| `deleteTask` \| `removeProject`；与 kind 同名的 payload 字段必须存在（两端解码时校验）；其余 payload 字段应省略，接收方以 kind 为准并忽略多余载荷。
 
 每种命令的载荷在它所属的章里定义：
 
@@ -46,7 +46,7 @@ Relay 另设防御性上限：合并后 `tasks` 最多保留 400 条（按 updat
 |---|---|
 | `startTask`、`followUp`、`interrupt` | 二、任务与状态 |
 | `approve` | 三、审批与提问 |
-| `setConnectorEnabled` | 一、电脑与连接器 |
+| `setConnectorEnabled`、`restartConnector`、`deleteTask`、`removeProject` | 一、电脑与连接器 |
 | `fetchMessages`、`fetchFile` | 四、对话与附件 |
 | `fetchChanges`、`mergeWorktree` | 五、产物与文件 |
 | `remoteControl` | 六、屏幕共享与远程操作 |
@@ -222,6 +222,13 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 
 3.8 起 `AgentInfo.canRemoveProjects: boolean?` 声明能移出 **BotBus 电脑端项目列表**。只有 `true` 才支持；省略或 `false` 都不支持，手机不向旧电脑发 `removeProject`。
 
+3.9 起另有两项，都只写 `true`、不能时省略（写 `false` 整条拒绝）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| canRestartConnectors | true? | 电脑接受 `restartConnector`（手机上的「重启」）。省略 = 手机不显示「重启」，停止 / 启动照旧用 `setConnectorEnabled` |
+| canChooseProjectParent | true? | 新建项目时接受 `startTask.newProjectParent`（放在哪个目录下）。省略 = 只能建在 `projectsRoot` 下，手机不给选位置 |
+
 ### HostCapabilities
 
 3.5 起。每个键都是可选布尔，**省略 = 支持**，`true` 与省略同义，只有 `false` 表示不支持；接收方遇到不认得的键一律忽略（以后加能力不用发手机版）。Linux 宿主报 `{"remoteControl": false, "previews": false}`，其余省略。没有屏幕，不能远程操作；第一版也不开预览——预览隧道与 HMR 代理走 URLSession 的 WebSocket，而 Swift 静态 Linux SDK 的 libcurl 没编进 WebSocket（连 Relay 已换成 SwiftNIO，这两处还没换）。
@@ -269,9 +276,10 @@ Project：`agentId`、`path`、`name`、`lastUsedAt` string，`pinned` boolean�
 
 HTTP 202 只表示 Relay 收到。手机等待 `CommandResult.ok == true` 才移出列表；失败保留项目/会话并显示原因，未确认/可重试网络失败沿用原 `command.id` / `createdAt`。确认选项默认不勾选；电脑离线、能力缺失、会话进行中时禁用并说明。非同步删除提供撤销，只恢复本次记录，不能撤销后来另一次删除。
 
-### 命令：setConnectorEnabled
+### 命令：setConnectorEnabled、restartConnector
 
-- setConnectorEnabled：`connector` ConnectorKind，`enabled` boolean，`connectorId` string?（2.13 起，开关哪个 ACP agent：`connector = acp` 时必填，其余 kind 必须省略）
+- setConnectorEnabled：`connector` ConnectorKind，`enabled` boolean，`connectorId` string?（2.13 起，开关哪个 ACP agent：`connector = acp` 时必填，其余 kind 必须省略）。手机上的「停止」「启动」（3.9 起手机界面才用到它）发的就是这条；开关存在电脑上，电脑端菜单与设置跟着变。
+- restartConnector（3.9 起）：`connector` ConnectorKind，`connectorId` string?（规则同上）。电脑像停用那样收掉这个 Agent 的连接和后台进程（在跑、等审批、等回答的会话都会停），等收尾完再启用，然后发全量快照；结果在重新启用之后才回，所以可能要几秒。Agent 停着时等同于启动。只发给报了 `AgentInfo.canRestartConnectors` 的电脑；手机在有会话会被中断时先确认。同一个 Agent 的停止 / 启动 / 重启在途时手机不再发第二条，电脑也拒绝同一 Agent 上叠加的控制。
 
 ## 二、任务与状态
 
@@ -306,7 +314,7 @@ TaskStatus：`running` 有轮次进行中；`waitingApproval` 有 pendingRequest
 
 ### 命令：startTask、followUp、interrupt
 
-- startTask：`source` TaskSource，`projectPath` string，`prompt` string，`newProject` string?，`attachments` [MessageAttachment]?，`connectorId` string?（2.13 起，发给哪个 ACP agent：`source = acp` 时必填，其余来源必须省略，两者不符即整条拒绝），`model` string?，`effort` string?，`autoApprove` boolean?，`worktree` true?。2.6 起 `projectPath` 可为空串，表示「不在项目中」：Agent 在主目录下运行，OpenClaw 用它的默认工作区。`newProject`（2.6）是新项目的文件夹名：Agent 在自己的 `projectsRoot` 下建这个子文件夹再开始，`projectPath` 忽略（填空串）。名字只能是一层（去掉首尾空白后 1–80 字，不含 `/`、`\`、`:` 与控制字符，不以 `.` 开头）；同名目录已存在、名字不合法或 Agent 没有 `projectsRoot` 时回 `ok: false`，不复用已有目录。`attachments`（2.9 起）是手机发图开新任务，最多 4 张；带附件时 `prompt` 可为空串。`model` / `effort`（3.2 起，写法同 ModelOption）指定这条会话从第一轮起用的模型与思考强度，之后的续聊沿用，省略 = agent 默认；和 followUp 一样只有报了 `ConnectorInfo.models` 的 agent 收，其余带上它们回 `ok: false`（Agent 在建新项目文件夹、下载图之前就拒）。Codex 随第一轮 `turn/start` 发，Claude 在第一次 `claude -p` 就带 `--model` / `--effort` 并记在会话上。`autoApprove`（3.3 起）把这条会话所在项目（`newProject` 时是新建的文件夹）的自动批准设为开（`true`）或关（`false`），从第一轮起生效、之后沿用，省略 = 不动；只有报了 `ConnectorInfo.canAutoApprove` 的 agent 收，其余带上它回 `ok: false`，「不在项目中」（`projectPath` 为空串）带 `true` 也回 `ok: false`，都在建新项目文件夹、下载图之前就拒。`worktree` `true`?（3.4 起）：在项目所在仓库新开一个 git worktree 再开始。Mac 以 `projectPath` 所在检出的仓库为准，在主仓库的 `.claude/worktrees/<6 位十六进制>` 建 worktree、新分支 `botbus/<同名>`，起点是 `projectPath` 所在那份检出当前分支的最新提交（通常是主仓库；`projectPath` 本身在仓库的另一个 worktree 里时是那个 worktree 检出的分支），合并也落回这个分支（`WorkingChanges.mergeTarget`）；`projectPath` 是仓库子目录时 cwd 取 worktree 里的同一子目录；主仓库没忽略 `.claude/worktrees/` 时往 `info/exclude` 追加一行。不是 git 仓库、还没有提交、detached HEAD、`projectPath` 是没被跟踪（或被忽略）的子目录（新 worktree 里没有它）时照旧在 `projectPath` 里跑，不报错。只写 true，只和非空 `projectPath` 一起出现，与 `newProject` 同时出现或 `source = openclaw` 时整条拒绝。连接器启动失败时删掉刚建的 worktree 与分支。同时带 `autoApprove` 时设的是手机选的项目（`projectPath`），不是新建的 worktree
+- startTask：`source` TaskSource，`projectPath` string，`prompt` string，`newProject` string?，`attachments` [MessageAttachment]?，`connectorId` string?（2.13 起，发给哪个 ACP agent：`source = acp` 时必填，其余来源必须省略，两者不符即整条拒绝），`model` string?，`effort` string?，`autoApprove` boolean?，`worktree` true?。2.6 起 `projectPath` 可为空串，表示「不在项目中」：Agent 在主目录下运行，OpenClaw 用它的默认工作区。`newProject`（2.6）是新项目的文件夹名：Agent 在自己的 `projectsRoot` 下建这个子文件夹再开始，`projectPath` 忽略（填空串）。名字只能是一层（去掉首尾空白后 1–80 字，不含 `/`、`\`、`:` 与控制字符，不以 `.` 开头）；同名目录已存在、名字不合法或 Agent 没有 `projectsRoot` 时回 `ok: false`，不复用已有目录。`attachments`（2.9 起）是手机发图开新任务，最多 4 张；带附件时 `prompt` 可为空串。`model` / `effort`（3.2 起，写法同 ModelOption）指定这条会话从第一轮起用的模型与思考强度，之后的续聊沿用，省略 = agent 默认；和 followUp 一样只有报了 `ConnectorInfo.models` 的 agent 收，其余带上它们回 `ok: false`（Agent 在建新项目文件夹、下载图之前就拒）。Codex 随第一轮 `turn/start` 发，Claude 在第一次 `claude -p` 就带 `--model` / `--effort` 并记在会话上。`autoApprove`（3.3 起）把这条会话所在项目（`newProject` 时是新建的文件夹）的自动批准设为开（`true`）或关（`false`），从第一轮起生效、之后沿用，省略 = 不动；只有报了 `ConnectorInfo.canAutoApprove` 的 agent 收，其余带上它回 `ok: false`，「不在项目中」（`projectPath` 为空串）带 `true` 也回 `ok: false`，都在建新项目文件夹、下载图之前就拒。`newProjectParent` string?（3.9 起）：新项目文件夹建在哪个目录下（电脑上的绝对路径，最长 1024 字），只和 `newProject` 一起出现（单独出现整条拒绝），省略 = `projectsRoot`。电脑检查它是绝对路径、已存在、是目录（软链接按解析后的目标算）、可写，`<newProjectParent>/<newProject>` 已存在时同样回 `ok: false`、不复用；只有报了 `AgentInfo.canChooseProjectParent` 的电脑收，其余带上它回 `ok: false`。建出来的文件夹是普通项目（不在 `projectsRoot` 下也一样），不算「不在项目中」。`worktree` `true`?（3.4 起）：在项目所在仓库新开一个 git worktree 再开始。Mac 以 `projectPath` 所在检出的仓库为准，在主仓库的 `.claude/worktrees/<6 位十六进制>` 建 worktree、新分支 `botbus/<同名>`，起点是 `projectPath` 所在那份检出当前分支的最新提交（通常是主仓库；`projectPath` 本身在仓库的另一个 worktree 里时是那个 worktree 检出的分支），合并也落回这个分支（`WorkingChanges.mergeTarget`）；`projectPath` 是仓库子目录时 cwd 取 worktree 里的同一子目录；主仓库没忽略 `.claude/worktrees/` 时往 `info/exclude` 追加一行。不是 git 仓库、还没有提交、detached HEAD、`projectPath` 是没被跟踪（或被忽略）的子目录（新 worktree 里没有它）时照旧在 `projectPath` 里跑，不报错。只写 true，只和非空 `projectPath` 一起出现，与 `newProject` 同时出现或 `source = openclaw` 时整条拒绝。连接器启动失败时删掉刚建的 worktree 与分支。同时带 `autoApprove` 时设的是手机选的项目（`projectPath`），不是新建的 worktree
 - followUp：`taskId` string，`prompt` string，`attachments` [MessageAttachment]?，`model` string?，`effort` string?，`autoApprove` boolean?。2.7 起 worktree 里的会话在原 worktree 里续聊；worktree 已被删掉时回 `ok: false`。`attachments`（2.9 起）同上，追问带图。`model` / `effort`（3.2 起，写法同 ModelOption）从这一轮起换模型与思考强度，之后的续聊沿用，省略 = 不换；只有报了 `ConnectorInfo.models` 的 agent 收，其余 agent 带上它们回 `ok: false`。Codex 随 `turn/start` 的 `model` / `effort` 发（app-server 记在线程上）；回答挂着的提问、或共用桌面时插进正在跑的那一轮（`turn/steer` 不收模型）时不换，`Task.model` 照旧，手机的选择跟着快照退回。Claude 只收 `ClaudeModels` 的别名与该模型支持的档，Agent 记在会话上，之后每次 `claude -p --resume` 都带 `--model` / `--effort`（换到 Haiku 时不再带强度）；`--resume` 分支出新 session 时跟过去。不认识的模型、这个模型没有的档位回 `ok: false`。`autoApprove`（3.3 起）把这条会话 `projectPath` 的自动批准设为开或关，从这一轮起生效、之后沿用，省略 = 不动；规则同 startTask（`outsideProject` 的会话带 `true` 回 `ok: false`）。设置在这一轮开始之前落地，这一轮失败也不回滚
 - interrupt：`taskId` string
 
@@ -728,6 +736,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - 版本 3.7 同时加入**「操作电脑」的工作区**（见「工作区（3.7）」）：`AgentInfo.workspace`；`remoteControl` 回的预览里多了 `/fs/*`（浏览、读写、上传文件），没有屏幕的宿主也能开；请求可带通道号 `c`，防重放改成按通道记窗口并另有全局下限，回复钉在请求上。都在密文里、走既有的预览隧道：Relay 只改版本号，两条最低线不动；旧手机照常只用屏幕，3.6 的 Mac 不报 `workspace`，新手机连它只有屏幕那一段。
 
 - 版本 3.8 加入 `deleteTask` / `removeProject` 命令、`ConnectorInfo.canDeleteTasks` / `AgentInfo.canRemoveProjects` 能力声明，以及两种手机列表视图和本地删除基线。新命令只发给声明支持的电脑；旧端忽略能力字段，Relay 继续只处理密封形状。当前版本升到 3.8，三条最低线不动。
+- 版本 3.9 加入**手机上的 Agent 管理**与**新建项目选位置**：`restartConnector` 命令与 `AgentInfo.canRestartConnectors`（手机的「停止 / 启动」沿用 2.x 起就有的 `setConnectorEnabled`）；`startTask.newProjectParent` 与 `AgentInfo.canChooseProjectParent`。都在密文里，新命令与新字段只发给声明支持的电脑，旧端忽略能力字段；Relay 只改版本号，三条最低线不动。
 - 终端（「操作电脑」第二期，2026-10）**不改版本号**：管理端点与 `/term/attach` 都在 3.7 的工作区加密预览里，Relay 不变；手机按 `/status.features` 里的 `terminal` 判断，旧手机不认它、照常只有文件与屏幕。
 
 ## 附录 B：Fixture 与类型对应
@@ -839,6 +848,8 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | invalid/command-start-task-worktree-outside-project.json | 必须被拒绝：`projectPath` 为空串（不在项目中）却带 `worktree` |
 | invalid/agent-info-worktrees-false.json | 必须被拒绝：`worktrees` 只写 true，不能写 false |
 | invalid/agent-info-workspace-false.json | 必须被拒绝：`workspace` 只写 true，不能写 false |
+
+3.9 样本（`plain/` 内）：`command-restart-connector.json`（ACP agent）/ `command-start-task-new-project-parent.json` → Command；`agent-info-agent-control.json` → AgentInfo；`invalid/command-restart-connector-missing-payload.json`、`invalid/command-start-task-parent-without-new-project.json`（`newProjectParent` 没配 `newProject`）、`invalid/agent-info-can-restart-connectors-false.json`（只写 true）→ 必须拒绝。两条 Command 的根目录密封版由 `scripts/seal-fixtures.mjs` 生成。
 
 3.8 样本（`plain/` 内）：`command-delete-task.json` / `command-remove-project.json` → Command；`agent-info-list-management.json` → AgentInfo；`invalid/command-delete-task-missing-payload.json` / `invalid/command-remove-project-missing-payload.json` → 必须拒绝（kind 同名载荷缺失）。两条 Command 的根目录密封版由 `scripts/seal-fixtures.mjs` 生成，三端解密与重封核对。
 

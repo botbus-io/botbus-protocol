@@ -3,7 +3,7 @@ import Foundation
 public struct Command: Codable, Hashable, Sendable, Identifiable {
     public enum Kind: String, Codable, Sendable, CaseIterable {
         case startTask, followUp, approve, interrupt, setConnectorEnabled, fetchMessages, fetchFile, fetchChanges
-        case remoteControl, mergeWorktree, deleteTask, removeProject
+        case remoteControl, mergeWorktree, deleteTask, removeProject, restartConnector
     }
 
     public struct StartTask: Codable, Hashable, Sendable {
@@ -29,10 +29,14 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         /// 只写 true；只和非空的 `projectPath` 一起出现，不和 `newProject` 同时出现，OpenClaw 不收。
         /// 电脑建不了（不是 git 仓库、还没有提交、detached HEAD）时照旧在 `projectPath` 里跑。
         public var worktree: Bool?
+        /// 协议 3.9：新项目文件夹建在哪个目录下（电脑上的绝对路径）。只和 `newProject` 一起出现；
+        /// 省略 = 建在 `AgentInfo.projectsRoot` 下。只有报了 `AgentInfo.canChooseProjectParent` 的电脑收。
+        public var newProjectParent: String?
 
         public init(source: TaskSource, projectPath: String, prompt: String, newProject: String? = nil,
                     attachments: [MessageAttachment]? = nil, connectorId: String? = nil,
-                    model: String? = nil, effort: String? = nil, autoApprove: Bool? = nil, worktree: Bool? = nil) {
+                    model: String? = nil, effort: String? = nil, autoApprove: Bool? = nil, worktree: Bool? = nil,
+                    newProjectParent: String? = nil) {
             self.source = source
             self.projectPath = projectPath
             self.prompt = prompt
@@ -43,10 +47,12 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
             self.effort = effort
             self.autoApprove = autoApprove
             self.worktree = worktree
+            self.newProjectParent = newProjectParent
         }
 
         private enum CodingKeys: String, CodingKey {
             case source, projectPath, prompt, newProject, attachments, connectorId, model, effort, autoApprove, worktree
+            case newProjectParent
         }
 
         public init(from decoder: Decoder) throws {
@@ -61,6 +67,15 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
             effort = try container.decodeIfPresent(String.self, forKey: .effort)
             autoApprove = try container.decodeIfPresent(Bool.self, forKey: .autoApprove)
             worktree = try container.decodeIfPresent(Bool.self, forKey: .worktree)
+            newProjectParent = try container.decodeIfPresent(String.self, forKey: .newProjectParent)
+            if let newProjectParent {
+                guard newProject != nil, !newProjectParent.isEmpty,
+                      newProjectParent.count <= Self.maxNewProjectParentLength else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .newProjectParent, in: container,
+                        debugDescription: "newProjectParent must be a non-empty path and only appear with newProject")
+                }
+            }
             if let model, !ModelOption.isValidId(model) {
                 throw DecodingError.dataCorruptedError(forKey: .model, in: container, debugDescription: "invalid model id")
             }
@@ -86,6 +101,8 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         }
 
         public static let maxNewProjectNameLength = 80
+        /// 协议 3.9：`newProjectParent` 的长度上限（字符）。
+        public static let maxNewProjectParentLength = 1024
 
         /// 新项目名能不能用：去掉首尾空白后非空、不超过 80 字、只有一层（不含 `/`、`\`、`:`）、
         /// 不以 `.` 开头（挡住 `..` 与隐藏目录）、没有控制字符。手机据此提示，电脑据此拒绝——
@@ -194,6 +211,39 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         }
     }
 
+    /// 协议 3.9：在电脑上重启一个 Agent 的连接——先像停用那样收掉连接和后台进程（在跑的会话被中断），
+    /// 等收尾完再重新启用。只对报了 `AgentInfo.canRestartConnectors` 的电脑发。停止 / 启动用 `setConnectorEnabled`。
+    public struct RestartConnector: Codable, Hashable, Sendable {
+        public var connector: ConnectorKind
+        /// 重启哪个 ACP agent。`connector = acp` 时必填，其余 kind 省略。
+        public var connectorId: String?
+
+        public init(connector: ConnectorKind, connectorId: String? = nil) {
+            self.connector = connector
+            self.connectorId = connectorId
+        }
+
+        public init(_ ref: ConnectorRef) { self.init(connector: ref.kind, connectorId: ref.id) }
+
+        public var ref: ConnectorRef { ConnectorRef(kind: connector, id: connectorId) }
+
+        private enum CodingKeys: String, CodingKey { case connector, connectorId }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            connector = try container.decode(ConnectorKind.self, forKey: .connector)
+            connectorId = try container.decodeIfPresent(String.self, forKey: .connectorId)
+            let valid = connector == .acp
+                ? connectorId.map(ConnectorRef.isValidAcpId) == true
+                : connectorId == nil
+            guard valid else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .connectorId, in: container,
+                    debugDescription: "connectorId is required for connector acp and only allowed there")
+            }
+        }
+    }
+
     /// 拉取一个任务的对话记录。`limit` 省略时由 Agent 取协议上限。
     public struct FetchMessages: Codable, Hashable, Sendable {
         public var taskId: String
@@ -289,6 +339,7 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
     public var mergeWorktree: MergeWorktree?
     public var deleteTask: DeleteTask?
     public var removeProject: RemoveProject?
+    public var restartConnector: RestartConnector?
 
     public init(id: String = UUID().uuidString.lowercased(), createdAt: String, agentId: String, kind: Kind,
                 startTask: StartTask? = nil, followUp: FollowUp? = nil,
@@ -296,7 +347,8 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
                 setConnectorEnabled: SetConnectorEnabled? = nil, fetchMessages: FetchMessages? = nil,
                 fetchFile: FetchFile? = nil, fetchChanges: FetchChanges? = nil,
                 remoteControl: RemoteControl? = nil, mergeWorktree: MergeWorktree? = nil,
-                deleteTask: DeleteTask? = nil, removeProject: RemoveProject? = nil) {
+                deleteTask: DeleteTask? = nil, removeProject: RemoveProject? = nil,
+                restartConnector: RestartConnector? = nil) {
         self.id = id
         self.createdAt = createdAt
         self.agentId = agentId
@@ -313,11 +365,12 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         self.mergeWorktree = mergeWorktree
         self.deleteTask = deleteTask
         self.removeProject = removeProject
+        self.restartConnector = restartConnector
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, createdAt, agentId, kind, startTask, followUp, approve, interrupt, setConnectorEnabled, fetchMessages
-        case fetchFile, fetchChanges, remoteControl, mergeWorktree, deleteTask, removeProject
+        case fetchFile, fetchChanges, remoteControl, mergeWorktree, deleteTask, removeProject, restartConnector
     }
 
     private var hasPayloadForKind: Bool {
@@ -334,6 +387,7 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         case .mergeWorktree: mergeWorktree != nil
         case .deleteTask: deleteTask != nil
         case .removeProject: removeProject != nil
+        case .restartConnector: restartConnector != nil
         }
     }
 
@@ -357,6 +411,7 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         mergeWorktree = try container.decodeIfPresent(MergeWorktree.self, forKey: .mergeWorktree)
         deleteTask = try container.decodeIfPresent(DeleteTask.self, forKey: .deleteTask)
         removeProject = try container.decodeIfPresent(RemoveProject.self, forKey: .removeProject)
+        restartConnector = try container.decodeIfPresent(RestartConnector.self, forKey: .restartConnector)
 
         guard hasPayloadForKind else {
             throw DecodingError.dataCorruptedError(
@@ -375,6 +430,7 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         if kind != .mergeWorktree { mergeWorktree = nil }
         if kind != .deleteTask { deleteTask = nil }
         if kind != .removeProject { removeProject = nil }
+        if kind != .restartConnector { restartConnector = nil }
     }
 
     /// 编码方向同样守住这条规则：载荷缺失直接拒绝编码，与 kind 不符的载荷不写出。
@@ -398,6 +454,8 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
         case .mergeWorktree: try container.encode(required(mergeWorktree, encoder), forKey: .mergeWorktree)
         case .deleteTask: try container.encode(required(deleteTask, encoder), forKey: .deleteTask)
         case .removeProject: try container.encode(required(removeProject, encoder), forKey: .removeProject)
+        case .restartConnector:
+            try container.encode(required(restartConnector, encoder), forKey: .restartConnector)
         }
     }
 
@@ -464,6 +522,12 @@ public struct Command: Codable, Hashable, Sendable, Identifiable {
                                            agentId: String) -> Command {
         Command(id: id, createdAt: createdAt, agentId: agentId, kind: .setConnectorEnabled,
                 setConnectorEnabled: payload)
+    }
+
+    public static func restartConnector(_ payload: RestartConnector, createdAt: String,
+                                       id: String = UUID().uuidString.lowercased(),
+                                       agentId: String) -> Command {
+        Command(id: id, createdAt: createdAt, agentId: agentId, kind: .restartConnector, restartConnector: payload)
     }
 
     public static func mergeWorktree(_ payload: MergeWorktree, createdAt: String,
