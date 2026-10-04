@@ -218,7 +218,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 | projectsRoot | string? | 2.6 起。手机新建项目时 Agent 在这个目录（绝对路径）下建子文件夹；省略表示这台电脑不接受新建项目，手机不显示「新建项目」。Mac 默认是「文稿」里的 `BotBusProjects`，可在设置里改。这个目录本身算「不在项目中」 |
 | worktrees | true? | 3.4 起。电脑能从手机开 worktree 会话（`startTask.worktree`）、能 `mergeWorktree`；只写 true，不能时省略 |
 | capabilities | HostCapabilities? | 3.5 起。宿主能力；省略 = 全部支持（现在的 Mac 不报） |
-| workspace | true? | 3.7 起。电脑提供「操作电脑」的工作区服务（文件，之后是终端；见「工作区（3.7）」），没有屏幕的宿主也接受 `remoteControl`；只写 true，没有时省略。目前只有 Mac 报。不放进 `HostCapabilities`：那里省略 = 支持，什么都不报的旧电脑会被误判成有工作区 |
+| workspace | true? | 3.7 起。电脑提供「操作电脑」的工作区服务（文件与终端，终端看 `/status.features`；见「工作区（3.7）」），没有屏幕的宿主也接受 `remoteControl`；只写 true，没有时省略。目前只有 Mac 报。不放进 `HostCapabilities`：那里省略 = 支持，什么都不报的旧电脑会被误判成有工作区 |
 
 3.8 起 `AgentInfo.canRemoveProjects: boolean?` 声明能移出 **BotBus 电脑端项目列表**。只有 `true` 才支持；省略或 `false` 都不支持，手机不向旧电脑发 `removeProject`。
 
@@ -465,14 +465,14 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 
 ### 工作区（3.7）
 
-3.7 起 `remoteControl` 回的预览是「操作电脑」的**工作区**：电脑在本进程里处理 `/status`、`/arm`、`/fs/*`，其余路径（屏幕的 `/stream`、`/click`……）转给 Mac 的屏幕服务，没有屏幕时 404。工作区由 `AgentInfo.workspace` 声明，目前只有 Mac 报。线上类型在 Protocol 包的 `Workspace.swift`，样本在 `protocol-fixtures/workspace/`。终端（第二期）不在本节。
+3.7 起 `remoteControl` 回的预览是「操作电脑」的**工作区**：电脑在本进程里处理 `/status`、`/arm`、`/fs/*`，其余路径（屏幕的 `/stream`、`/click`……）转给 Mac 的屏幕服务，没有屏幕时 404。工作区由 `AgentInfo.workspace` 声明，目前只有 Mac 报。线上类型在 Protocol 包的 `Workspace.swift`，样本在 `protocol-fixtures/workspace/`。终端（「操作电脑」第二期）在本节末尾，不改协议版本。
 
 加密沿用上一节的预览隧道与 `K_rc`，Relay 只转发、看不到也不解析；没有组密钥时整个工作区不可用（403），不会退回明文。
 
 #### 状态与锁
 
-- **`GET /status`**：回 `{"sealed": …}`，AAD 仍是 `rc:<agentId>`（GET 没有请求体，回复钉不到请求上；旧 Mac 也有这个端点，手机靠它认出新功能）。明文是 `WorkspaceStatus`：`features`（`files` / `terminal` / `screen` 的子集，开集：不认得的值忽略；Mac 报 `["files", "screen"]`，没有屏幕的宿主只有 `["files"]`，`terminal` 第二期才有；3.6 的 Mac 没有这个键，按只有屏幕处理）、`armed`、`armedUntil`（解锁时是到期的毫秒时间戳，锁着时省略）、`home`（电脑上的主目录）、`platform`（`macos` / `linux` / `windows`），以及有屏幕服务时才有的屏幕字段（`accessibility`、`screenCapture`、`secureInput`、`streaming`、`frontmost`、`displays`，与 2.12 相同）。`POST /status` 回同样的内容，只是请求走下面的密封请求。
-- **锁**：屏幕的点击与键入、所有文件写操作（`/fs/write`、`/fs/mkdir`、`/fs/create`、`/fs/rename`、`/fs/trash`、`/fs/upload/*`）共用一把。默认锁着；`/arm` 带 `on` 开关并回 `WorkspaceStatus`，请求体解不开按「锁上」处理并照常回状态：出了岔子时落在更安全的一边，手机从回复里看得到。解锁后闲置 10 分钟锁回，每次真实输入或写操作顺延 10 分钟。读（`/fs/list`、`/fs/read`、`/status`、屏幕画面）不受锁限制；写在锁着时回失败 `locked`。
+- **`GET /status`**：回 `{"sealed": …}`，AAD 仍是 `rc:<agentId>`（GET 没有请求体，回复钉不到请求上；旧 Mac 也有这个端点，手机靠它认出新功能）。明文是 `WorkspaceStatus`：`features`（`files` / `terminal` / `screen` 的子集，开集：不认得的值忽略；Mac 报 `["files", "terminal", "screen"]`（没有嵌入 `botbus` 命令行的开发构建不报 `terminal`），没有屏幕的宿主没有 `screen`；3.6 的 Mac 没有这个键，按只有屏幕处理；1A 的 Mac 没有 `terminal`）、`armed`、`armedUntil`（解锁时是到期的毫秒时间戳，锁着时省略）、`home`（电脑上的主目录）、`platform`（`macos` / `linux` / `windows`），以及有屏幕服务时才有的屏幕字段（`accessibility`、`screenCapture`、`secureInput`、`streaming`、`frontmost`、`displays`，与 2.12 相同）。`POST /status` 回同样的内容，只是请求走下面的密封请求。
+- **锁**：屏幕的点击与键入、所有文件写操作（`/fs/write`、`/fs/mkdir`、`/fs/create`、`/fs/rename`、`/fs/trash`、`/fs/upload/*`）、终端的新开、关闭与输入共用一把。默认锁着；`/arm` 带 `on` 开关并回 `WorkspaceStatus`，请求体解不开按「锁上」处理并照常回状态：出了岔子时落在更安全的一边，手机从回复里看得到。解锁后闲置 10 分钟锁回，每次真实输入或写操作顺延 10 分钟。读（`/fs/list`、`/fs/read`、`/status`、屏幕画面、终端列表与输出）不受锁限制；写在锁着时回失败 `locked`。终端的尺寸锁着也收。
 
 #### 请求与防重放
 
@@ -560,7 +560,48 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 #### 生命周期
 
 - **开启**：手机发 `remoteControl {enabled: true}`，回预览产物 id；agent 停下来等人、电脑上又有密码框聚焦时，Mac 也会自动开一份挂在那条任务上的（要同时有辅助功能、录屏权限与聚焦的密码框，标题是「电脑屏幕」）。工作区预览共用一个来源：同一个任务再开（手机主动开的都算同一个，taskId 为空）时，那份还活着就**复用**它、回同一个产物 id——两台手机都点「操作电脑」看到的是同一份，而不是互相顶掉；那份离到期不到 10 分钟时才新开一份替换它（旧的那份上的手机会看到预览结束，重新开就拿到新的）。不同任务的可以并存。共用一份时每台手机各自换一次性入口、拿各自的会话 cookie，请求按各自的通道号 `c` 防重放，互不干扰；输入锁与屏幕画面是这台电脑共用的：一台解了锁，另一台也能点击、键入与写文件，任何一台发 `enabled: false` 都会撤掉这一份（见下）。没有组密钥时开启失败，不会退回明文；没允许录屏不影响开启，文件照常能用，`/status` 里 `screenCapture: false`，屏幕那段由页面说明原因。
-- **停止**：`remoteControl {enabled: false}` 撤掉**全部**工作区预览（包括自动开的、挂在任务上的），锁回输入、丢掉没提交的上传、停屏幕服务；手机关页面时不发它。预览因别的原因结束（到期、被顶掉、菜单里停止分享）时，没有别的工作区预览在用就同样收尾，还有别的在用则什么都不动。BotBus 退出、解除配对或配对被撤销也一样收尾，退出时不等磁盘。
+- **停止**：`remoteControl {enabled: false}` 撤掉**全部**工作区预览（包括自动开的、挂在任务上的），锁回输入、丢掉没提交的上传、停屏幕服务；手机关页面时不发它。预览因别的原因结束（到期、被顶掉、菜单里停止分享）时，没有别的工作区预览在用就同样收尾，还有别的在用则什么都不动。BotBus 退出、解除配对或配对被撤销也一样收尾，退出时不等磁盘。`enabled: false` 另结束全部终端会话；预览因别的原因结束（到期、被顶掉、菜单里停止分享）**不**结束终端，手机再开一份预览就接回原来的会话。
+
+#### 终端
+
+「操作电脑」第二期，**不改协议版本**：端点都在这一份工作区预览里，Relay 只转发；手机看 `/status.features` 有没有 `terminal` 决定画不画终端段。线上类型在 Protocol 包的 `Terminal.swift`，样本是 `protocol-fixtures/workspace/terminal.json`（生成）、`term-list.json`、`request-term-create.json`。
+
+**管理端点**（密封 `POST`，同 `/fs/*`：只收带通道号的请求、回复钉在请求上、失败是密封的 `{"failure": …}`）：
+
+| 路径 | 锁 | 明文请求 | 回复 |
+|---|---|---|---|
+| `/term/list` | 读 | — | `{sessions: [{id, title, cwd, cols, rows, createdAt, exited?: {code}}]}`，按 `createdAt` 排 |
+| `/term/create` | 写 | `cwd`, `cols`, `rows` | `{id}` |
+| `/term/close` | 写（关已经退出的会话不要锁） | `id` | `{}` |
+
+- `id` 是 16 个随机字节的规范 base64url（同通道号的写法）；`title` 是 shell 的名字（`zsh`）；`cwd` 是开的时候的目录，不跟着 `cd` 变；`createdAt` 是毫秒时间戳；`exited` 只在 shell 退出之后有，会话留在列表里直到手机关掉（`/term/close`）或 24 小时后回收。
+- `create`：shell 是用户的登录 shell（Mac / Linux：`getpwuid_r` 的 `pw_shell`，退回 `$SHELL`、`/bin/zsh`、`/bin/sh`，跳过 `nologin` / `false`）以 `-l` 启动，环境是 BotBus 自己的环境去掉 `BOTBUS_*`、加 `TERM=xterm-256color` 与 `COLORTERM=truecolor`；字符编码（`LC_ALL` > `LC_CTYPE` > `LANG`）不是 UTF-8 时（一个都没有，或 `C` / `POSIX` 之类）去掉不是 UTF-8 的 `LC_ALL` / `LC_CTYPE`、`LANG` 换成 UTF-8 的（macOS `en_US.UTF-8`、Linux `C.UTF-8`）。shell 只继承 0 / 1 / 2（伪终端），电脑进程别的描述符一个都不带过去。`cwd` 必须是绝对路径、已有的目录，`cols` / `rows` 在 1…1000。失败码同文件：`notFound`、`notDirectory`、`tcc`、`denied`、`invalid`、`timeout`、`locked`（检查之后、起 shell 那一刻目录没了或被拒，也按这几个报）；同时活着的会话已有 8 个（已退出的不算）、或起不了 shell 回 `failed`（前者 `detail: "too many terminals"`）。新开等在电脑上的授权框时电脑上「全部结束」了（或 `enabled: false`、解除配对），这次新开回 `failed`，不留下会话。
+- `close`：结束整个会话：关掉伪终端，给会话里（会话号就是 shell 的进程号）每个进程组发 `SIGHUP` 与 `SIGCONT`——后台作业各在各的进程组里——2 秒后还在的整组 `SIGKILL`（忽略 `SIGHUP` 的、`nohup` 的也一样；自己 `setsid` 出去的守护进程如 tmux 不在这个会话里，不受影响）。shell 自己退出时，留下的作业同样这样收拾。已经没有这个 `id` 回 `notFound`（手机当作已经关了）。
+- 没有终端的电脑（报的 `features` 里没有 `terminal`）对 `/term/*` 回明文 `501 unsupported`。
+
+**连接**：`GET /term/attach?id=<会话>&cn=<手机随机数>` 升级成 WebSocket（经隧道的 `wsopen`），一条连接对应一个会话，同一个会话最多同时连 4 条（输出都收到，尺寸以最后一个发 resize 的为准），第 5 条在握手之后以 4429 关。`cn` 是手机每次 attach 新生成的 16 字节规范 base64url。升级请求不带密封体：之后的消息全是密文，没有钥匙的一方 attach 上来什么也读不到、什么也写不进。电脑接不了这条（没有终端、`id` / `cn` 写法不对、没有组密钥）时在 `wsaccept` 之前回 `wsclose 1011`，Relay 给手机 502。
+
+每条消息都是**二进制**，一条就是一个密封包（`0x01 ‖ nonce ‖ 密文 ‖ tag`，`K_rc`，不加长度前缀），明文是 `[u8 类型][u64 大端序号][负载]`：
+
+| 类型 | 方向 | 负载 |
+|---|---|---|
+| 0 握手 | 电脑→手机 | 16 字节 `sn`（电脑的随机数）；序号固定 0，不计入之后的序号 |
+| 1 输出 | 电脑→手机 | 字节，每条 ≤ 64 KiB |
+| 2 输入 | 手机→电脑 | 字节 |
+| 3 尺寸 | 手机→电脑 | `u16 cols, u16 rows`（大端） |
+| 4 退出 | 电脑→手机 | `i32` 退出码（大端；被信号结束是 128 + 信号） |
+| 5 锁 | 电脑→手机 | `u8`：1 解锁、0 锁着 |
+| 6 回放结束 | 电脑→手机 | 无 |
+
+- **AAD**：握手是 `rc:<agentId>:term:<id>:<cn>:hello`；之后两个方向分别是 `rc:<agentId>:term:<id>:<cn>:<sn 的 base64url>:m2c` 与 `…:c2m`。两边各出一半随机数，Relay 把旧连接里手机发过的输入原样灌进新连接解不开（`sn` 变了）。
+- **序号**：握手之后每个方向从 0 起严格加一；解不开、序号不是下一个、方向不对（电脑收到输出类、手机收到输入类）、收到文本消息，一律断开这条连接。手机收到握手之前不发任何消息。
+- **顺序**：`wsaccept` → 握手 → 回放（最近 256 KiB 的输出，拆成若干条输出；缓冲满过时从第一个换行之后开始）→ 回放结束 → 锁 → 实时输出。会话已经退出时回放结束、锁之后再发「退出」，然后以 1000 关。
+- **锁**：锁着时电脑丢掉输入、回一条「锁 0」（一条连接 1 秒内最多回一次）；尺寸锁着也收（只是 `SIGWINCH`）。输入顺延闲置计时。
+- **背压**：电脑把输出合并 20 毫秒再发；一条连接排队的输出超过 1 MiB 就以 4008 关掉，手机重连拿回放。shell 不读输入、排着没写进去的输入超过 1 MiB 时，丢掉这一条并以 4008 关掉送来它的连接。
+- **换钥匙**：电脑的凭据变了之后，握手时用旧钥匙的连接不再收发任何东西（输出也不发），下一件事就以 1008 关；会话本身留着。
+- **关闭码**（明文、只当提示，要紧的结论用 `/term/list` 核实）：1000 shell 退出（之前已发「退出」）；1003 收到文本消息；1008 解不开、序号或方向不对、电脑换了钥匙；1011 电脑出错；4008 发送跟不上（或输入积压），重连拿回放（手机第一次立刻重连，连着的按退避来，免得一直重连、一直被踢）；4404 没有这个会话——attach 时就不认得，或连着时会话被结束（`/term/close`、电脑上「全部结束」、`enabled: false`、解除配对、24 小时回收），这时不发「退出」，手机核实之后直接移走标签；4429 这个会话的连接满了（4 条），手机不自动重连（重连只会接着被拒），停在这个标签上提示用户关掉别处的连接，点「重试」时再 attach 一次。Relay 的 1001 是预览结束（重开预览再 attach；手机把 Relay 关隧道用的 4001 也当成预览结束）。
+
+**寿命**：shell 退出、`/term/close`、`remoteControl {enabled: false}`、电脑上「全部结束」、BotBus 退出或解除配对时结束（退出时等会话里的进程清理完再走，最多约 2 秒）；没人连着也保留，连续 24 小时没人连着才回收——「有人连着」指连上之后至少发过一条解得开的消息（手机握手后先发的尺寸就算），只连上、什么都不发的连接不算；同时最多 8 个活着的。预览到期、被顶掉、菜单里停止分享都不结束终端。Mac 菜单「正在分享」里有一行「手机终端 · N 个会话」与「全部结束」；日志只记会话的开关与数量。
 
 ### 预览主机与隧道
 
@@ -687,6 +728,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - 版本 3.7 同时加入**「操作电脑」的工作区**（见「工作区（3.7）」）：`AgentInfo.workspace`；`remoteControl` 回的预览里多了 `/fs/*`（浏览、读写、上传文件），没有屏幕的宿主也能开；请求可带通道号 `c`，防重放改成按通道记窗口并另有全局下限，回复钉在请求上。都在密文里、走既有的预览隧道：Relay 只改版本号，两条最低线不动；旧手机照常只用屏幕，3.6 的 Mac 不报 `workspace`，新手机连它只有屏幕那一段。
 
 - 版本 3.8 加入 `deleteTask` / `removeProject` 命令、`ConnectorInfo.canDeleteTasks` / `AgentInfo.canRemoveProjects` 能力声明，以及两种手机列表视图和本地删除基线。新命令只发给声明支持的电脑；旧端忽略能力字段，Relay 继续只处理密封形状。当前版本升到 3.8，三条最低线不动。
+- 终端（「操作电脑」第二期，2026-10）**不改版本号**：管理端点与 `/term/attach` 都在 3.7 的工作区加密预览里，Relay 不变；手机按 `/status.features` 里的 `terminal` 判断，旧手机不认它、照常只有文件与屏幕。
 
 ## 附录 B：Fixture 与类型对应
 
@@ -801,3 +843,5 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 3.8 样本（`plain/` 内）：`command-delete-task.json` / `command-remove-project.json` → Command；`agent-info-list-management.json` → AgentInfo；`invalid/command-delete-task-missing-payload.json` / `invalid/command-remove-project-missing-payload.json` → 必须拒绝（kind 同名载荷缺失）。两条 Command 的根目录密封版由 `scripts/seal-fixtures.mjs` 生成，三端解密与重封核对。
 
 `protocol-fixtures/workspace/` 是工作区（3.7）的样本，Relay 不读：明文的 `WorkspaceStatus`（`status-mac.json`、`status-linux.json`、3.6 Mac 的 `status-legacy.json`）、`WorkspaceListing`（`listing.json`）、失败外形（`failure-conflict.json`，以及带不认得的 code 的 `failure-unknown-code.json`）、请求明文（`request-write.json`），以及由 `node scripts/seal-fixtures.mjs` 生成的 `sealed.json`（固定钥匙与确定性 nonce 封的请求、钉在请求上的回复、3 个包的 `/fs/read` 流，不要手改）。Swift 的 `WorkspaceWireTests` 与 Android 的 `WorkspaceWireTest` 逐字节核对它们；手机端的 `WorkspaceSealerTests` / `WorkspaceSealerTest` 另用 `sealed.json` 核对手机自己封的请求。
+
+终端（第二期）：`workspace/term-list.json` → `TerminalList`；`workspace/request-term-create.json` → `/term/create` 的请求明文；`workspace/terminal.json`（`node scripts/seal-fixtures.mjs` 生成）→ 握手与两个方向的 7 条消息，Swift `WorkspaceWireTests` 与 Kotlin `WorkspaceWireTest` 逐字节核对。
