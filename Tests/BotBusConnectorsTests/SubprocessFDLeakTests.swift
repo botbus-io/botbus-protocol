@@ -37,9 +37,37 @@ final class SubprocessFDLeakTests: XCTestCase {
         return url.path
     }
 
-    /// 先跑一次预热（线程池、懒加载的全局状态也会占 fd），再跑 `runs` 次，等读线程退出后比较。
+    /// `Process.run()` 要取调用线程的 `RunLoop.current`：Linux 上一条线程第一次起子进程就建一个 CFRunLoop，
+    /// 占 3 个描述符（epoll、eventfd、timerfd），跟线程活得一样久。协作线程池最多 CPU 数条线程，所以这是一次性的，
+    /// 不算泄漏；可用例里的任务换到一条还没起过子进程的池线程上，就会冒出 3 个来，并发跑时一下子十几条线程，
+    /// 看着像漏了几十个。计数前先并发起子进程，把池里的线程都用一遍，直到描述符数不再涨。
+    ///
+    /// 每个任务同步等子进程退出、不让出线程，后面的任务只好落到别的池线程上。
+    private func warmUpThreadRunLoops() async throws {
+        var previous = openDescriptors()
+        for _ in 0..<10 {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for _ in 0..<(4 * ProcessInfo.processInfo.activeProcessorCount) {
+                    group.addTask {
+                        let process = Process()
+                        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+                        process.arguments = ["-c", "exit 0"]
+                        try process.run()
+                        process.waitUntilExit()
+                    }
+                }
+                try await group.waitForAll()
+            }
+            let current = openDescriptors()
+            if current <= previous { return }
+            previous = current
+        }
+    }
+
+    /// 先预热（池线程的 run loop、线程池、懒加载的全局状态也会占 fd），再跑 `runs` 次，等读线程退出后比较。
     private func assertNoLeak(_ what: String, runs: Int, file: StaticString = #filePath, line: UInt = #line,
                               _ body: () async throws -> Void) async throws {
+        try await warmUpThreadRunLoops()
         try await body()
         try await Task.sleep(for: .milliseconds(300))
         let before = openDescriptors()
@@ -111,12 +139,17 @@ final class SubprocessFDLeakTests: XCTestCase {
     }
 
     /// 孙进程攥着 stdout、EOF 不来：排空超时之后读端也得关掉。并发跑，免得每次都等 2 秒。
+    ///
+    /// 孙进程只能攥 stdout，别的继承来的描述符得关掉：Linux 上 Foundation 靠子进程继承的一个 socket 得知它退出，
+    /// 孙进程也攥着这个 socket 的话，`terminationHandler` 要等孙进程退出才来，那时 EOF 也到了，排空超时根本走不到。
+    /// Hermes 是 Python，`subprocess` 默认 `close_fds`，它起的后台进程本来就只继承 stdio。dash 不认两位数的 fd，用 bash 关。
     func testHermesLauncherClosesStdoutWhenEOFNeverComes() async throws {
         let hermes = try script("hermes-bg", """
             echo '{"type":"result","exit_code":0}'
-            sleep 4 &
+            bash -c 'for fd in /proc/$$/fd/*; do n=${fd##*/}; [ "$n" -gt 2 ] && eval "exec $n>&-"; done; exec sleep 4' &
             exit 0
             """)
+        try await warmUpThreadRunLoops()
         try await runHermes(try script("hermes-warm", "exit 0"))
         try await Task.sleep(for: .milliseconds(300))
         let before = openDescriptors()
