@@ -278,6 +278,77 @@ final class WorkspaceWireTests: XCTestCase {
                        [WorkspacePacket.Kind.header, .data, .end].map { Int($0.rawValue) })
     }
 
+    func testTerminalListRoundTrips() throws {
+        try assertRoundTrips(TerminalList.self, "term-list.json")
+        let list = try JSONDecoder().decode(TerminalList.self, from: fixture("term-list.json"))
+        XCTAssertNil(list.sessions[0].exited)
+        XCTAssertEqual(list.sessions[1].exited?.code, 130)
+        XCTAssertTrue(list.sessions.allSatisfy { TerminalCipher.isValidToken($0.id) })
+    }
+
+    func testTermCreateEnvelopeMatchesFixture() throws {
+        let body = WorkspaceRequest.TermCreate(cwd: "/Users/me/Projects/demo", cols: 120, rows: 40)
+        let produced = try WorkspaceEnvelope.plaintext(body, path: WorkspacePath.termCreate, stamp: 1_790_000_000_600,
+                                                       channel: "AAECAwQFBgcICQoLDA0ODw")
+        XCTAssertEqual(produced, try canonicalBytes(JSONSerialization.jsonObject(with: fixture("request-term-create.json"))))
+    }
+
+    /// 每次封之前把下一条要用的 nonce 放进去：样本里每条的 nonce 就是密文的第 1…12 字节。
+    private final class NonceSlot: @unchecked Sendable {
+        var next = Data()
+    }
+
+    func testSealedTerminalMessagesMatchByteForByte() throws {
+        let sample = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture("terminal.json")) as? [String: Any])
+        let key = try PairKey(root: Data((0..<32).map { UInt8($0) })).derived(.remoteControl)
+        let agentId = try XCTUnwrap(sample["agentId"] as? String)
+        let sessionId = try XCTUnwrap(sample["sessionId"] as? String)
+        let clientNonce = try XCTUnwrap(sample["clientNonce"] as? String)
+        let serverNonce = try XCTUnwrap(sample["serverNonce"] as? String)
+        let slot = NonceSlot()
+        let provider: Sealer.NonceProvider = { _ in slot.next }
+        var computer = try TerminalCipher(key: key, agentId: agentId, sessionId: sessionId, clientNonce: clientNonce,
+                                          role: .computer, nonce: provider)
+        var phone = try TerminalCipher(key: key, agentId: agentId, sessionId: sessionId, clientNonce: clientNonce,
+                                       role: .phone, nonce: provider)
+
+        let hello = try XCTUnwrap(sample["hello"] as? [String: String])
+        let helloSealed = try XCTUnwrap(Base64URL.decode(try XCTUnwrap(hello["sealed"])))
+        slot.next = helloSealed.subdata(in: 1..<13)
+        XCTAssertEqual(try computer.sealHello(serverNonce: try XCTUnwrap(Base64URL.decode(serverNonce))), helloSealed,
+                       "握手要逐字节相同")
+        try phone.openHello(helloSealed)
+        XCTAssertEqual(phone.serverNonce, serverNonce)
+        XCTAssertEqual(TerminalFrame.plaintext(.hello(serverNonce: try XCTUnwrap(Base64URL.decode(serverNonce))), seq: 0),
+                       try XCTUnwrap(Base64URL.decode(try XCTUnwrap(hello["plaintext"]))))
+
+        let messages = try XCTUnwrap(sample["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.count, 7)
+        for (index, entry) in messages.enumerated() {
+            let kind = UInt8(try XCTUnwrap(entry["kind"] as? Int))
+            let payload = try XCTUnwrap(Base64URL.decode(try XCTUnwrap(entry["payload"] as? String)))
+            let sealed = try XCTUnwrap(Base64URL.decode(try XCTUnwrap(entry["sealed"] as? String)))
+            let message = try TerminalMessage.decode(kind: kind, payload: payload)
+            slot.next = sealed.subdata(in: 1..<13)
+            if entry["direction"] as? String == "m2c" {
+                XCTAssertEqual(try computer.seal(message), sealed, "第 \(index) 条（电脑封）")
+                XCTAssertEqual(try phone.open(sealed), message, "第 \(index) 条（手机解）")
+            } else {
+                XCTAssertEqual(try phone.seal(message), sealed, "第 \(index) 条（手机封）")
+                XCTAssertEqual(try computer.open(sealed), message, "第 \(index) 条（电脑解）")
+            }
+        }
+
+        // 换序：一条新连接的手机先收第二条电脑消息，序号对不上。
+        var fresh = try TerminalCipher(key: key, agentId: agentId, sessionId: sessionId, clientNonce: clientNonce,
+                                       role: .phone)
+        try fresh.openHello(helloSealed)
+        let second = try XCTUnwrap(Base64URL.decode(try XCTUnwrap(messages[1]["sealed"] as? String)))
+        XCTAssertThrowsError(try fresh.open(second)) {
+            XCTAssertEqual($0 as? TerminalWireError, .outOfOrder(expected: 0, got: 1))
+        }
+    }
+
     // MARK: - 语料对账
 
     /// `protocol-fixtures/workspace/` 不在顶层的覆盖对账里：这里单独对账，新增样本却没有用例会在这里暴露。
@@ -287,6 +358,7 @@ final class WorkspaceWireTests: XCTestCase {
         let used: Set<String> = [
             "status-mac.json", "status-linux.json", "status-legacy.json", "listing.json",
             "failure-conflict.json", "failure-unknown-code.json", "request-write.json", "sealed.json",
+            "terminal.json", "term-list.json", "request-term-create.json",
         ]
         XCTAssertEqual(onDisk.subtracting(used).sorted(), [], "这些样本没有被任何用例使用")
         XCTAssertEqual(used.subtracting(onDisk).sorted(), [], "用例引用了不存在的样本")

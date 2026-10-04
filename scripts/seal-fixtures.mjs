@@ -317,7 +317,8 @@ async function main() {
     ],
   });
   await writeWorkspaceSealed();
-  console.log(`sealed ${count} fixtures + pairing fixtures + workspace sample into ${FIXTURES}`);
+  await writeTerminalSealed();
+  console.log(`sealed ${count} fixtures + pairing fixtures + workspace and terminal samples into ${FIXTURES}`);
 }
 
 /**
@@ -360,6 +361,65 @@ async function writeWorkspaceSealed() {
       stream: base64url(Buffer.concat(frames)),
     },
   });
+}
+
+/**
+ * 终端（「操作电脑」第二期）的密封样本：`protocol-fixtures/workspace/terminal.json`。
+ * K_rc、固定的电脑 id / 会话号 / 手机随机数 `cn` / 电脑随机数 `sn`：握手一条，之后两个方向交错的几条消息，
+ * 每条的明文是 `[u8 类型][u64 大端序号][负载]`，AAD 按方向，序号各自从 0 起。Swift 与 Kotlin 都拿它逐字节核对。
+ * 同一方向的 AAD 相同：样本给每条一个不同的确定性 nonce（`<aad>#<序号>` 的哈希）；生产环境一律随机。
+ */
+async function writeTerminalSealed() {
+  const rc = await derive(FIXTURE_ROOT_KEY, INFO.remoteControl);
+  const agentId = FIXTURE_AGENT_ID;
+  const sessionId = "EBESExQVFhcYGRobHB0eHw";
+  const clientNonce = "ICEiIyQlJicoKSorLC0uLw";
+  const serverNonceBytes = Uint8Array.from({ length: 16 }, (_, i) => 48 + i);
+  const serverNonce = base64url(serverNonceBytes);
+  const prefix = `rc:${agentId}:term:${sessionId}:${clientNonce}`;
+  const frame = (kind, seq, payload) => {
+    const out = new Uint8Array(9 + payload.length);
+    out[0] = kind;
+    new DataView(out.buffer).setBigUint64(1, BigInt(seq));
+    out.set(payload, 9);
+    return out;
+  };
+  const text = (value) => new TextEncoder().encode(value);
+  const size = (cols, rows) => {
+    const out = new Uint8Array(4);
+    const view = new DataView(out.buffer);
+    view.setUint16(0, cols);
+    view.setUint16(2, rows);
+    return out;
+  };
+  const exitCode = (code) => {
+    const out = new Uint8Array(4);
+    new DataView(out.buffer).setInt32(0, code);
+    return out;
+  };
+
+  const helloPlain = frame(0, 0, serverNonceBytes);
+  const hello = { plaintext: base64url(helloPlain), sealed: await seal(rc, helloPlain, `${prefix}:hello`) };
+
+  const steps = [
+    ["m2c", 1, text("Last login: Sat Oct  4 09:00:00 on ttys001\r\nme@demo ~ % ")],
+    ["m2c", 6, new Uint8Array(0)],
+    ["m2c", 5, Uint8Array.of(0)],
+    ["c2m", 3, size(120, 40)],
+    ["c2m", 2, text("ls\r")],
+    ["m2c", 1, text("你好 \u001b[31mred\u001b[0m\r\n")],
+    ["m2c", 4, exitCode(130)],
+  ];
+  const seqs = { m2c: 0, c2m: 0 };
+  const messages = [];
+  for (const [direction, kind, payload] of steps) {
+    const seq = seqs[direction]++;
+    const aadText = `${prefix}:${serverNonce}:${direction}`;
+    const plain = frame(kind, seq, payload);
+    const sealed = await seal(rc, plain, aadText, fixtureNonce(`${aadText}#${seq}`));
+    messages.push({ direction, seq, kind, payload: base64url(payload), sealed });
+  }
+  write("workspace/terminal.json", { agentId, sessionId, clientNonce, serverNonce, hello, messages });
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

@@ -1,0 +1,23 @@
+{
+  "sessions": [
+    {
+      "cols": 120,
+      "createdAt": 1790000000000,
+      "cwd": "/Users/me/Projects/demo",
+      "id": "EBESExQVFhcYGRobHB0eHw",
+      "rows": 40,
+      "title": "zsh"
+    },
+    {
+      "cols": 80,
+      "createdAt": 1790000300000,
+      "cwd": "/Users/me",
+      "exited": {
+        "code": 130
+      },
+      "id": "MDEyMzQ1Njc4OTo7PD0-Pw",
+      "rows": 24,
+      "title": "zsh"
+    }
+  ]
+}

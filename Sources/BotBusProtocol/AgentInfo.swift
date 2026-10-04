@@ -290,7 +290,7 @@ public struct AgentInfo: Codable, Hashable, Sendable, Identifiable {
     public var worktrees: Bool?
     /// 协议 3.5：宿主能力，见 `HostCapabilities`。nil = 全部支持（现在的 Mac）。
     public var capabilities: HostCapabilities?
-    /// 协议 3.7：这台电脑提供「操作电脑」的工作区服务（文件，之后是终端），`remoteControl` 命令在没有屏幕的宿主上也能用。
+    /// 协议 3.7：这台电脑提供「操作电脑」的工作区服务（文件与终端），`remoteControl` 命令在没有屏幕的宿主上也能用。
     /// 只写 true，nil = 没有。不放进 `HostCapabilities`：那里「省略 = 支持」，什么都不报的旧电脑会被当成有。
     public var workspace: Bool?
     /// 协议 3.8：支持移出 BotBus 项目列表，省略 = 不支持。
