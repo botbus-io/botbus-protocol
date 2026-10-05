@@ -1,0 +1,7 @@
+{
+  "path": "/home/me/inbox",
+  "entries": [
+    { "name": "report.pdf", "kind": "file", "size": 2048, "mtimeMs": 1790000000000 },
+    { "name": "caf�.txt", "kind": "other", "mtimeMs": 0, "undecodable": true }
+  ]
+}

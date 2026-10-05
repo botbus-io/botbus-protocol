@@ -40,6 +40,7 @@ final class DirectoryProbeTests: XCTestCase {
         XCTAssertNil(first)
         let second = await blocked.diagnose("/slow")
         XCTAssertNil(second)
+        await assertFirstReadStarted(calls)
         XCTAssertEqual(calls.value, 1)
     }
 
@@ -59,7 +60,15 @@ final class DirectoryProbeTests: XCTestCase {
         XCTAssertNil(first)
         let second = await blocked().diagnose(path)
         XCTAssertNil(second)
+        await assertFirstReadStarted(calls)
         XCTAssertEqual(calls.value, 1)
+    }
+
+    /// 第一次读在后台队列上跑，超时只是不再等它：线程被饿着的机器上（Windows 的托管 runner）两次 `diagnose` 都回来了，
+    /// 它可能还没开始。先等它真的跑起来，再数一共起了几次（第二次在 `diagnose` 里同步地被挡掉，不会后补）。
+    private func assertFirstReadStarted(_ calls: LockedCounter, file: StaticString = #filePath, line: UInt = #line) async {
+        let started = await eventually(timeout: 5) { calls.value >= 1 }
+        XCTAssertTrue(started, "第一次读一直没开始", file: file, line: line)
     }
 
     /// 等结果的任务被取消（任务重新跑起来、被删掉）：立刻回 nil，不等读完或超时。

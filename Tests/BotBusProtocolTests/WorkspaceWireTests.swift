@@ -51,6 +51,39 @@ final class WorkspaceWireTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(WorkspaceEntry.self, from: future).kind, .other)
     }
 
+    /// 第三期：Windows 宿主的 `/status` 与「此电脑」那一层（路径是空串）。
+    func testWindowsStatusAndDriveListing() throws {
+        try assertRoundTrips(WorkspaceStatus.self, "status-windows.json")
+        let windows = try JSONDecoder().decode(WorkspaceStatus.self, from: fixture("status-windows.json"))
+        XCTAssertEqual(windows.platform, "windows")
+        XCTAssertEqual(windows.home, #"C:\Users\me"#)
+        XCTAssertTrue(windows.supports(WorkspaceFeature.terminal))
+        XCTAssertFalse(windows.supports(WorkspaceFeature.screen))
+
+        try assertRoundTrips(WorkspaceListing.self, "listing-drives.json")
+        let drives = try JSONDecoder().decode(WorkspaceListing.self, from: fixture("listing-drives.json"))
+        XCTAssertEqual(drives.path, "", "「此电脑」是空串")
+        XCTAssertEqual(drives.entries.map(\.name), ["C:", "D:"])
+        XCTAssertTrue(drives.entries.allSatisfy { $0.kind == .dir && $0.git == nil && $0.size == nil })
+        XCTAssertNil(drives.repoRoot)
+    }
+
+    /// 第三期：Linux 上不是 UTF-8 的名字标 `undecodable`；Linux / Windows 进不了废纸篓回 `noTrash`。
+    func testUndecodableNamesAndNoTrash() throws {
+        try assertRoundTrips(WorkspaceListing.self, "listing-undecodable.json")
+        let listing = try JSONDecoder().decode(WorkspaceListing.self, from: fixture("listing-undecodable.json"))
+        XCTAssertNil(listing.entries[0].undecodable)
+        XCTAssertEqual(listing.entries[1].undecodable, true)
+        XCTAssertEqual(listing.entries[1].kind, .other)
+        XCTAssertEqual(listing.entries[1].name, "caf\u{FFFD}.txt")
+        XCTAssertThrowsError(try WorkspaceReply.decode(WorkspaceEmpty.self, from: fixture("failure-no-trash.json"))) {
+            XCTAssertEqual(($0 as? WorkspaceFailure)?.code, .noTrash)
+        }
+        // 只写 true：没有的时候整个键省略。
+        let plain = try JSONEncoder().encode(WorkspaceEntry(name: "a", kind: .file, mtimeMs: 0))
+        XCTAssertFalse(String(decoding: plain, as: UTF8.self).contains("undecodable"))
+    }
+
     func testFailureEnvelope() throws {
         XCTAssertThrowsError(try WorkspaceReply.decode(WorkspaceEmpty.self, from: fixture("failure-conflict.json"))) {
             let failure = $0 as? WorkspaceFailure
@@ -359,6 +392,7 @@ final class WorkspaceWireTests: XCTestCase {
             "status-mac.json", "status-linux.json", "status-legacy.json", "listing.json",
             "failure-conflict.json", "failure-unknown-code.json", "request-write.json", "sealed.json",
             "terminal.json", "term-list.json", "request-term-create.json",
+            "status-windows.json", "listing-drives.json", "listing-undecodable.json", "failure-no-trash.json",
         ]
         XCTAssertEqual(onDisk.subtracting(used).sorted(), [], "这些样本没有被任何用例使用")
         XCTAssertEqual(used.subtracting(onDisk).sorted(), [], "用例引用了不存在的样本")

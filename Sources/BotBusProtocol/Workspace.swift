@@ -121,9 +121,13 @@ public struct WorkspaceEntry: Codable, Hashable, Sendable {
     public var hidden: Bool?
     /// git 标记：`M` / `A` / `D` / `?` / `U`，目录在仓库里时才有；目录里有改动时目录标 `M`。
     public var git: String?
+    /// 第三期：名字解不出来（Linux 上不是合法 UTF-8，Windows 上含落单的代理项）。`name` 是把解不出来的部分换成 U+FFFD
+    /// 之后的，按它碰不到原来那一项；`kind` 一律 `other`。
+    /// 只写 true。
+    public var undecodable: Bool?
 
     public init(name: String, kind: Kind, link: Bool? = nil, size: Int64? = nil, mtimeMs: Int64,
-                hidden: Bool? = nil, git: String? = nil) {
+                hidden: Bool? = nil, git: String? = nil, undecodable: Bool? = nil) {
         self.name = name
         self.kind = kind
         self.link = link
@@ -131,6 +135,7 @@ public struct WorkspaceEntry: Codable, Hashable, Sendable {
         self.mtimeMs = mtimeMs
         self.hidden = hidden
         self.git = git
+        self.undecodable = undecodable
     }
 }
 
@@ -183,7 +188,11 @@ public struct WorkspaceReadEnd: Codable, Hashable, Sendable {
 /// 失败的回复（HTTP 200 + 密封的 `{"failure": …}`）。手机按 `code` 显示本地化文案。
 public struct WorkspaceFailure: Codable, Hashable, Sendable, Error {
     public enum Code: String, Codable, Sendable {
-        case notFound, notDirectory, exists, tooLarge, invalid, denied, tcc, timeout, locked, conflict, uploadGone, failed
+        case notFound, notDirectory, exists, tooLarge, invalid, denied, tcc, timeout, locked, conflict, uploadGone
+        /// 第三期：这个位置没有能用的废纸篓（Linux 找不到可用的 XDG 废纸篓、Windows 的回收站收不了、Mac 的卷不支持），
+        /// 文件原样留着，没有删除。旧手机按 `failed`。
+        case noTrash
+        case failed
 
         /// 以后的电脑可能加新的 code：按 `failed` 处理。
         public init(from decoder: Decoder) throws {
