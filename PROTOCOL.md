@@ -218,7 +218,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 | projectsRoot | string? | 2.6 起。手机新建项目时 Agent 在这个目录（绝对路径）下建子文件夹；省略表示这台电脑不接受新建项目，手机不显示「新建项目」。Mac 默认是「文稿」里的 `BotBusProjects`，可在设置里改。这个目录本身算「不在项目中」 |
 | worktrees | true? | 3.4 起。电脑能从手机开 worktree 会话（`startTask.worktree`）、能 `mergeWorktree`；只写 true，不能时省略 |
 | capabilities | HostCapabilities? | 3.5 起。宿主能力；省略 = 全部支持（现在的 Mac 不报） |
-| workspace | true? | 3.7 起。电脑提供「操作电脑」的工作区服务（文件与终端，终端看 `/status.features`；见「工作区（3.7）」），没有屏幕的宿主也接受 `remoteControl`；只写 true，没有时省略。目前只有 Mac 报。不放进 `HostCapabilities`：那里省略 = 支持，什么都不报的旧电脑会被误判成有工作区 |
+| workspace | true? | 3.7 起。电脑提供「操作电脑」的工作区服务（文件与终端，终端看 `/status.features`；见「工作区（3.7）」），没有屏幕的宿主也接受 `remoteControl`；只写 true，没有时省略。Mac、Linux、Windows 宿主都报（第三期起；Linux / Windows 没有屏幕、也没有开发预览，`capabilities` 照旧报 `remoteControl: false`、`previews: false`，手机看 `workspace` 给「操作电脑」）。不放进 `HostCapabilities`：那里省略 = 支持，什么都不报的旧电脑会被误判成有工作区 |
 
 3.8 起 `AgentInfo.canRemoveProjects: boolean?` 声明能移出 **BotBus 电脑端项目列表**。只有 `true` 才支持；省略或 `false` 都不支持，手机不向旧电脑发 `removeProject`。
 
@@ -231,7 +231,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 
 ### HostCapabilities
 
-3.5 起。每个键都是可选布尔，**省略 = 支持**，`true` 与省略同义，只有 `false` 表示不支持；接收方遇到不认得的键一律忽略（以后加能力不用发手机版）。Linux 宿主报 `{"remoteControl": false, "previews": false}`，其余省略。没有屏幕，不能远程操作；第一版也不开预览——预览隧道与 HMR 代理走 URLSession 的 WebSocket，而 Swift 静态 Linux SDK 的 libcurl 没编进 WebSocket（连 Relay 已换成 SwiftNIO，这两处还没换）。
+3.5 起。每个键都是可选布尔，**省略 = 支持**，`true` 与省略同义，只有 `false` 表示不支持；接收方遇到不认得的键一律忽略（以后加能力不用发手机版）。Linux 与 Windows 宿主报 `{"remoteControl": false, "previews": false}`，其余省略。没有屏幕，不能远程操作；也不开开发预览：「操作电脑」用的预览隧道第三期起两个宿主都有了（Linux 走 SwiftNIO、Windows 走 WinHTTP——Swift 静态 Linux SDK 的 libcurl 没编进 WebSocket），但托管 dev server、转发本机端口与 HMR 的 WebSocket 代理还没做。
 
 | 字段 | 类型 | 为 false 时手机怎么做 |
 |---|---|---|
@@ -473,13 +473,13 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 
 ### 工作区（3.7）
 
-3.7 起 `remoteControl` 回的预览是「操作电脑」的**工作区**：电脑在本进程里处理 `/status`、`/arm`、`/fs/*`，其余路径（屏幕的 `/stream`、`/click`……）转给 Mac 的屏幕服务，没有屏幕时 404。工作区由 `AgentInfo.workspace` 声明，目前只有 Mac 报。线上类型在 Protocol 包的 `Workspace.swift`，样本在 `protocol-fixtures/workspace/`。终端（「操作电脑」第二期）在本节末尾，不改协议版本。
+3.7 起 `remoteControl` 回的预览是「操作电脑」的**工作区**：电脑在本进程里处理 `/status`、`/arm`、`/fs/*`，其余路径（屏幕的 `/stream`、`/click`……）转给 Mac 的屏幕服务，没有屏幕时 404。工作区由 `AgentInfo.workspace` 声明，Mac、Linux、Windows 都报；Linux / Windows 没有屏幕服务，`/status`、`/arm`、`/fs/*`、`/term/*` 之外的路径一律 404。线上类型在 Protocol 包的 `Workspace.swift`，样本在 `protocol-fixtures/workspace/`。终端（「操作电脑」第二期）在本节末尾，不改协议版本。
 
 加密沿用上一节的预览隧道与 `K_rc`，Relay 只转发、看不到也不解析；没有组密钥时整个工作区不可用（403），不会退回明文。
 
 #### 状态与锁
 
-- **`GET /status`**：回 `{"sealed": …}`，AAD 仍是 `rc:<agentId>`（GET 没有请求体，回复钉不到请求上；旧 Mac 也有这个端点，手机靠它认出新功能）。明文是 `WorkspaceStatus`：`features`（`files` / `terminal` / `screen` 的子集，开集：不认得的值忽略；Mac 报 `["files", "terminal", "screen"]`（没有嵌入 `botbus` 命令行的开发构建不报 `terminal`），没有屏幕的宿主没有 `screen`；3.6 的 Mac 没有这个键，按只有屏幕处理；1A 的 Mac 没有 `terminal`）、`armed`、`armedUntil`（解锁时是到期的毫秒时间戳，锁着时省略）、`home`（电脑上的主目录）、`platform`（`macos` / `linux` / `windows`），以及有屏幕服务时才有的屏幕字段（`accessibility`、`screenCapture`、`secureInput`、`streaming`、`frontmost`、`displays`，与 2.12 相同）。`POST /status` 回同样的内容，只是请求走下面的密封请求。
+- **`GET /status`**：回 `{"sealed": …}`，AAD 仍是 `rc:<agentId>`（GET 没有请求体，回复钉不到请求上；旧 Mac 也有这个端点，手机靠它认出新功能）。明文是 `WorkspaceStatus`：`features`（`files` / `terminal` / `screen` 的子集，开集：不认得的值忽略；Mac 报 `["files", "terminal", "screen"]`（没有嵌入 `botbus` 命令行的开发构建不报 `terminal`），没有屏幕的宿主没有 `screen`（Linux 报 `["files", "terminal"]`；Windows 有 ConPTY——Windows 10 1809 起——时报 `["files", "terminal"]`，没有时只有 `files`）；3.6 的 Mac 没有这个键，按只有屏幕处理；1A 的 Mac 没有 `terminal`）、`armed`、`armedUntil`（解锁时是到期的毫秒时间戳，锁着时省略）、`home`（电脑上的主目录）、`platform`（`macos` / `linux` / `windows`），以及有屏幕服务时才有的屏幕字段（`accessibility`、`screenCapture`、`secureInput`、`streaming`、`frontmost`、`displays`，与 2.12 相同）。`POST /status` 回同样的内容，只是请求走下面的密封请求。
 - **锁**：屏幕的点击与键入、所有文件写操作（`/fs/write`、`/fs/mkdir`、`/fs/create`、`/fs/rename`、`/fs/trash`、`/fs/upload/*`）、终端的新开、关闭与输入共用一把。默认锁着；`/arm` 带 `on` 开关并回 `WorkspaceStatus`，请求体解不开按「锁上」处理并照常回状态：出了岔子时落在更安全的一边，手机从回复里看得到。解锁后闲置 10 分钟锁回，每次真实输入或写操作顺延 10 分钟。读（`/fs/list`、`/fs/read`、`/status`、屏幕画面、终端列表与输出）不受锁限制；写在锁着时回失败 `locked`。终端的尺寸锁着也收。
 
 #### 请求与防重放
@@ -501,7 +501,7 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 |---|---|---|
 | `/status`（POST） | — | `WorkspaceStatus` |
 | `/arm` | `on` | `WorkspaceStatus` |
-| `/fs/list` | `path`, `hidden?` | `{path, entries: [{name, kind: file\|dir\|other, link?, size?, mtimeMs, hidden?, git?}], truncated?, repoRoot?}` |
+| `/fs/list` | `path`, `hidden?` | `{path, entries: [{name, kind: file\|dir\|other, link?, size?, mtimeMs, hidden?, git?, undecodable?}], truncated?, repoRoot?}`；Windows 上 `path` 为空串时是「此电脑」（见「Windows 的路径」） |
 | `/fs/read` | `path` | 分块流（见上） |
 | `/fs/write` | `path`, `content`（**标准 base64**）, `expect?: {mtimeMs, size}` | `{mtimeMs, size}` |
 | `/fs/mkdir`、`/fs/create` | `path` | `{}` |
@@ -530,7 +530,8 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 | locked | 锁着时的写操作 |
 | conflict | `/fs/write` 的 `expect` 对不上，带电脑上现在的 `current: {mtimeMs, size}` |
 | uploadGone | 上传不存在、已被清理或作废 |
-| failed | 其余：没空间、同时的上传太多（`too many uploads`）、这个平台还不支持（Linux / Windows 的废纸篓、Windows 的文件） |
+| noTrash | 第三期：这个位置没有能用的废纸篓（Linux 找不到可用的 XDG 废纸篓、Windows 的回收站收不了这一项、Mac 的卷不支持），文件原样留着、没有删除；旧手机按 `failed` 显示 |
+| failed | 其余：没空间、同时的上传太多（`too many uploads`） |
 
 **忙与超时。** 文件操作都在电脑上一个专用的队列里跑：第一次进「文稿」「桌面」等受保护目录时系统会在电脑上弹授权框、调用一直卡着，网络卷也一样。每个操作最多等 20 秒（也留出了 Relay 等 `res` 的 30 秒），超时回 `timeout`。线程在系统调用里没法取消，所以**超时只是不再等它，操作可能仍在继续、之后才完成**；同时在途的操作（含已经超时、线程仍卡着的）最多 8 个，再来的立刻回 `timeout`（`detail: "busy"`）。两种「忙」的重试语义不同：
 
@@ -540,15 +541,36 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 
 #### 文件
 
-路径一律是电脑上的绝对路径，不限制在项目目录里（终端本来就能碰到整台电脑，这里是同一份权限的另一个界面）。电脑按字面规范化路径：丢掉空段与 `.`，`..` 退一层但不会越过根（`/..` 就是 `/`），不解析软链接，不含 NUL，不以 `/` 开头的一律 `invalid`；回复里的路径是规范化之后的。Windows 的盘符路径本期不支持（回 `failed`）。
+路径一律是电脑上的绝对路径，不限制在项目目录里（终端本来就能碰到整台电脑，这里是同一份权限的另一个界面）。电脑按字面规范化路径：丢掉空段与 `.`，`..` 退一层但不会越过根（`/..` 就是 `/`），不解析软链接，不含 NUL，不以 `/` 开头的一律 `invalid`；回复里的路径是规范化之后的。Windows 的路径见下面「Windows 的路径」。
 
-- **列目录**：目录在前，再按名字（不分大小写）；最多 5000 项，多了截断并标 `truncated`；点开头的名字默认不列，请求 `hidden: true` 才列并标 `hidden: true`。软链接按它指向的东西报（`kind`、`size`、`mtimeMs` 都取目标的）并标 `link: true`，指向目录的能点进去；断掉的或读不了的是 `other`。`size` 只有文件有。
+- **列目录**：目录在前，再按名字（不分大小写）；最多 5000 项，多了截断并标 `truncated`；点开头的名字默认不列，请求 `hidden: true` 才列并标 `hidden: true`。软链接按它指向的东西报（`kind`、`size`、`mtimeMs` 都取目标的）并标 `link: true`，指向目录的能点进去；断掉的或读不了的是 `other`。`size` 只有文件有。第三期：Linux 上名字不是合法 UTF-8 的项照样列出来，见「Linux 的废纸篓与文件名」。
 - **读**：只读普通文件（软链接跟到它指向的文件）；设备、管道、目录回 `invalid`——先 `stat` 确认再打开，不去打开它们（打开设备节点本身有副作用）。头里的 `contentType` 按扩展名猜（软链接取它指向的文件的扩展名），猜不出是 `application/octet-stream`；这只是个提示，手机另按内容判断是不是文本。
 - **写**（`/fs/write`）：整份文本，≤ 1 000 000 字节（先按 base64 的长度挡一道，超了回 `tooLarge`，不先解码）。目标已存在时必须是（软链接指向的）普通文件并且可写，否则 `invalid` / `denied`，不会把目录、管道换掉；断掉的软链接回 `notFound`、链接原样留着；写软链接就是写它指向的文件。目标不存在时新建（0644 去掉 umask）；带了 `expect` 却不存在回 `notFound`。写到同目录的临时文件 `.botbus-write-<id>`（先 0600 创建，写完、定好权限、`fsync`）再原子改名替换：保留原文件的权限位（不含 setuid / setgid / sticky），Mac 上另带过去 ACL 与扩展属性（隔离标记等，尽力而为），**不保留属主、创建时间与硬链接关系**（硬链接的文件保存后与别的名字脱钩）——这是原子替换的代价。带 `expect` 时在改名之前再比一次修改时间与大小（agent 可能正在改它），对不上回 `conflict` 并带上现在的样子；「检查之后又被改」的空当在没有文件锁的文件系统上消除不了。成功回写完之后的 `{mtimeMs, size}`。
 - **新建**：`/fs/mkdir`（0755）、`/fs/create`（空文件，0644 去掉 umask）；已存在（含断掉的软链接）回 `exists`，不清空。
 - **改名**（`/fs/rename`）：从不覆盖，目标已存在（含断掉的软链接、空目录）回 `exists`。Mac 用 `renamex_np(RENAME_EXCL)`，是原子的「目标不存在才改」，只改大小写的改名在大小写不敏感的卷上也行；其他平台先查再改，有极小的空当，目标与源是同一个条目的两个名字（同设备同 inode，且是目录或链接数为 1）时才放行。只在原地改：跨文件系统回 `invalid`，不做复制再删除。
-- **移到废纸篓**（`/fs/trash`）：目前只有 Mac（`FileManager.trashItem`），软链接本身进废纸篓、不跟链接，不永久删除、移不进去时（跨卷、网络盘）回错误；`/` 回 `invalid`。Linux（XDG Trash）与 Windows（回收站）第三期做，之前回 `failed`。
+- **移到废纸篓**（`/fs/trash`）：软链接本身进废纸篓、不跟链接，**从不永久删除**，进不去时回 `noTrash`；`/`、Windows 的盘符根与共享根回 `invalid`。Mac 用 `FileManager.trashItem`；Linux 按 freedesktop.org 的 Trash 规范，Windows 是回收站，细节见下面两小节。
 - **Mac 的隐私保护（TCC）**：访问「文稿」「桌面」「下载」等受保护目录被系统拒绝时底层是 `EPERM`，回 `tcc`，页面要提示用户回电脑上允许一次（授权框弹在电脑上，手机按不到）。但 `EPERM` 也是「文件被锁定（`uchg` / `schg`）」「SIP 保护的系统目录」的错误：路径本身或上一级带 immutable 标志、或在 `/System`、`/bin`、`/sbin`、`/usr`（`/usr/local` 除外）之下时回 `denied`；看不出来的按 `tcc`。普通权限不足（`EACCES`）是 `denied`。
+
+#### Windows 的路径（第三期）
+
+Windows 电脑（`/status.platform` 是 `windows`）上的路径是 Windows 的绝对路径，只有两种：盘符 `C:\…` 与 UNC `\\server\share\…`。
+
+- **规范化**：`\` 与 `/` 都当分隔符；去掉空段与 `.`，`..` 退一层但不越过盘符根或共享根；盘符大写；分隔符一律 `\`；不以 `\` 结尾（盘符根本身是 `C:\`）。回复里的路径都是规范化之后的；`home` 也是（`C:\Users\me`）。
+- **一律 `invalid`**：相对路径、`C:foo`（盘符相对）、`\foo`（当前盘的根）、`\\?\…` / `\\.\…` / `\??\…`（原样路径与设备路径）、只有 `\\server` 没有共享名；任何一段含 `< > : " | ? *` 或控制字符、以空格或 `.` 结尾（Windows 会悄悄去掉，`a.` 与 `a` 是同一个文件）、是保留设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM0`–`COM9`、`LPT0`–`LPT9` 与上标的 `COM¹²³`、`LPT¹²³`，以及控制台的 `CONIN$`、`CONOUT$`，看第一个 `.` 之前、去掉尾部空格的部分，所以 `nul.txt` 也算）、超过 255 个 UTF-16 码元。新建、改名、上传给的名字同样按这几条核对。
+- **「此电脑」是空串。** 只有 `/fs/list` 收它，回 `{path: "", entries: [{name: "C:", kind: "dir", mtimeMs: 0}, …]}`：每个盘符一项，电脑不探测是否就绪（探测光驱、断开的网络盘会卡住），点进去不可用的盘回 `notFound`；没有 `git`、`repoRoot`、`truncated`。别的端点收到空串回 `invalid`。手机拼盘符项的路径写 `C:\`；盘符根与共享根的上一级是「此电脑」。
+- **大小写**：名字比较不分大小写（NTFS 默认），回复保留磁盘上的写法；只改大小写的改名照常成功。
+- **隐藏**：点开头的名字，或带「隐藏」「系统」属性的项。
+- **软链接**：符号链接与目录联接（junction）报 `link: true`，`kind` / `size` / `mtimeMs` 取目标的；其余重解析点（OneDrive 等云文件的占位符、应用执行别名）当普通项报，列目录时不跟、不打开（打开云文件会触发下载）。
+- **写**：同目录的 `.botbus-write-<id>` 写完、落盘之后用 `ReplaceFileW` 换上去（保留原文件的属性、ACL 与创建时间；原文件先挪到同目录的 `.botbus-backup-<id>`，换上去之后删掉），新文件用不覆盖的 `MoveFileExW`。被别的程序以不许共享的方式占着时回 `denied`（`detail: "in use"`）。换到一半失败时电脑看磁盘收拾：新内容能放到原名就补完（算成功），放不了就把原文件挪回原名（回 `denied`，`detail: "in use"`）；两样都做不到时什么都不删，回 `failed`，`detail` 写明留下的 `.botbus-write-<id>` / `.botbus-backup-<id>`（隐藏文件，用户在电脑上处理）。
+- **废纸篓**是回收站：回收站收不了的（网络盘、没开回收站的 U 盘、比回收站上限还大的）回 `noTrash`。
+- **名字里有落单的代理项**（NTFS 允许，Win32 的名字是任意的 16 位码元）：同 Linux 不是 UTF-8 的名字，照样列出来、换成 U+FFFD、`kind` 是 `other`、带 `undecodable: true`。
+- **git 标记**照常给（要装 Git for Windows）；「此电脑」那一层没有。git 报的名字大小写与磁盘上不同的那一项没有标记。
+- 没有 `tcc`：那是 Mac 的隐私保护。
+
+#### Linux 的废纸篓与文件名（第三期）
+
+- **废纸篓**按 freedesktop.org 的 Trash 规范 1.0（GNOME、KDE 的文件管理器都认，放进去的能在桌面上还原）：文件与主废纸篓 `$XDG_DATA_HOME/Trash`（缺省 `~/.local/share/Trash`，没有就建）在同一个文件系统上就放那里，`.trashinfo` 的 `Path=` 是绝对路径；不在的话用文件所在文件系统的顶层目录里的 `.Trash/<uid>`（`.Trash` 是管理员建的、带 sticky 位的目录时）或 `.Trash-<uid>`（没有就建 0700，已有的必须是自己的、不是软链接的目录），`Path=` 相对顶层目录。上级目录先解开软链接，顶层目录与 `Path=` 都按解开之后的真实路径算。先写 `info/<名>.trashinfo`，再把文件改名进 `files/<名>`，同名时依次用 `名.2.扩展名`、`名.3.扩展名`……（最多试 1000 个名字，都占着回 `failed`）。哪个废纸篓都用不了（顶层目录没有写权限、`.Trash-<uid>` 是别人的或是软链接、改名跨了文件系统）回 `noTrash`。不维护 `directorysizes`（规范里是可选的缓存）。
+- **不是合法 UTF-8 的名字**：照样列出来，`name` 是把非法字节换成 U+FFFD 之后的，`kind` 是 `other`、没有 `size`、`mtimeMs` 是 0，并带 `undecodable: true`（只写 true）。按这个名字做的操作碰不到原来那一项（一般回 `notFound`）：手机不让点，提示回电脑上处理。Windows 上名字含落单代理项的项同样处理（见「Windows 的路径」）。
 
 #### 上传
 
@@ -583,8 +605,8 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 | `/term/close` | 写（关已经退出的会话不要锁） | `id` | `{}` |
 
 - `id` 是 16 个随机字节的规范 base64url（同通道号的写法）；`title` 是 shell 的名字（`zsh`）；`cwd` 是开的时候的目录，不跟着 `cd` 变；`createdAt` 是毫秒时间戳；`exited` 只在 shell 退出之后有，会话留在列表里直到手机关掉（`/term/close`）或 24 小时后回收。
-- `create`：shell 是用户的登录 shell（Mac / Linux：`getpwuid_r` 的 `pw_shell`，退回 `$SHELL`、`/bin/zsh`、`/bin/sh`，跳过 `nologin` / `false`）以 `-l` 启动，环境是 BotBus 自己的环境去掉 `BOTBUS_*`、加 `TERM=xterm-256color` 与 `COLORTERM=truecolor`；字符编码（`LC_ALL` > `LC_CTYPE` > `LANG`）不是 UTF-8 时（一个都没有，或 `C` / `POSIX` 之类）去掉不是 UTF-8 的 `LC_ALL` / `LC_CTYPE`、`LANG` 换成 UTF-8 的（macOS `en_US.UTF-8`、Linux `C.UTF-8`）。shell 只继承 0 / 1 / 2（伪终端），电脑进程别的描述符一个都不带过去。`cwd` 必须是绝对路径、已有的目录，`cols` / `rows` 在 1…1000。失败码同文件：`notFound`、`notDirectory`、`tcc`、`denied`、`invalid`、`timeout`、`locked`（检查之后、起 shell 那一刻目录没了或被拒，也按这几个报）；同时活着的会话已有 8 个（已退出的不算）、或起不了 shell 回 `failed`（前者 `detail: "too many terminals"`）。新开等在电脑上的授权框时电脑上「全部结束」了（或 `enabled: false`、解除配对），这次新开回 `failed`，不留下会话。
-- `close`：结束整个会话：关掉伪终端，给会话里（会话号就是 shell 的进程号）每个进程组发 `SIGHUP` 与 `SIGCONT`——后台作业各在各的进程组里——2 秒后还在的整组 `SIGKILL`（忽略 `SIGHUP` 的、`nohup` 的也一样；自己 `setsid` 出去的守护进程如 tmux 不在这个会话里，不受影响）。shell 自己退出时，留下的作业同样这样收拾。已经没有这个 `id` 回 `notFound`（手机当作已经关了）。
+- `create`：shell 是用户的登录 shell（Mac / Linux：`getpwuid_r` 的 `pw_shell`，退回 `$SHELL`、`/bin/zsh`、`/bin/sh`，跳过 `nologin` / `false`）以 `-l` 启动，环境是 BotBus 自己的环境去掉 `BOTBUS_*`、加 `TERM=xterm-256color` 与 `COLORTERM=truecolor`；字符编码（`LC_ALL` > `LC_CTYPE` > `LANG`）不是 UTF-8 时（一个都没有，或 `C` / `POSIX` 之类）去掉不是 UTF-8 的 `LC_ALL` / `LC_CTYPE`、`LANG` 换成 UTF-8 的（macOS `en_US.UTF-8`、Linux `C.UTF-8`）。Windows（ConPTY，Windows 10 1809 起）：`PATH` 里的 `pwsh.exe`，没有就 `%ProgramFiles%\PowerShell\7\pwsh.exe`、Windows PowerShell、`%ComSpec%`（`cmd.exe`）；PowerShell 带 `-NoLogo`、cmd 不带参数；`title` 是去掉 `.exe` 的文件名（`pwsh`）；环境去掉 `BOTBUS_*`（不分大小写）、加 `TERM` 与 `COLORTERM`，不加 `SHELL`、不改控制台代码页（ConPTY 输出的总是 UTF-8 的 VT 序列，按代码页写字节的老程序显示得和在 Windows Terminal 里一样）。shell 只继承 0 / 1 / 2（伪终端），电脑进程别的描述符一个都不带过去。`cwd` 必须是绝对路径、已有的目录，`cols` / `rows` 在 1…1000。失败码同文件：`notFound`、`notDirectory`、`tcc`、`denied`、`invalid`、`timeout`、`locked`（检查之后、起 shell 那一刻目录没了或被拒，也按这几个报）；同时活着的会话已有 8 个（已退出的不算）、或起不了 shell 回 `failed`（前者 `detail: "too many terminals"`）。新开等在电脑上的授权框时电脑上「全部结束」了（或 `enabled: false`、解除配对），这次新开回 `failed`，不留下会话。
+- `close`：结束整个会话：关掉伪终端，给会话里（会话号就是 shell 的进程号）每个进程组发 `SIGHUP` 与 `SIGCONT`——后台作业各在各的进程组里——2 秒后还在的整组 `SIGKILL`（忽略 `SIGHUP` 的、`nohup` 的也一样；自己 `setsid` 出去的守护进程如 tmux 不在这个会话里，不受影响）。shell 自己退出时，留下的作业同样这样收拾。已经没有这个 `id` 回 `notFound`（手机当作已经关了）。Windows 上一个会话是一个作业对象：关掉伪终端（会话里的程序收到 `CTRL_CLOSE_EVENT`，相当于挂断），2 秒后还在的整个作业结束。
 - 没有终端的电脑（报的 `features` 里没有 `terminal`）对 `/term/*` 回明文 `501 unsupported`。
 
 **连接**：`GET /term/attach?id=<会话>&cn=<手机随机数>` 升级成 WebSocket（经隧道的 `wsopen`），一条连接对应一个会话，同一个会话最多同时连 4 条（输出都收到，尺寸以最后一个发 resize 的为准），第 5 条在握手之后以 4429 关。`cn` 是手机每次 attach 新生成的 16 字节规范 base64url。升级请求不带密封体：之后的消息全是密文，没有钥匙的一方 attach 上来什么也读不到、什么也写不进。电脑接不了这条（没有终端、`id` / `cn` 写法不对、没有组密钥）时在 `wsaccept` 之前回 `wsclose 1011`，Relay 给手机 502。
@@ -597,7 +619,7 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 | 1 输出 | 电脑→手机 | 字节，每条 ≤ 64 KiB |
 | 2 输入 | 手机→电脑 | 字节 |
 | 3 尺寸 | 手机→电脑 | `u16 cols, u16 rows`（大端） |
-| 4 退出 | 电脑→手机 | `i32` 退出码（大端；被信号结束是 128 + 信号） |
+| 4 退出 | 电脑→手机 | `i32` 退出码（大端；Mac / Linux 被信号结束是 128 + 信号，Windows 是进程退出码按位转成 `i32`） |
 | 5 锁 | 电脑→手机 | `u8`：1 解锁、0 锁着 |
 | 6 回放结束 | 电脑→手机 | 无 |
 
@@ -609,7 +631,7 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 - **换钥匙**：电脑的凭据变了之后，握手时用旧钥匙的连接不再收发任何东西（输出也不发），下一件事就以 1008 关；会话本身留着。
 - **关闭码**（明文、只当提示，要紧的结论用 `/term/list` 核实）：1000 shell 退出（之前已发「退出」）；1003 收到文本消息；1008 解不开、序号或方向不对、电脑换了钥匙；1011 电脑出错；4008 发送跟不上（或输入积压），重连拿回放（手机第一次立刻重连，连着的按退避来，免得一直重连、一直被踢）；4404 没有这个会话——attach 时就不认得，或连着时会话被结束（`/term/close`、电脑上「全部结束」、`enabled: false`、解除配对、24 小时回收），这时不发「退出」，手机核实之后直接移走标签；4429 这个会话的连接满了（4 条），手机不自动重连（重连只会接着被拒），停在这个标签上提示用户关掉别处的连接，点「重试」时再 attach 一次。Relay 的 1001 是预览结束（重开预览再 attach；手机把 Relay 关隧道用的 4001 也当成预览结束）。
 
-**寿命**：shell 退出、`/term/close`、`remoteControl {enabled: false}`、电脑上「全部结束」、BotBus 退出或解除配对时结束（退出时等会话里的进程清理完再走，最多约 2 秒）；没人连着也保留，连续 24 小时没人连着才回收——「有人连着」指连上之后至少发过一条解得开的消息（手机握手后先发的尺寸就算），只连上、什么都不发的连接不算；同时最多 8 个活着的。预览到期、被顶掉、菜单里停止分享都不结束终端。Mac 菜单「正在分享」里有一行「手机终端 · N 个会话」与「全部结束」；日志只记会话的开关与数量。
+**寿命**：shell 退出、`/term/close`、`remoteControl {enabled: false}`、电脑上「全部结束」、BotBus 退出或解除配对时结束（退出时等会话里的进程清理完再走，最多约 2 秒）；没人连着也保留，连续 24 小时没人连着才回收——「有人连着」指连上之后至少发过一条解得开的消息（手机握手后先发的尺寸就算），只连上、什么都不发的连接不算；同时最多 8 个活着的。预览到期、被顶掉、菜单里停止分享都不结束终端。Mac 菜单「正在分享」里有一行「手机终端 · N 个会话」与「全部结束」，Linux 的 `botbus status` 与 `botbus terminals end`、Windows 托盘菜单同样看得见、能全部结束；日志只记会话的开关与数量。
 
 ### 预览主机与隧道
 
@@ -738,6 +760,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - 版本 3.8 加入 `deleteTask` / `removeProject` 命令、`ConnectorInfo.canDeleteTasks` / `AgentInfo.canRemoveProjects` 能力声明，以及两种手机列表视图和本地删除基线。新命令只发给声明支持的电脑；旧端忽略能力字段，Relay 继续只处理密封形状。当前版本升到 3.8，三条最低线不动。
 - 版本 3.9 加入**手机上的 Agent 管理**与**新建项目选位置**：`restartConnector` 命令与 `AgentInfo.canRestartConnectors`（手机的「停止 / 启动」沿用 2.x 起就有的 `setConnectorEnabled`）；`startTask.newProjectParent` 与 `AgentInfo.canChooseProjectParent`。都在密文里，新命令与新字段只发给声明支持的电脑，旧端忽略能力字段；Relay 只改版本号，三条最低线不动。
 - 终端（「操作电脑」第二期，2026-10）**不改版本号**：管理端点与 `/term/attach` 都在 3.7 的工作区加密预览里，Relay 不变；手机按 `/status.features` 里的 `terminal` 判断，旧手机不认它、照常只有文件与屏幕。
+- 「操作电脑」第三期（不改版本号）：Linux / Windows 宿主也报 `AgentInfo.workspace`（文件与终端，没有屏幕；`capabilities` 不变）；工作区补上 Windows 的路径写法与「此电脑」（空串）、失败码 `noTrash`（开集，旧手机按 `failed`）、目录项的 `undecodable`（可选，旧手机忽略）。三条最低线与宿主的 `minClientProtocol` 都不动；3.7–3.8 的手机连 Windows 宿主时路径的面包屑与「上一级」不完整（见计划 `docs/superpowers/plans/2026-10-04-remote-workspace-3-hosts.md` 关键决定 1）。
 
 ## 附录 B：Fixture 与类型对应
 
@@ -856,3 +879,5 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 `protocol-fixtures/workspace/` 是工作区（3.7）的样本，Relay 不读：明文的 `WorkspaceStatus`（`status-mac.json`、`status-linux.json`、3.6 Mac 的 `status-legacy.json`）、`WorkspaceListing`（`listing.json`）、失败外形（`failure-conflict.json`，以及带不认得的 code 的 `failure-unknown-code.json`）、请求明文（`request-write.json`），以及由 `node scripts/seal-fixtures.mjs` 生成的 `sealed.json`（固定钥匙与确定性 nonce 封的请求、钉在请求上的回复、3 个包的 `/fs/read` 流，不要手改）。Swift 的 `WorkspaceWireTests` 与 Android 的 `WorkspaceWireTest` 逐字节核对它们；手机端的 `WorkspaceSealerTests` / `WorkspaceSealerTest` 另用 `sealed.json` 核对手机自己封的请求。
 
 终端（第二期）：`workspace/term-list.json` → `TerminalList`；`workspace/request-term-create.json` → `/term/create` 的请求明文；`workspace/terminal.json`（`node scripts/seal-fixtures.mjs` 生成）→ 握手与两个方向的 7 条消息，Swift `WorkspaceWireTests` 与 Kotlin `WorkspaceWireTest` 逐字节核对。
+
+第三期：`workspace/status-windows.json`（Windows 的 `/status`）、`listing-drives.json`（「此电脑」，路径是空串）、`listing-undecodable.json`（Linux 上不是 UTF-8 的名字）、`failure-no-trash.json`（`noTrash`），手写，Swift 的 `WorkspaceWireTests` 与 Kotlin 的 `WorkspaceWireTest` 各自对账；`plain/agent-info-windows-workspace.json`（没有屏幕与开发预览、有工作区的 Windows 宿主）三端往返。

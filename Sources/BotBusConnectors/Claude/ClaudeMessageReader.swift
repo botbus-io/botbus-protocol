@@ -93,6 +93,7 @@ public struct ClaudeMessageReader: MessageReader {
     /// 出来的 `URL`：Windows 上两边的写法对不上，正常的记录也会被拒（`realPath` 与 `PlatformPath` 管分隔符与大小写）。
     private static func removeTranscript(_ url: URL, sessionID: String, in projectsDirectory: URL) throws {
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        // 按路径比、不按 URL 比：Windows 上解开软链接之后的目录 URL 有没有结尾的 `/` 两边不一定一样，大小写也不分。
         guard values.isRegularFile == true, values.isSymbolicLink != true,
               let root = TranscriptFileRefs.realPath(projectsDirectory.path),
               let resolved = TranscriptFileRefs.realPath(url.path),

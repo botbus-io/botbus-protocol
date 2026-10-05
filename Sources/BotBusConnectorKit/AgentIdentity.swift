@@ -38,7 +38,8 @@ public struct AgentIdentity: Hashable, Sendable {
 }
 
 /// 本机是哪种宿主（协议 3.5）：`TaskStore` 据此填外发 `AgentInfo` 的 `platform` 与 `capabilities`。
-/// Mac 什么能力都不报（= 全部支持）；Linux 首版报 `remoteControl: false`（没有屏幕，手机不给「电脑屏幕」入口）与 `previews: false`（预览隧道还没在静态构建里可用，手机不显示预览）。
+/// Mac 什么能力都不报（= 全部支持）；Linux / Windows 报 `remoteControl: false`（没有屏幕，手机不给屏幕那一段）与 `previews: false`
+///（不托管 dev server、不转发本机端口）。「操作电脑」的工作区不在这里：`AgentHost` 建得出预览隧道就报 `AgentInfo.workspace`。
 ///
 /// `minClientProtocol`（协议 3.6）：这台电脑要求手机至少是哪个版本，随 Relay 连接的 ready 帧发出，Relay 按组给更旧的手机回 412。
 /// 3.4 及更早的手机把 `platform` 当闭集，见到 `linux` / `windows` 会拒收整份快照，所以 Linux 宿主报 3.5（以后的 Windows 同理）；Mac 不报。
@@ -54,11 +55,11 @@ public struct HostIdentity: Sendable, Equatable {
     }
 
     public static let mac = HostIdentity(platform: .macos)
-    /// Linux 首版：没有屏幕（不做远程操作），预览隧道还没在静态构建里验证过（报不支持，手机不显示预览入口）；
+    /// Linux：没有屏幕（不做远程操作）；开发预览（托管 dev server、端口转发、HMR 代理）不做；工作区的隧道由宿主注入。
     /// 手机要 ≥ 3.5（认得 `platform: "linux"`）。
     public static let linux = HostIdentity(platform: .linux, capabilities: HostCapabilities(remoteControl: false, previews: false),
                                            minClientProtocol: "3.5")
-    /// Windows 首版：远程操作不做；预览要托管 dev server（进程组）与 WebSocket 代理，本期也不做。
+    /// Windows：没有屏幕（不做远程操作）；开发预览（托管 dev server、端口转发、HMR 代理）不做；工作区的隧道由宿主注入。
     /// 手机要 ≥ 3.5（认得 `platform: "windows"`）。
     public static let windows = HostIdentity(platform: .windows,
                                              capabilities: HostCapabilities(remoteControl: false, previews: false),

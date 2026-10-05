@@ -132,6 +132,7 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "agent-info-models.json": P.AgentInfo,
   "agent-info-worktrees.json": P.AgentInfo,
   "agent-info-workspace.json": P.AgentInfo,
+  "agent-info-windows-workspace.json": P.AgentInfo,
   "agent-info-list-management.json": P.AgentInfo,
   "agent-info-agent-control.json": P.AgentInfo,
   "agent-info-linux.json": P.AgentInfo,
@@ -244,7 +245,7 @@ describe("fixture 目录与对照表一一对应", () => {
     expect([...validFixtures.keys()].sort()).toEqual(Object.keys(SCHEMA).sort());
     expect(validFixtures.size).toBe(83);
     expect([...plainFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_SCHEMA).sort());
-    expect(plainFixtures.size).toBe(75);
+    expect(plainFixtures.size).toBe(76);
   });
   it("每个 invalid fixture 都在 MUST_REJECT / PLAIN_MUST_REJECT 表里", () => {
     expect([...invalidFixtures.keys()].sort()).toEqual(Object.keys(MUST_REJECT).sort());

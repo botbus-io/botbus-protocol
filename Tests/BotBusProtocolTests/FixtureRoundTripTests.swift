@@ -151,6 +151,7 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(AgentInfo.self, "plain/agent-info-linux.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-other-platform.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-workspace.json"),
+        roundTripCase(AgentInfo.self, "plain/agent-info-windows-workspace.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-list-management.json"),
         roundTripCase(AgentInfo.self, "plain/agent-info-agent-control.json"),
     ] }
@@ -597,6 +598,11 @@ final class FixtureRoundTripTests: XCTestCase {
         XCTAssertEqual(try decodeFixture(AgentInfo.self, "plain/agent-info-workspace.json").workspace, true)
         XCTAssertNil(try decodeFixture(AgentInfo.self, "plain/agent-info.json").workspace)
         XCTAssertThrowsError(try decodeFixture(AgentInfo.self, "plain/invalid/agent-info-workspace-false.json"))
+        let windows = try decodeFixture(AgentInfo.self, "plain/agent-info-windows-workspace.json")
+        XCTAssertEqual(windows.platform, .windows)
+        XCTAssertEqual(windows.workspace, true, "没有屏幕的宿主也报工作区（第三期）")
+        XCTAssertEqual(windows.capabilities?.supportsRemoteControl, false)
+        XCTAssertEqual(windows.capabilities?.supportsPreviews, false)
     }
 
     /// 协议 3.3：项目级自动批准。能力与状态都只写 true（没有时整键省略）；命令里 true / false 都有意义。

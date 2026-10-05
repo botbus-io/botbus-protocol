@@ -24,7 +24,9 @@ final class FakeDshWeb: @unchecked Sendable {
 
     init(plans: [FakeTransport.Plan] = []) {
         transport = FakeTransport(plans: plans)
-        http.respond = { [unowned self] method, body in
+        http.respond = { [weak self] method, body in
+            // 停机后迟到的 HTTP 回调不能访问已释放的测试桩。
+            guard let self else { return (503, .null) }
             let args = body.path("payload", "args")
             switch method {
             case "workspace/create":
