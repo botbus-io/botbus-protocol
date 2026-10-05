@@ -701,7 +701,14 @@ public actor DshConnector: TaskConnector {
         case .removed(let sessionId):
             webSessions.removeValue(forKey: sessionId)
             webRunning.remove(sessionId)
-            await reconcile()
+            // 删掉的会话不会再有 waterfall 收尾、也不会再跑：挂着的实时认领就地交还，否则 store 里一直留着它。
+            pending.removeValue(forKey: sessionId)
+            expecting.removeValue(forKey: sessionId)
+            if claimed.contains(DshTaskMapping.identity.taskId(sessionId: sessionId)) {
+                await settleIfIdle(sessionId, force: true)
+            } else {
+                await reconcile()
+            }
         case .status(let sessionId, let running):
             if running {
                 webRunning.insert(sessionId)
@@ -994,11 +1001,36 @@ public actor DshConnector: TaskConnector {
             base = scanned.values.map { DshSessionFacts(scanned: $0, now: current) }
         }
         let controllable = web != nil || installation() != nil
-        let acpTasks = await acp.staticTasks()
+        var acpTasks = await acp.staticTasks()
+        if await forgetDeletedAcpSessions(acpTasks, base: base) { acpTasks = await acp.staticTasks() }
         let records = DshTaskMapping.merged(base: base, acp: acpTasks, live: live, controllable: controllable, now: current)
         let agentId = await store.identity.agentId
         guard generation == reconcileGeneration, hasBaseline, loop != nil else { return }
         await store.reconcile(source: .dsh, tasks: records, projects: SessionFormatting.projects(from: records, agentId: agentId))
+    }
+
+    /// 只有 ACP 记着（BotBus 拉起或接上过）、底子里没有的会话：会话目录在磁盘上也没了，就是在电脑上删了，
+    /// 让 `AcpConnector` 忘掉（否则它的本机记录会一直把它补回列表，最长 7 天）。web 的列表不收 ACP 新建、
+    /// 还没交给桌面的会话，所以不拿底子判断，只认磁盘。返回有没有忘掉什么。
+    private func forgetDeletedAcpSessions(_ acpTasks: [TaskRecord], base: [DshSessionFacts]) async -> Bool {
+        let inBase = Set(base.map(\.sessionId))
+        let candidates = acpTasks.compactMap { record -> String? in
+            guard record.source == .dsh, let sessionId = DshTaskMapping.identity.sessionId(taskId: record.id),
+                  !inBase.contains(sessionId) else { return nil }
+            return sessionId
+        }
+        guard !candidates.isEmpty else {
+            await acp.noteSeen(inBase)
+            return false
+        }
+        let directory = paths.sessionsDirectory
+        let started = now()
+        let onDisk = await Task.detached(priority: .utility) {
+            DshSessionScanner.sessionIdsOnDisk(in: directory)
+        }.value
+        // 都还在也要报一次：`forgetDeleted` 只忘见过的，这一次就是「见过」。
+        guard let onDisk else { return false }
+        return await acp.forgetDeleted(notIn: onDisk.union(inBase), updatedAfter: .distantPast, updatedBefore: started)
     }
 
     // MARK: - 健康

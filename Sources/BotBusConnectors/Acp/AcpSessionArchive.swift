@@ -47,6 +47,15 @@ public actor AcpSessionArchive {
         save()
     }
 
+    /// 电脑上删掉的会话：记录拿掉，重启后不再补回来。
+    public func forget(connectorId: String, taskIds: Set<String>) {
+        guard let list = byConnector[connectorId] else { return }
+        let kept = list.filter { !taskIds.contains($0.id) }
+        guard kept.count != list.count else { return }
+        byConnector[connectorId] = kept.isEmpty ? nil : kept
+        save()
+    }
+
     /// 去掉最近窗口之外的记录（时间解析不了的留着，交给显示那一侧）；剪空的 agent 整个拿掉。
     static func pruned(_ records: [String: [TaskRecord]], now: Date) -> [String: [TaskRecord]] {
         records.compactMapValues { list in

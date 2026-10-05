@@ -35,15 +35,19 @@ public actor OpenClawConnector: TaskConnector {
         public var maxBackoff: TimeInterval
         /// `sessions.changed` 没带行（或是整表失效）时，攒多久再重新拉一次列表。一次改名常常连着几条事件。
         public var refreshDelay: TimeInterval
+        /// 重新拉列表失败后隔多久再拉：删除通知只带 key，拉不到新列表，删掉的会话就一直留在手机上。
+        public var refreshRetryDelay: TimeInterval
         public var requestTimeout: TimeInterval
         public var challengeTimeout: TimeInterval
         public var pingInterval: TimeInterval
 
         public init(initialBackoff: TimeInterval = 1, maxBackoff: TimeInterval = 60, refreshDelay: TimeInterval = 0.5,
-                    requestTimeout: TimeInterval = 15, challengeTimeout: TimeInterval = 2, pingInterval: TimeInterval = 30) {
+                    requestTimeout: TimeInterval = 15, challengeTimeout: TimeInterval = 2, pingInterval: TimeInterval = 30,
+                    refreshRetryDelay: TimeInterval = 10) {
             self.initialBackoff = initialBackoff
             self.maxBackoff = maxBackoff
             self.refreshDelay = refreshDelay
+            self.refreshRetryDelay = refreshRetryDelay
             self.requestTimeout = requestTimeout
             self.challengeTimeout = challengeTimeout
             self.pingInterval = pingInterval
@@ -295,9 +299,9 @@ public actor OpenClawConnector: TaskConnector {
         }
     }
 
-    private func scheduleRefresh() {
+    private func scheduleRefresh(after retryDelay: TimeInterval? = nil) {
         guard refreshTask == nil else { return }
-        let delay = timing.refreshDelay
+        let delay = retryDelay ?? timing.refreshDelay
         refreshTask = Task { [weak self, sleep] in
             await sleep(delay)
             guard !Task.isCancelled else { return }
@@ -316,6 +320,8 @@ public actor OpenClawConnector: TaskConnector {
             await publish()
         } catch {
             Self.log.error("sessions.list 刷新失败：\(String(describing: error), privacy: .public)")
+            // 还连着就过一会儿再拉（断开了由重连的 bootstrap 整表替换）。
+            if self.gateway != nil { scheduleRefresh(after: timing.refreshRetryDelay) }
         }
     }
 

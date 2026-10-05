@@ -5,9 +5,28 @@ import BotBusConnectorKit
 /// 定位 `~/.claude` 下的东西与 `claude` 可执行文件。
 public struct ClaudePaths: Sendable {
     public var claudeHome: URL
+    /// Claude 桌面 App 的会话记录目录（`claude-code-sessions`），只读，见 `ClaudeDesktopSessionIndex`。
+    public var desktopSessionsDirectories: [URL]
 
-    public init(claudeHome: URL = ClaudePaths.defaultClaudeHome) {
+    /// - Parameter desktopSessionsDirectories: nil = 默认 Claude 目录时用桌面 App 的位置；自定的 Claude 目录
+    ///   （测试、`CLAUDE_CONFIG_DIR`）对不上桌面 App 的记录，不读。
+    public init(claudeHome: URL = ClaudePaths.defaultClaudeHome, desktopSessionsDirectories: [URL]? = nil) {
         self.claudeHome = claudeHome
+        self.desktopSessionsDirectories = desktopSessionsDirectories
+            ?? (claudeHome == Self.defaultClaudeHome ? Self.defaultDesktopSessionsDirectories : [])
+    }
+
+    /// 桌面 App 存会话记录的地方：macOS 在 `~/Library/Application Support/Claude`，Windows 在 `%APPDATA%\Claude`
+    /// 与 Microsoft Store 版的虚拟化目录（同 `desktopClaudeCodeRoots`）；Linux 没有桌面 App。
+    public static var defaultDesktopSessionsDirectories: [URL] {
+        #if os(macOS)
+        let roots = [(desktopClaudeCodeRoot as NSString).deletingLastPathComponent]
+        #elseif os(Windows)
+        let roots = desktopDataRoots(fileManager: .default)
+        #else
+        let roots: [String] = []
+        #endif
+        return roots.map { URL(fileURLWithPath: $0, isDirectory: true).appendingPathComponent("claude-code-sessions", isDirectory: true) }
     }
 
     /// Linux / Windows 上认 Claude Code 自己的 `CLAUDE_CONFIG_DIR`（后台进程拿得到用户的环境变量；Mac 的 GUI 进程拿不到，照旧）。
@@ -179,6 +198,11 @@ public struct ClaudePaths: Sendable {
     /// Microsoft Store（MSIX）版的 `%APPDATA%` 是虚拟化的，真实位置在 `%LOCALAPPDATA%\Packages\Claude_<发布者>\LocalCache\Roaming`。
     /// 只装了桌面 app 的电脑靠它才有 `claude`；它的登录态与桌面 app 分开，没登录过要先用它 `claude auth login`。
     static func desktopClaudeCodeRoots(fileManager: FileManager) -> [String] {
+        desktopDataRoots(fileManager: fileManager).map { $0 + "\\claude-code" }
+    }
+
+    /// 桌面 app 的数据目录（`%APPDATA%\Claude`，Store 版在虚拟化目录里），普通安装的在前。
+    static func desktopDataRoots(fileManager: FileManager) -> [String] {
         let environment = ProcessInfo.processInfo.environment
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let appData = environment["APPDATA"] ?? home + "\\AppData\\Roaming"
@@ -187,8 +211,8 @@ public struct ClaudePaths: Sendable {
         let storeRoots = ((try? fileManager.contentsOfDirectory(atPath: packages)) ?? [])
             .filter { $0.hasPrefix("Claude_") }
             .sorted()
-            .map { packages + "\\" + $0 + "\\LocalCache\\Roaming\\Claude\\claude-code" }
-        return [appData + "\\Claude\\claude-code"] + storeRoots
+            .map { packages + "\\" + $0 + "\\LocalCache\\Roaming\\Claude" }
+        return [appData + "\\Claude"] + storeRoots
     }
     #endif
 

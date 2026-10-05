@@ -123,6 +123,24 @@ public actor DshSessionScanner {
     /// 已缓存的会话头（测试与 DshConnector 读 subagent 判定用）。
     public func cachedHeader(sessionId: String) -> DshSessionHeader? { headerCache[sessionId] ?? nil }
 
+    /// 磁盘上还在的会话 id（有日志文件的会话目录，不看时间窗口）。会话根目录或某个项目目录读不了返回 nil：
+    /// 不知道不等于删了。只在有「只有 ACP 记着」的会话时用，判断它们在电脑上删了没有。
+    static func sessionIdsOnDisk(in sessionsDirectory: URL) -> Set<String>? {
+        let fileManager = FileManager.default
+        guard let projects = try? fileManager.contentsOfDirectory(at: sessionsDirectory, includingPropertiesForKeys: nil,
+                                                                  options: [.skipsHiddenFiles]) else { return nil }
+        var ids: Set<String> = []
+        for project in projects where isDirectory(project) {
+            guard let sessions = try? fileManager.contentsOfDirectory(at: project, includingPropertiesForKeys: nil,
+                                                                      options: [.skipsHiddenFiles]) else { return nil }
+            for directory in sessions where isDirectory(directory) && DshSessionFiles.logFile(in: directory) != nil {
+                let sessionId = decodeSegment(directory.lastPathComponent)
+                if !sessionId.isEmpty { ids.insert(sessionId) }
+            }
+        }
+        return ids
+    }
+
     static func isDirectory(_ url: URL) -> Bool {
         var isDirectory: ObjCBool = false
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
