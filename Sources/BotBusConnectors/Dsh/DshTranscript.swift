@@ -1,6 +1,13 @@
 import Foundation
 import BotBusProtocol
 import BotBusConnectorKit
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 
 /// 一份 dsh 会话日志读出来的样子：头、事件（升序）、前面有没有被截掉。
 public struct DshSessionLog: Hashable, Sendable {
@@ -148,8 +155,9 @@ public struct DshTranscriptDecoder: Sendable {
 
     // MARK: - 进程
 
-    /// 起 node 读完标准输出；stderr 丢掉（可能带路径与内容，不收）。超时 SIGTERM 并报错。
+    /// 起只读的解码进程；stderr 丢掉（可能带路径与内容，不收）。超时强制结束并报错。
     public static let runProcess: Runner = { node, arguments, timeout in
+        try Task.checkCancellation()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: node)
         process.arguments = arguments
@@ -166,19 +174,33 @@ public struct DshTranscriptDecoder: Sendable {
             try? stdout.fileHandleForWriting.close()
             throw ConnectorError("起不了 node：\(error.localizedDescription)")
         }
-        let timer = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        let stop: @Sendable () -> Void = {
+            guard process.isRunning else { return }
+            // 解码不写会话文件，无须等待清理。SIGTERM 可被忽略，不能作为超时的硬上限。
+            #if os(Windows)
+            PlatformProcess.interrupt(process.processIdentifier)
+            #else
+            kill(process.processIdentifier, SIGKILL)
+            #endif
+        }
+        let timer = DispatchWorkItem(block: stop)
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
-        let data: Data = await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let data = (try? stdout.fileHandleForReading.readToEnd()) ?? Data()
-                // 读完就关：Linux 的 Foundation 不会在 EOF 时替你关读端，每读一次会话记录就漏一个描述符。
-                try? stdout.fileHandleForReading.close()
-                process.waitUntilExit()
-                continuation.resume(returning: data)
+        let data: Data = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let data = (try? stdout.fileHandleForReading.readToEnd()) ?? Data()
+                    // 读完就关：Linux 的 Foundation 不会在 EOF 时替你关读端，每读一次会话记录就漏一个描述符。
+                    try? stdout.fileHandleForReading.close()
+                    process.waitUntilExit()
+                    continuation.resume(returning: data)
+                }
             }
+        } onCancel: {
+            stop()
         }
         timer.cancel()
-        // 只有超时会 SIGTERM 它（node 自己出错是非 0 退出码）。
+        try Task.checkCancellation()
+        // 超时会强制结束它（node 自己出错是非 0 退出码）。
         if process.terminationReason == .uncaughtSignal { throw ConnectorError("解会话记录超时") }
         guard process.terminationStatus == 0 else { throw ConnectorError("解不开 DeepSeek Harness 的会话记录") }
         return data

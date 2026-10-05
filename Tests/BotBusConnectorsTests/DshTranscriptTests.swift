@@ -226,6 +226,42 @@ final class DshTranscriptDecoderTests: XCTestCase {
         XCTAssertTrue(log.events.isEmpty)
     }
 
+    func testProcessTimeoutStopsAChildIgnoringTermination() async throws {
+        #if !os(Windows)
+        let started = Date()
+        do {
+            _ = try await DshTranscriptDecoder.runProcess("/bin/sh", ["-c", "trap '' TERM; while :; do sleep 0.1; done"], 0.3)
+            XCTFail("A timed-out decoder must fail")
+        } catch {
+            XCTAssertEqual((error as? ConnectorError)?.message, "解会话记录超时")
+            XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+        }
+        #endif
+    }
+
+    func testProcessCancellationStopsDecoderBeforeItsTimeout() async throws {
+        #if !os(Windows)
+        let marker = root.appendingPathComponent("decoder-started")
+        let task = Task {
+            try await DshTranscriptDecoder.runProcess("/bin/sh", ["-c", "trap '' TERM; printf ready > \"$1\"; while :; do sleep 0.1; done", "decoder", marker.path], 10)
+        }
+        defer { task.cancel() }
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: marker.path) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "The decoder must have started before cancellation")
+        let started = Date()
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Cancelled decoding must not return partial output")
+        } catch is CancellationError {
+            XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+        }
+        #endif
+    }
+
     /// 真 node：拿 node 自己的 `zstdCompressSync` 把 JSONL 按几段各压一帧再拼起来（同 dsh 追加写的形状），
     /// 解回来要逐字节一样；只要尾部时头行照给、事件行完整。本机没有够新的 node 就跳过。
     func testRealNodeDecodesMultiFrameZstd() async throws {
