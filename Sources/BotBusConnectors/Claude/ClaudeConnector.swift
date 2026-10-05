@@ -18,6 +18,8 @@ import BotBusConnectorKit
 ///   从 transcript 补回 7 天内的会话（`ClaudeSessionHistory`），只做一次，不轮询。
 /// - **跟标题**：桌面 app 与 Claude Code 会给会话起名并写进 transcript，hook 负载里却没有。
 ///   hook 进来时顺手去 transcript 末尾看一眼（`refreshAppTitle`），标题跟 app 侧栏保持一致。
+/// - **跟删除**：电脑上删会话没有 hook，所以每 `presenceSweepInterval` 秒核对一遍（`sweepPresence`）：
+///   transcript 没了、桌面 App 里归档或删掉了的会话从列表里摘掉，手机上随之消失。
 ///
 /// **所有权一拿就不放**：Claude 这一侧没有只读观察者（不像 Codex 有 `CodexObserver`），
 /// 本连接器就是唯一权威，所以每个会话建出来就 `claimLive`，不再交还——
@@ -59,6 +61,8 @@ public actor ClaudeConnector: TaskConnector {
     /// 收尾标记的时间比这一轮开始（Agent 收到 hook 的时刻）早多少以内仍算这一轮的。
     /// 更早的是上一轮留下的，不算。
     static let turnEndSlack: TimeInterval = 2
+    /// 隔多久核对一次电脑上删掉、归档的会话（见 `sweepPresence`）。连着两轮不在才摘，手机上最多晚半分钟消失。
+    static let presenceSweepInterval: TimeInterval = 15
 
     private static let log = PlatformLogger(subsystem: "io.botbus.agent", category: "claude")
 
@@ -219,6 +223,20 @@ public actor ClaudeConnector: TaskConnector {
     /// 盯收尾标记的循环；没有要盯的会话时自己退出。
     private var turnEndCheck: Task<Void, Never>?
     private let turnEndCheckInterval: TimeInterval
+    /// 核对电脑上删掉、归档的会话的循环：`restoreRecentSessions` 起，`stop()` 停。
+    private var presenceSweep: Task<Void, Never>?
+    private let presenceSweepInterval: TimeInterval
+    /// 见过 transcript 的会话。之后 transcript 不在了才算删了——刚开的会话可能还没写盘。
+    private var transcriptSeen: Set<String> = []
+    /// 上一轮核对时 transcript 已经不在的会话。连着两轮不在才摘：正在写的会话删了文件会被重新建出来。
+    private var transcriptMissing: Set<String> = []
+    /// 在桌面 App 里有过记录的会话 → 记录所在的账号目录。记录没了（账号目录还在）就是在桌面 App 里删了。
+    private var desktopRecorded: [String: String] = [:]
+    /// 上一轮核对时桌面记录已经没了的会话。删除是永久隐藏，同样连着两轮才算。
+    private var desktopMissing: Set<String> = []
+    /// 桌面 App 里归档了的会话：同 Codex 的归档，不进列表，hook 也不收；取消归档之后有动静或重启时回来。
+    private var desktopArchived: Set<String> = []
+    private var desktopRecordCache: [String: ClaudeDesktopSessionIndex.Record] = [:]
     /// 各别名见过的最新版本，撑起手机上「Opus 5.5」里的版本号（见 `ClaudeModels`）。
     /// 初始为空——启动时补历史会话就会从 transcript 里填上常用模型的版本。
     private var modelVersions: [String: [Int]] = [:]
@@ -230,6 +248,7 @@ public actor ClaudeConnector: TaskConnector {
     ///   - registry: 签发与绑定 task token；app 里与本机工具服务器共用同一个实例。
     ///   - titleRetryDelays: nil = `ClaudeConnector.titleRetryDelays`；测试传短的。
     ///   - turnEndCheckInterval: nil = `ClaudeConnector.turnEndCheckInterval`；测试传短的。
+    ///   - presenceSweepInterval: nil = `ClaudeConnector.presenceSweepInterval`；测试直接调 `sweepPresence()`。
     ///   - approvalTimeout: nil = `LocalHookServer.defaultHoldTimeout`（与 hook 挂起同一个上限）；测试传短的。
     public init(store: TaskStore,
                 paths: ClaudePaths = ClaudePaths(),
@@ -240,6 +259,7 @@ public actor ClaudeConnector: TaskConnector {
                 directoryProbe: DirectoryProbe = .live(),
                 titleRetryDelays: [TimeInterval]? = nil,
                 turnEndCheckInterval: TimeInterval? = nil,
+                presenceSweepInterval: TimeInterval? = nil,
                 approvalTimeout: TimeInterval? = nil) {
         self.store = store
         self.paths = paths
@@ -253,6 +273,7 @@ public actor ClaudeConnector: TaskConnector {
         self.registry = registry
         self.titleRetryDelays = titleRetryDelays ?? Self.titleRetryDelays
         self.turnEndCheckInterval = turnEndCheckInterval ?? Self.turnEndCheckInterval
+        self.presenceSweepInterval = presenceSweepInterval ?? Self.presenceSweepInterval
         self.approvalTimeout = approvalTimeout ?? LocalHookServer.defaultHoldTimeout
         store.connectors.setModels(supportedEfforts.map { ClaudeModels.options(versions: [:], efforts: $0) },
                                    for: .claude)
@@ -279,6 +300,10 @@ public actor ClaudeConnector: TaskConnector {
         titleRefreshes.removeAll()
         turnEndCheck?.cancel()
         turnEndCheck = nil
+        presenceSweep?.cancel()
+        presenceSweep = nil
+        transcriptMissing.removeAll()
+        desktopMissing.removeAll()
     }
 
     /// 手机发起新一轮之前看一眼挑中的 claude 换没换：换了就重读它认的强度，变了下一次 `publish` 补发快照。
@@ -313,6 +338,8 @@ public actor ClaudeConnector: TaskConnector {
         // 被分支取代的旧会话：桌面 hook 继续来，但 BotBus 不再管它。
         // 放行的话会重建已移除的会话，手机上又变成两条。
         guard !superseded.contains(event.sessionID) else { return .now(.noContent) }
+        // 桌面 App 里归档了的会话不进列表；放行的话这里建出来、下一轮核对又摘掉，手机上一闪一闪。
+        guard !desktopArchived.contains(event.sessionID) else { return .now(.noContent) }
 
         switch event.kind {
         case .sessionStart:
@@ -625,13 +652,29 @@ public actor ClaudeConnector: TaskConnector {
     /// 以 hook 为准，只补它还不知道的标题与最后一条消息。补进来的是基线，不推通知。
     public func restoreRecentSessions() async {
         let directory = paths.projectsDirectory
+        let roots = paths.desktopSessionsDirectories
         let current = now()
         let limit = Self.maxSessions
-        let entries = await Task.detached(priority: .utility) {
-            ClaudeSessionHistory.recentSessions(in: directory, now: current, limit: limit)
+        let previousCache = desktopRecordCache
+        let (entries, index, readCache) = await Task.detached(priority: .utility) {
+            var cache = previousCache
+            let entries = ClaudeSessionHistory.recentSessions(in: directory, now: current, limit: limit)
+            let index = ClaudeDesktopSessionIndex.read(roots: roots, cache: &cache)
+            return (entries, index, cache)
         }.value
-        guard !entries.isEmpty else { return }
-        for entry in entries { adopt(entry, now: current) }
+        if let index {
+            desktopRecordCache = readCache
+            desktopArchived = index.archived
+        }
+        defer { startPresenceSweep() }
+        // 桌面 App 里归档了的不补：同 Codex，归档的不进列表。
+        let adopted = entries.filter { !desktopArchived.contains($0.sessionID) }
+        guard !adopted.isEmpty else { return }
+        for entry in adopted {
+            adopt(entry, now: current)
+            transcriptSeen.insert(entry.sessionID)
+            if let account = index?.recorded[entry.sessionID] { desktopRecorded[entry.sessionID] = account }
+        }
         pruneIfNeeded()
         await publish(notify: false)
     }
@@ -665,6 +708,97 @@ public actor ClaudeConnector: TaskConnector {
         sessions[entry.sessionID] = session
     }
 
+    // MARK: - 跟电脑上的删除
+
+    private func startPresenceSweep() {
+        guard presenceSweep == nil else { return }
+        let interval = presenceSweepInterval
+        presenceSweep = Task { [weak self] in
+            while true {
+                // 被 `stop()` 取消：那边已经清掉了句柄。
+                guard (try? await Task.sleep(for: .seconds(interval))) != nil, let self else { return }
+                await self.sweepPresence()
+            }
+        }
+    }
+
+    /// 测试用：核对循环在不在。
+    var isSweepingPresence: Bool { presenceSweep != nil }
+
+    /// 核对一遍电脑上删掉、归档的会话（读盘在后台线程）。本连接器自己正跑着的那一轮不动。
+    /// - transcript 见过、连着两轮不在了 → 从列表摘掉（`remove`：transcript 又出现、hook 又来时照常回来）。
+    /// - 桌面 App 里归档了 → 同上摘掉，之后的 hook 也不收，直到取消归档。
+    /// - 桌面 App 里有过记录、连着两轮没了而账号目录还在（transcript 被别的进程写过时桌面 App 会留着它）→
+    ///   当作删除，和手机上删一样永久隐藏（`hide`），否则重启后补历史又会把它补回来。
+    /// 读不了（目录不在、记录正在写）这一轮就不摘。
+    func sweepPresence() async {
+        let projects = paths.projectsDirectory
+        let roots = paths.desktopSessionsDirectories
+        let knownPaths = sessions.values.compactMap { session in session.transcriptPath.map { (session.sessionID, $0) } }
+        let withPath = Set(knownPaths.map(\.0))
+        let previousCache = desktopRecordCache
+        let (listed, onDisk, index, readCache) = await Task.detached(priority: .utility) {
+            var cache = previousCache
+            let listed = ClaudeSessionPresence.transcriptIDs(in: projects)
+            let onDisk = Set(knownPaths.filter { FileManager.default.fileExists(atPath: $0.1) }.map(\.0))
+            let index = ClaudeDesktopSessionIndex.read(roots: roots, cache: &cache)
+            return (listed, onDisk, index, cache)
+        }.value
+        if let index {
+            desktopRecordCache = readCache
+            desktopArchived = index.archived
+        }
+
+        var gone: [String] = []
+        var deleted: [String] = []
+        var stillMissing: Set<String> = []
+        var stillUnrecorded: Set<String> = []
+        // 读盘时 actor 可能已经处理了新的 hook：按此刻的会话判断，刚建的会话没读过盘就当还在。
+        for session in sessions.values {
+            let id = session.sessionID
+            if let account = index?.recorded[id] { desktopRecorded[id] = account }
+            let present = listed?.contains(id) == true || onDisk.contains(id)
+            if present { transcriptSeen.insert(id) }
+            guard !isOwnTurn(id) else { continue }
+            if desktopArchived.contains(id) {
+                gone.append(id)
+                continue
+            }
+            let known = listed != nil || withPath.contains(id)
+            if known, !present, transcriptSeen.contains(id) {
+                if transcriptMissing.contains(id) { gone.append(id) } else { stillMissing.insert(id) }
+                continue
+            }
+            if let index, let account = desktopRecorded[id], index.recorded[id] == nil, index.accounts.contains(account) {
+                if desktopMissing.contains(id) { deleted.append(id) } else { stillUnrecorded.insert(id) }
+            }
+        }
+        if listed != nil || !withPath.isEmpty { transcriptMissing = stillMissing }
+        if index != nil { desktopMissing = stillUnrecorded }
+
+        for id in gone {
+            forget(id)
+            await store.remove(id: taskId(for: id))
+        }
+        for id in deleted {
+            await discard(taskId: taskId(for: id))
+            await store.hide(id: taskId(for: id))
+        }
+        let ids = Set(sessions.keys)
+        transcriptSeen.formIntersection(ids)
+        desktopRecorded = desktopRecorded.filter { ids.contains($0.key) }
+        // 项目列表随之更新（`discard` 已经推过一次）。
+        if !gone.isEmpty { await publish() }
+    }
+
+    /// 从内存里拿掉一个会话：挂着的审批放掉，排着的续聊作废。不拦之后的 hook（不同于 `discard`）。
+    private func forget(_ sessionID: String) {
+        queued.removeValue(forKey: sessionID)
+        if let session = sessions.removeValue(forKey: sessionID) { releaseHold(for: session) }
+        transcriptSeen.remove(sessionID)
+        desktopRecorded.removeValue(forKey: sessionID)
+    }
+
     // MARK: - 会话状态
 
     /// 取出（或新建）一个会话，改完它，记下时间。Task 的产出统一在 `publish()`。
@@ -688,7 +822,7 @@ public actor ClaudeConnector: TaskConnector {
 
     /// 电脑上按停止（或在权限框里拒绝）只往 transcript 写一行 "[Request interrupted by user…]"，
     /// 不发 Stop，也没有别的 hook。所以电脑上的会话在跑时，每 `turnEndCheckInterval` 秒看一眼 transcript 末尾
-    /// （只读 64 KB），见到这一轮的收尾标记就补上状态。没有要盯的会话时循环自己退出；这是 Claude 这边唯一的轮询。
+    /// （只读 64 KB），见到这一轮的收尾标记就补上状态。没有要盯的会话时循环自己退出。另一条轮询是核对电脑上的删除（`sweepPresence`）。
     private func scheduleTurnEndCheck() {
         guard turnEndCheck == nil, !turnEndCandidates().isEmpty else { return }
         let interval = turnEndCheckInterval

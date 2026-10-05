@@ -594,6 +594,45 @@ final class DshConnectorTests: XCTestCase {
         await h.connector.stop()
     }
 
+    /// BotBus 起过的会话在电脑上删了（会话目录没了）：ACP 的本机记录不再把它补回列表。
+    func testBotBusSessionDeletedOnDiskLeavesTheList() async throws {
+        let behavior = FakeAcpBehavior()
+        behavior.capabilities = Self.resumeOnly
+        let h = await makeHarness(listing: OneProcess(home: nil), installation: installed, behavior: behavior)
+        await h.connector.start()
+        _ = try await h.connector.start(projectPath: project, prompt: "手机上开的", images: [])
+        await assertEventually { await h.task("dsh:sess-1")?.status == .completed }
+        let log = try writeSession("sess-1", title: "dsh 起的标题", modified: Date())
+        await h.connector.tick()
+        var record = await h.task("dsh:sess-1")
+        XCTAssertEqual(record?.origin, .watch)
+
+        try FileManager.default.removeItem(at: log.deletingLastPathComponent())
+        await assertEventually {
+            await h.connector.tick()
+            return await h.task("dsh:sess-1") == nil
+        }
+        record = await h.task("dsh:sess-1")
+        XCTAssertNil(record)
+        await h.connector.stop()
+    }
+
+    /// 从没在盘上见过的（测试里的假 dsh 不落盘，真 dsh 刚建好也可能还没写）：不当成删了。
+    func testBotBusSessionNeverSeenOnDiskStays() async throws {
+        let behavior = FakeAcpBehavior()
+        behavior.capabilities = Self.resumeOnly
+        let h = await makeHarness(listing: OneProcess(home: nil), installation: installed, behavior: behavior)
+        await h.connector.start()
+        try writeSession("other", modified: Date())
+        _ = try await h.connector.start(projectPath: project, prompt: "手机上开的", images: [])
+        await assertEventually { await h.task("dsh:sess-1")?.status == .completed }
+        await h.connector.tick()
+        await h.connector.tick()
+        let record = await h.task("dsh:sess-1")
+        XCTAssertEqual(record?.origin, .watch)
+        await h.connector.stop()
+    }
+
     /// 不在进程里的会话：web 不在就 `session/resume`；撞锁且 web 找得到就改走 web。
     func testFollowUpResumesAndFallsBackToWebWhenLocked() async throws {
         try writeSession("s-desk", title: "桌面上的", modified: Date().addingTimeInterval(-60))

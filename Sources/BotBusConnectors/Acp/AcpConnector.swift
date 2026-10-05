@@ -73,6 +73,8 @@ public actor AcpConnector {
     private let directoryProbe: DirectoryProbe
     private var localTasks: [TaskRecord] = []
     private var localBaselined = false
+    /// OpenCode 数据库读到的最旧那条的时间（读满了上限时）；nil = 整个最近窗口都读全了。比它旧的会话数据库里没有不说明删了。
+    private var localCoverageStart: Date?
     let now: @Sendable () -> Date
     /// 健康变化（起不来、登录过期、又好了）。hub 转给 ConnectorRegistry 并重发快照。
     let onHealth: HealthHandler
@@ -146,6 +148,8 @@ public actor AcpConnector {
     private var listed: [String: AcpSessionInfo] = [:]
     /// 这个连接器成功列过一次 `session/list`。见 `isListBaselined`。
     private var listedOnce = false
+    /// 本机记着的会话里，在权威来源（列表、OpenCode 数据库、dsh 的会话目录）里见过的。见 `forgetDeleted`。
+    private var seenInSource: Set<String> = []
     private var idleTask: Task<Void, Never>?
     /// 反向连接（见 `AcpConnector+Reverse.swift`）。
     var links: [UUID: ReverseLink] = [:]
@@ -456,8 +460,11 @@ public actor AcpConnector {
     public func staticTasks() async -> [TaskRecord] {
         var byId: [String: TaskRecord] = [:]
         let current = now()
+        let localIds = Set(localTasks.map(\.id))
         for info in listed.values {
             let record = listedRecord(info)
+            // 内置 OpenCode 以数据库为准：数据库里没有（删了、归档了）的，`session/list` 还列着也不要。
+            if openCodeLocalCovers(record), !localIds.contains(record.id) { continue }
             byId[record.id] = record
         }
         for record in await archive.records(connectorId: id) {
@@ -495,14 +502,22 @@ public actor AcpConnector {
     }
 
     /// 内置 OpenCode 的全机发现不依赖 ACP 的项目列表。读失败保留上一次结果。
+    /// 数据库是权威：BotBus 驱动过、本机记着的会话数据库里没了（电脑上删了、归档了）就忘掉，见 `forgetDeleted`。
     public func refreshLocalSessions() async {
         guard let openCodeReader, !isShutDown,
               FileManager.default.fileExists(atPath: openCodeReader.databaseURL.path) else { return }
         do {
-            let fresh = try openCodeReader.tasks(now: now())
-            let changed = !localBaselined || fresh != localTasks
+            let started = now()
+            let (fresh, coverageStart) = try openCodeReader.scan(now: started)
+            var changed = !localBaselined || fresh != localTasks
             localTasks = fresh
             localBaselined = true
+            localCoverageStart = coverageStart
+            let present = Set(fresh.compactMap { identity.sessionId(taskId: $0.id) })
+            if await forgetDeleted(notIn: present, updatedAfter: localCoverageStart ?? .distantPast,
+                                   updatedBefore: started) {
+                changed = true
+            }
             if changed { await onTasksChanged() }
         } catch {
             Self.log.error("opencode local session scan failed")
@@ -522,15 +537,82 @@ public actor AcpConnector {
             let running = try await ensureRunning()
             guard running.capabilities.listSessions else { return }
             let current = now()
-            let fresh = try await running.client.listSessions()
+            let all = try await running.client.listAllSessions()
+            let fresh = all.sessions
                 .filter { ($0.updatedAt.map { current.timeIntervalSince($0) } ?? 0) <= SessionFormatting.recentWindow }
             listed = Dictionary(fresh.map { ($0.sessionId, $0) }, uniquingKeysWith: { first, _ in first })
             listedOnce = true
+            // 完整的列表里没有 = 电脑上删了：本机记着的（BotBus 驱动过的）一并忘掉。按窗口过滤之前的全集比，
+            // agent 报的时间比我们记的旧的会话不会被当成删了。
+            if all.complete {
+                await forgetDeleted(notIn: Set(all.sessions.map(\.sessionId)), updatedAfter: .distantPast,
+                                    updatedBefore: current)
+            }
             await onTasksChanged()
         } catch {
             // 只记错误的类别：进程退出的原因里带 stderr 末尾，agent 回的错误文本也可能有会话内容。
             Self.log.error("acp list failed for \(self.id, privacy: .public): \(Self.logCategory(error), privacy: .public)")
         }
+    }
+
+    // MARK: - 电脑上删掉的会话
+
+    /// 本连接器此刻还在用这个会话：这一轮在跑、挂着审批、进程里开着、反向连接在报、正在准备或载入。
+    private func isInUse(_ sessionId: String) -> Bool {
+        turns[sessionId] != nil || waiters[sessionId] != nil || loaded.contains(sessionId)
+            || reverseOwner[sessionId] != nil || preparing.contains(sessionId) || loads[sessionId] != nil
+    }
+
+    /// 权威来源（完整的 `session/list`、OpenCode 数据库、dsh 的会话目录）里已经没有的会话：从本机记录
+    ///（`acp-sessions.json`）与内存状态里忘掉，`staticTasks()` 不再报，hub / dsh 下一次对账就从手机上摘掉。
+    ///
+    /// 只忘在权威来源里**见过**、这次又不在的（`seenInSource`）：有的 agent 列表不收 BotBus 建的会话、刚建的会话可能还没落盘，
+    /// 没见过的不能当成删了。另外只看更新时间在 `updatedAfter..<updatedBefore` 之间的：之后的是读那一刻之后才动过的，
+    /// 之前的是来源读满上限、判断不了的旧会话。还在用的不动。返回有没有忘掉什么（调用方据此要不要再对一次账）。
+    @discardableResult
+    public func forgetDeleted(notIn present: Set<String>, updatedAfter: Date, updatedBefore: Date) async -> Bool {
+        let known = await knownSessionTimes()
+        seenInSource = seenInSource.intersection(known.keys).union(present.intersection(known.keys))
+        let doomed = Set(known.compactMap { sessionId, updated -> String? in
+            guard seenInSource.contains(sessionId), !present.contains(sessionId), !isInUse(sessionId),
+                  updated >= updatedAfter, updated < updatedBefore else { return nil }
+            return sessionId
+        })
+        guard !doomed.isEmpty else { return false }
+        for sessionId in doomed {
+            sessions.removeValue(forKey: sessionId)
+            listed.removeValue(forKey: sessionId)
+            seenInSource.remove(sessionId)
+        }
+        await archive.forget(connectorId: id, taskIds: Set(doomed.map { identity.taskId(sessionId: $0) }))
+        return true
+    }
+
+    /// 只记下「在权威来源里见过」，不忘任何会话（dsh 的底子里都有、不必读盘时用）。
+    public func noteSeen(_ present: Set<String>) async {
+        let known = await knownSessionTimes()
+        seenInSource = seenInSource.intersection(known.keys).union(present.intersection(known.keys))
+    }
+
+    /// 本机记着的会话（本机记录与内存状态）→ 最近更新时间；解析不了的当作刚更新（不会被忘）。
+    private func knownSessionTimes() async -> [String: Date] {
+        var known: [String: Date] = [:]
+        for record in await archive.records(connectorId: id) {
+            guard let sessionId = identity.sessionId(taskId: record.id) else { continue }
+            known[sessionId] = Self.date(record.updatedAt) ?? .distantFuture
+        }
+        for (sessionId, state) in sessions {
+            let updated = Self.date(state.record.updatedAt) ?? .distantFuture
+            known[sessionId] = max(known[sessionId] ?? .distantPast, updated)
+        }
+        return known
+    }
+
+    /// OpenCode 数据库这一读覆盖得到这条记录（读全了，或它比读满上限时最旧的那条新）。
+    private func openCodeLocalCovers(_ record: TaskRecord) -> Bool {
+        guard openCodeReader != nil, localBaselined else { return false }
+        guard let start = localCoverageStart else { return true }
+        return (Self.date(record.updatedAt) ?? .distantFuture) >= start
     }
 
     // MARK: - agent 发来的消息

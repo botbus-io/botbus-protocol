@@ -75,6 +75,12 @@ public struct AcpClient: Sendable {
     /// `session/list`，按 `nextCursor` 翻页，最多翻 `maxPages` 页——超过这个页数就默默截断，
     /// 不当错误处理，也不告诉调用方还有没翻完的页。
     public func listSessions(maxPages: Int = 5) async throws -> [AcpSessionInfo] {
+        try await listAllSessions(maxPages: maxPages).sessions
+    }
+
+    /// 同 `listSessions`，另外说这份列表全不全：翻到最后一页才算（`complete`），页数到顶还有下一页就不全。
+    /// 只有全的列表才能说明「不在里面的会话在电脑上已经删了」。
+    public func listAllSessions(maxPages: Int = 5) async throws -> (sessions: [AcpSessionInfo], complete: Bool) {
         var sessions: [AcpSessionInfo] = []
         var cursor: String?
         for _ in 0..<maxPages {
@@ -82,9 +88,9 @@ public struct AcpClient: Sendable {
             if let cursor { params["cursor"] = .string(cursor) }
             let result = try await peer.request("session/list", params: .object(params), timeout: Self.sessionTimeout)
             sessions += result["sessions"]?.arrayValue?.compactMap(AcpSessionInfo.init(json:)) ?? []
-            guard let next = result["nextCursor"]?.stringValue, !next.isEmpty else { break }
+            guard let next = result["nextCursor"]?.stringValue, !next.isEmpty else { return (sessions, true) }
             cursor = next
         }
-        return sessions
+        return (sessions, false)
     }
 }

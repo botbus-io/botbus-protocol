@@ -38,7 +38,8 @@ final class OpenClawConnectorTests: XCTestCase {
                                  onHealth: health.handler,
                                  now: { now },
                                  timing: .init(initialBackoff: 0.05, maxBackoff: 0.2, refreshDelay: 0.05,
-                                               requestTimeout: 1, challengeTimeout: 0.2, pingInterval: 0))
+                                               requestTimeout: 1, challengeTimeout: 0.2, pingInterval: 0,
+                                               refreshRetryDelay: 0.05))
     }
 
     private func row(_ key: String, secondsAgo: Double = 60, _ extra: [String: JSONValue] = [:]) -> JSONValue {
@@ -329,6 +330,29 @@ final class OpenClawConnectorTests: XCTestCase {
         server.push("sessions.changed", ["reason": "delete", "key": "agent:main:other", "sessionId": "s-2"])
         await assertEventually { await store.task(id: "openclaw:agent:main:other") == nil }
         XCTAssertEqual(server.requests("sessions.list").count, 1)
+        let kept = await store.task(id: "openclaw:agent:main:main")
+        XCTAssertNotNil(kept)
+    }
+
+    /// 删除通知之后的列表拉失败了：过一会儿再拉，删掉的会话不会一直留在手机上。
+    func testFailedRefreshAfterDeletionRetries() async throws {
+        let server = FakeOpenClawServer()
+        server.rows = [row("agent:main:main", ["status": "done"]), row("agent:main:other", ["status": "done"])]
+        let store = makeStore()
+        let connector = await startConnected(server, store: store, waitFor: "agent:main:other")
+        defer { Task { await connector.stop() } }
+
+        let rows = [row("agent:main:main", ["status": "done"])]
+        let attempts = Locked(0)
+        server.setResponder("sessions.list") { _ in
+            attempts.withLock { $0 += 1 }
+            return attempts.current == 1
+                ? .failure(OpenClawGatewayError(.requestFailed, code: "UNAVAILABLE", message: "busy"))
+                : .success(["sessions": .array(rows)])
+        }
+        server.push("sessions.changed", ["reason": "delete", "key": "agent:main:other", "sessionId": "s-2"])
+        await assertEventually { await store.task(id: "openclaw:agent:main:other") == nil }
+        XCTAssertGreaterThanOrEqual(attempts.current, 2)
         let kept = await store.task(id: "openclaw:agent:main:main")
         XCTAssertNotNil(kept)
     }

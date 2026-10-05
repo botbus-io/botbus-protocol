@@ -17,14 +17,24 @@ public struct OpenCodeSessionReader: MessageReader, Sendable {
         AgentBinary.detect("opencode", extra: ["~/.opencode/bin"])
     }
 
+    public static let maxSessions = 200
+
     public func tasks(now: Date = Date()) throws -> [TaskRecord] {
+        try scan(now: now).tasks
+    }
+
+    /// 同 `tasks`，另给这一读覆盖到哪：读满 `maxSessions` 条时是最旧那条的时间（比它旧的没读到），没读满是 nil。
+    /// 覆盖范围里数据库没有的会话（删了、归档了）就是电脑上没了。
+    public func scan(now: Date = Date()) throws -> (tasks: [TaskRecord], coverageStart: Date?) {
         let db = try SQLiteDatabase(path: databaseURL.path)
         let rows = try db.query("""
             SELECT id, directory, title, time_created, time_updated FROM session
             WHERE parent_id IS NULL AND time_archived IS NULL AND time_updated >= ?
-            ORDER BY time_updated DESC, id DESC LIMIT 200
-            """, [.integer(Int64((now.timeIntervalSince1970 - SessionFormatting.recentWindow) * 1000))])
-        return try rows.compactMap { row in
+            ORDER BY time_updated DESC, id DESC LIMIT ?
+            """, [.integer(Int64((now.timeIntervalSince1970 - SessionFormatting.recentWindow) * 1000)),
+                  .integer(Int64(Self.maxSessions))])
+        let coverageStart = rows.count >= Self.maxSessions ? rows.last.map { Self.date($0["time_updated"]?.int ?? 0) } : nil
+        let tasks: [TaskRecord] = try rows.compactMap { row in
             guard let id = row["id"]?.string, let cwd = row["directory"]?.string else { return nil }
             let updated = Self.date(row["time_updated"]?.int ?? 0)
             var task = AcpSessionState.newRecord(connectorId: "opencode", sessionId: id, cwd: cwd,
@@ -47,6 +57,7 @@ public struct OpenCodeSessionReader: MessageReader, Sendable {
                 .map { SessionFormatting.truncate($0.message.text, SessionFormatting.lastMessageLimit) }
             return task
         }
+        return (tasks, coverageStart)
     }
 
     public func entries(taskId: String, limit: Int) async throws -> (entries: [TranscriptEntry], hasMore: Bool) {
