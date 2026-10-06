@@ -20,23 +20,33 @@ public struct HermesStateReader: Sendable {
     static let finishedReasons: Set<String> = ["stop", "length", "end_turn", "content_filter"]
 
     public let databasePath: String
+    /// 没有 `cwd` 的会话（Hermes 桌面端、Telegram 等渠道、cron）归到这个目录：手机按项目分组要一个路径，
+    /// 续聊也要一个起进程的地方。默认是用户主目录，和 Hermes 命令行不带 `--in` 时一样。
+    public let fallbackDirectory: String
     private let now: @Sendable () -> Date
 
-    public init(databasePath: String, now: @escaping @Sendable () -> Date = { Date() }) {
+    public init(databasePath: String, fallbackDirectory: String = HermesStateReader.homeDirectory,
+                now: @escaping @Sendable () -> Date = { Date() }) {
         self.databasePath = databasePath
+        self.fallbackDirectory = fallbackDirectory
         self.now = now
     }
 
     /// 不管库在不在都能建；读的时候才判断（`readSnapshot` 抛 `SessionSourceUnavailable`）。
-    public init(paths: HermesPaths, now: @escaping @Sendable () -> Date = { Date() }) {
-        self.init(databasePath: paths.hermesHome.appendingPathComponent("state.db").path, now: now)
+    public init(paths: HermesPaths, fallbackDirectory: String = HermesStateReader.homeDirectory,
+                now: @escaping @Sendable () -> Date = { Date() }) {
+        self.init(databasePath: paths.hermesHome.appendingPathComponent("state.db").path,
+                  fallbackDirectory: fallbackDirectory, now: now)
     }
+
+    public static var homeDirectory: String { FileManager.default.homeDirectoryForCurrentUser.path }
 
     // MARK: - 快照
 
-    /// 7 天内有活动、带 `cwd`、没归档/隐藏、不是被压缩掉的旧会话，活动时间降序，最多 200 条。
+    /// 7 天内有活动、没归档/隐藏、不是被压缩掉的旧会话，活动时间降序，最多 200 条。
     ///
-    /// Telegram 等渠道的私聊没有 `cwd`，不进快照——它们不是"某个项目里的编码任务"，也不该未经同意同步到手机。
+    /// Hermes 桌面端、Telegram 等渠道、cron 的会话没有 `cwd`，归到 `fallbackDirectory`（用户主目录）这个项目下，
+    /// 照样进快照（用户要求手机上也能看到桌面端发起的会话）。
     /// 库不存在抛 `SessionSourceUnavailable`（观察者据此不对账，一条都不摘）；缺表、忙锁照常抛错，
     /// 由观察者按连续失败次数报警。
     public func readSnapshot(agentId: String) throws -> (tasks: [TaskRecord], projects: [Project]) {
@@ -52,13 +62,11 @@ public struct HermesStateReader: Sendable {
         let sessionColumns = try HermesSQL.columns(of: "sessions", in: database)
         guard !sessionColumns.isEmpty else { throw HermesSchemaError("state.db 里没有 sessions 表") }
         guard sessionColumns.contains("id") else { throw HermesSchemaError("sessions 表缺 id 列") }
-        // 没有 cwd 列的老库里没有"项目会话"这回事：如实报空，而不是报错。
-        guard sessionColumns.contains("cwd") else { return [] }
         let activityParts = ["last_activity_at", "ended_at", "started_at"].filter(sessionColumns.contains)
         guard !activityParts.isEmpty else { throw HermesSchemaError("sessions 表没有任何时间列") }
         let activity = activityParts.count == 1 ? activityParts[0] : "COALESCE(\(activityParts.joined(separator: ", ")))"
 
-        var filters = ["cwd IS NOT NULL", "TRIM(cwd) != ''", "\(activity) > ?"]
+        var filters = ["\(activity) > ?"]
         if sessionColumns.contains("archived") { filters.append("COALESCE(archived, 0) = 0") }
         if sessionColumns.contains("hidden") { filters.append("COALESCE(hidden, 0) = 0") }
         // 压缩会以 end_reason='compression' 结束旧会话、新开一行接着聊：只显示链条末端。
@@ -79,8 +87,9 @@ public struct HermesStateReader: Sendable {
         var tasks: [TaskRecord] = []
         for row in rows {
             guard let id = HermesSQL.text(row["id"]), !id.isEmpty,
-                  let cwd = HermesSQL.text(row["cwd"])?.trimmed, !cwd.isEmpty,
                   let activitySeconds = HermesSQL.seconds(row["activity_at"]) else { continue }
+            let ownCwd = HermesSQL.directory(row["cwd"])
+            let cwd = ownCwd ?? fallbackDirectory
             let activityAt = Date(timeIntervalSince1970: activitySeconds)
             let startedAt = HermesSQL.seconds(row["started_at"]).map(Date.init(timeIntervalSince1970:)) ?? activityAt
             let endedAt = HermesSQL.seconds(row["ended_at"])
@@ -95,7 +104,7 @@ public struct HermesStateReader: Sendable {
 
             var title = HermesSQL.text(row["title"]).map(Self.singleLine) ?? ""
             if title.isEmpty, let first = try messages.firstUserText(sessionID: id) { title = Self.singleLine(first) }
-            if title.isEmpty { title = projectName.isEmpty ? "Hermes 会话" : projectName }
+            if title.isEmpty { title = ownCwd == nil || projectName.isEmpty ? "Hermes 会话" : projectName }
 
             tasks.append(TaskRecord(
                 id: "hermes:\(id)",
@@ -137,14 +146,16 @@ public struct HermesStateReader: Sendable {
     // MARK: - 查找
 
     /// 一个会话的工作目录。连接器续聊时要把子进程放回原项目里（`--in` 与 `currentDirectoryURL`）。
-    /// 库不在、会话不在、没有 cwd 都返回 nil，由连接器退回自己记得的目录。
+    /// 会话在、但没有 cwd（桌面端等）回 `fallbackDirectory`，与快照里给的项目路径一致；
+    /// 库不在、会话不在返回 nil，由连接器退回自己记得的目录。
     public func cwd(forSession sessionID: String) -> String? {
         guard FileManager.default.fileExists(atPath: databasePath),
               let database = try? SQLiteDatabase(path: databasePath),
-              let columns = try? HermesSQL.columns(of: "sessions", in: database), columns.contains("cwd"),
-              let row = try? database.query("SELECT cwd FROM sessions WHERE id = ? LIMIT 1", [.text(sessionID)]).first,
-              let cwd = HermesSQL.text(row["cwd"])?.trimmed, !cwd.isEmpty else { return nil }
-        return cwd
+              let columns = try? HermesSQL.columns(of: "sessions", in: database), columns.contains("id") else { return nil }
+        let selected = columns.contains("cwd") ? "cwd" : "id"
+        guard let row = try? database.query("SELECT \(selected) FROM sessions WHERE id = ? LIMIT 1",
+                                            [.text(sessionID)]).first else { return nil }
+        return HermesSQL.directory(row["cwd"]) ?? fallbackDirectory
     }
 
     /// 标题必须单行：换行与连续空白压成一个空格。
@@ -195,6 +206,12 @@ enum HermesSQL {
         case .integer(let number): return String(number)
         default: return nil
         }
+    }
+
+    /// `sessions.cwd`：去掉首尾空白，空的当没有。
+    static func directory(_ value: SQLiteValue?) -> String? {
+        guard let cwd = text(value)?.trimmed, !cwd.isEmpty else { return nil }
+        return cwd
     }
 
     /// Hermes 的时间是 REAL epoch 秒；老数据或手工写入的也可能是整数或数字字符串。

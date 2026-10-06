@@ -20,7 +20,7 @@ final class HermesStateReaderTests: XCTestCase {
     private var databasePath: String { home.appendingPathComponent("state.db").path }
 
     private func reader() -> HermesStateReader {
-        HermesStateReader(paths: HermesPaths(hermesHome: home), now: { [now] in now })
+        HermesStateReader(paths: HermesPaths(hermesHome: home), fallbackDirectory: "/Users/me", now: { [now] in now })
     }
 
     static let currentSchema = """
@@ -50,7 +50,7 @@ final class HermesStateReaderTests: XCTestCase {
               ('s-idle',     'cli',      '昨天的',     '/Users/me/Projects/old',  NULL, \(t(200000)), \(t(100000)), \(t(100000)), 'error', 0, 0),
               ('s-parent',   'cli',      '被压缩的',   '/Users/me/Projects/shop', NULL, \(t(5000)), \(t(4000)), \(t(4000)), 'compression', 0, 0),
               ('s-telegram', 'telegram', '私聊',       NULL,                      NULL, \(t(100)), NULL,         \(t(10)),  NULL,           0, 0),
-              ('s-blank',    'cli',      '空目录',     '  ',                      NULL, \(t(100)), NULL,         \(t(10)),  NULL,           0, 0),
+              ('s-blank',    'cli',      NULL,        '  ',                      NULL, \(t(100)), \(t(12)),    \(t(12)),  NULL,           0, 0),
               ('s-archived', 'cli',      '归档',       '/Users/me/Projects/shop', NULL, \(t(100)), NULL,         \(t(10)),  NULL,           1, 0),
               ('s-hidden',   'cli',      '隐藏',       '/Users/me/Projects/shop', NULL, \(t(100)), NULL,         \(t(10)),  NULL,           0, 1),
               ('s-ancient',  'cli',      '上古',       '/Users/me/Projects/shop', NULL, \(t(900000)), \(t(800000)), \(t(800000)), NULL,     0, 0);
@@ -75,9 +75,9 @@ final class HermesStateReaderTests: XCTestCase {
         try makeFixture()
         let snapshot = try reader().readSnapshot(agentId: "agent-mac-1")
         XCTAssertEqual(snapshot.tasks.map(\.id), [
-            "hermes:s-running", "hermes:s-answered", "hermes:s-json", "hermes:s-stale", "hermes:s-done",
+            "hermes:s-telegram", "hermes:s-blank", "hermes:s-running", "hermes:s-answered", "hermes:s-json", "hermes:s-stale", "hermes:s-done",
             "hermes:s-child", "hermes:s-failed", "hermes:s-long", "hermes:s-untitled", "hermes:s-idle",
-        ], "没 cwd、空白 cwd、归档、隐藏、被压缩的父会话、7 天前的都不进；按活动时间降序")
+        ], "归档、隐藏、被压缩的父会话、7 天前的都不进；没 cwd、空白 cwd 的照样进；按活动时间降序")
         XCTAssertTrue(snapshot.tasks.allSatisfy { $0.agentId == "agent-mac-1" && $0.source == .hermes && $0.origin == .desktop })
     }
 
@@ -105,6 +105,21 @@ final class HermesStateReaderTests: XCTestCase {
         XCTAssertEqual(HermesStateReader.status(endReason: nil, ended: false, activityAt: now.addingTimeInterval(-121), now: now), .completed)
         XCTAssertEqual(HermesStateReader.status(endReason: "agent_error", ended: true,
                                                 activityAt: now.addingTimeInterval(-90_000), now: now), .idle)
+    }
+
+    /// Hermes 桌面端、Telegram、cron 的会话没有 cwd：归到主目录这个项目下，续聊也在那里起进程。
+    func testSessionsWithoutCwdFallBackToHomeDirectory() throws {
+        try makeFixture()
+        let tasks = Dictionary(uniqueKeysWithValues: try reader().readSnapshot(agentId: "a").tasks.map { ($0.id, $0) })
+        let telegram = try XCTUnwrap(tasks["hermes:s-telegram"])
+        XCTAssertEqual(telegram.projectPath, "/Users/me")
+        XCTAssertEqual(telegram.projectName, "me")
+        XCTAssertEqual(telegram.title, "私聊")
+        XCTAssertEqual(telegram.status, .running, "没结束、10 秒前还在动")
+        let blank = try XCTUnwrap(tasks["hermes:s-blank"])
+        XCTAssertEqual(blank.projectPath, "/Users/me", "只有空白的 cwd 当没有")
+        XCTAssertEqual(blank.title, "Hermes 会话", "没标题也没消息时不拿主目录名当标题")
+        XCTAssertEqual(blank.status, .completed)
     }
 
     func testTitlePrecedenceAndLastMessage() throws {
@@ -146,9 +161,9 @@ final class HermesStateReaderTests: XCTestCase {
                        "没有 last_activity_at 时退回 ended_at")
 
         XCTAssertEqual(snapshot.projects.map(\.path),
-                       ["/Users/me/Projects/shop", "/Users/me/Projects/lab", "/Users/me/Projects/lab/",
+                       ["/Users/me", "/Users/me/Projects/shop", "/Users/me/Projects/lab", "/Users/me/Projects/lab/",
                         "/Users/me/Projects/empty", "/Users/me/Projects/old"])
-        XCTAssertEqual(snapshot.projects.first?.lastUsedAt, ProtocolJSON.timestamp(now.addingTimeInterval(-20)))
+        XCTAssertEqual(snapshot.projects.first?.lastUsedAt, ProtocolJSON.timestamp(now.addingTimeInterval(-10)))
         XCTAssertTrue(snapshot.projects.allSatisfy { $0.agentId == "agent-mac-1" })
     }
 
@@ -183,26 +198,31 @@ final class HermesStateReaderTests: XCTestCase {
               ('old-open', 'assistant', '老库的回答', \(t(20)));
             """)
         let tasks = try reader().readSnapshot(agentId: "a").tasks
-        XCTAssertEqual(tasks.map(\.id), ["hermes:old-open", "hermes:old-done"])
-        XCTAssertEqual(tasks[0].title, "老库的问题")
-        XCTAssertEqual(tasks[0].lastMessage, "老库的回答")
-        XCTAssertEqual(tasks[0].status, .running, "没有 finish_reason 列：退回纯时间判断")
-        XCTAssertEqual(tasks[1].status, .completed)
-        XCTAssertEqual(tasks[1].title, "旧标题")
+        XCTAssertEqual(tasks.map(\.id), ["hermes:old-chat", "hermes:old-open", "hermes:old-done"])
+        XCTAssertEqual(tasks[0].projectPath, "/Users/me", "没有 cwd 的归到主目录")
+        XCTAssertEqual(tasks[1].title, "老库的问题")
+        XCTAssertEqual(tasks[1].lastMessage, "老库的回答")
+        XCTAssertEqual(tasks[1].status, .running, "没有 finish_reason 列：退回纯时间判断")
+        XCTAssertEqual(tasks[2].status, .completed)
+        XCTAssertEqual(tasks[2].title, "旧标题")
     }
 
-    func testSchemaWithoutCwdReportsNothing() throws {
+    func testSchemaWithoutCwdUsesHomeDirectory() throws {
         try SQLiteDatabase(path: databasePath, readOnly: false).execute("""
             CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, started_at REAL);
             INSERT INTO sessions VALUES ('x', 't', \(t(10)));
             """)
-        XCTAssertEqual(try reader().readSnapshot(agentId: "a").tasks, [])
+        let tasks = try reader().readSnapshot(agentId: "a").tasks
+        XCTAssertEqual(tasks.map(\.id), ["hermes:x"])
+        XCTAssertEqual(tasks.first?.projectPath, "/Users/me")
+        XCTAssertEqual(reader().cwd(forSession: "x"), "/Users/me")
     }
 
     func testCwdLookup() throws {
         try makeFixture()
         XCTAssertEqual(reader().cwd(forSession: "s-done"), "/Users/me/Projects/lab")
-        XCTAssertNil(reader().cwd(forSession: "s-telegram"), "没有 cwd 的会话")
+        XCTAssertEqual(reader().cwd(forSession: "s-telegram"), "/Users/me", "没有 cwd 的会话回主目录")
+        XCTAssertEqual(reader().cwd(forSession: "s-blank"), "/Users/me")
         XCTAssertNil(reader().cwd(forSession: "nope"))
         XCTAssertNil(HermesStateReader(databasePath: "/nonexistent/state.db").cwd(forSession: "s-done"))
     }

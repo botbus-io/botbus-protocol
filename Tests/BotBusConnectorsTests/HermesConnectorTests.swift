@@ -409,8 +409,28 @@ final class HermesConnectorTests: XCTestCase {
         XCTAssertEqual(record.status, .running)
     }
 
-    func testFollowUpWithoutKnownDirectoryFails() async throws {
+    /// 桌面端等没有 cwd 的会话：快照把它归到主目录，续聊也在主目录起进程。
+    func testFollowUpWithoutSessionCwdResumesInHomeDirectory() async throws {
         try makeStateDB(sessions: [("chat", nil)])
+        let launcher = FakeHermesLauncher()
+        let finished = Locked(0)
+        let connector = makeConnector(store: makeStore(), launcher: launcher, finished: finished)
+
+        let pending = Task { try await connector.followUp(taskId: "hermes:chat", prompt: "接着聊") }
+        let launch = try await XCTUnwrapAsync(await launcher.waitForLaunch(1))
+        let home = HermesStateReader.homeDirectory
+        XCTAssertEqual(launch.request.arguments,
+                       ["chat", "-q", "接着聊", "--format", "stream-json", "--in", home, "--resume", "chat"])
+        XCTAssertEqual(launch.request.workingDirectory, home)
+        launch.emit(["type": "system", "subtype": "init", "session_id": "chat"])
+        _ = try await pending.value
+        launch.emit(["type": "result", "session_id": "chat", "exit_code": 0, "text": "好"])
+        launch.exit(0)
+        await assertEventually { finished.current == 1 }
+    }
+
+    func testFollowUpWithoutKnownDirectoryFails() async throws {
+        try makeStateDB(sessions: [])
         let connector = makeConnector(store: makeStore(), launcher: FakeHermesLauncher())
         do {
             _ = try await connector.followUp(taskId: "hermes:chat", prompt: "x")
