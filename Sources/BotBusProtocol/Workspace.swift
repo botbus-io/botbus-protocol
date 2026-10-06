@@ -26,6 +26,9 @@ public enum WorkspaceFeature {
     public static let files = "files"
     public static let terminal = "terminal"
     public static let screen = "screen"
+    /// 屏幕服务认 `/move`（只挪指针）与 `/click` 的 `button: "right"`：手机单指按住移动就是挪鼠标。
+    /// 没报的旧 Mac 上单指划动照旧是滚动。
+    public static let pointer = "pointer"
 }
 
 public enum WorkspaceLimits {

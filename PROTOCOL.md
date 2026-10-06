@@ -469,6 +469,7 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 
 - Mac 回的 JSON（`/status`、`/focus`、`/elements`、输入的回执）是 `{"sealed": <信封>}`；`/stream` 的每个包是 `[u32 大端长度][密封的 [u8 类型][负载]]`（类型与负载同 2.12）。
 - 输入是 `POST` `{"sealed": <信封>}`，明文 JSON 里除原有字段外必须有请求路径 `p` 与严格递增的毫秒时间戳 `t`：Mac 拒绝路径对不上（把 `/click` 的密文挪到 `/type`）、时间戳不比上一条新（重放）、或偏离本机时钟两分钟以上的请求，一律 403。明文输入一律 403。3.7 起请求还可带通道号 `c`，防重放与回复的钉法见下一节。
+- 指针（2026-10，**不改版本号**）：报了 `features` 含 `pointer` 的 Mac 认 `POST /move` `{x, y}`（只挪指针，回 `{}`，锁着时 `{locked: true}`），手机单指按住移动时连续发（同时只有一条在途，中间的位置丢掉）；`/click` 另收 `button: "right"`（缺省 `left`，旧 Mac 也认）。没报 `pointer` 的电脑上原生手机不发 `/move`，单指划动照旧是 `/scroll`。查看页 `RemoteControlPage` 不用它。
 - 没有组密钥时 Mac 的远程操作服务整个不可用；远程操作的预览产物带 `Artifact.remoteControl = true`，客户端据此选用加密查看页。
 
 ### 工作区（3.7）
@@ -479,7 +480,7 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 
 #### 状态与锁
 
-- **`GET /status`**：回 `{"sealed": …}`，AAD 仍是 `rc:<agentId>`（GET 没有请求体，回复钉不到请求上；旧 Mac 也有这个端点，手机靠它认出新功能）。明文是 `WorkspaceStatus`：`features`（`files` / `terminal` / `screen` 的子集，开集：不认得的值忽略；Mac 报 `["files", "terminal", "screen"]`（没有嵌入 `botbus` 命令行的开发构建不报 `terminal`），没有屏幕的宿主没有 `screen`（Linux 报 `["files", "terminal"]`；Windows 有 ConPTY——Windows 10 1809 起——时报 `["files", "terminal"]`，没有时只有 `files`）；3.6 的 Mac 没有这个键，按只有屏幕处理；1A 的 Mac 没有 `terminal`）、`armed`、`armedUntil`（解锁时是到期的毫秒时间戳，锁着时省略）、`home`（电脑上的主目录）、`platform`（`macos` / `linux` / `windows`），以及有屏幕服务时才有的屏幕字段（`accessibility`、`screenCapture`、`secureInput`、`streaming`、`frontmost`、`displays`，与 2.12 相同）。`POST /status` 回同样的内容，只是请求走下面的密封请求。
+- **`GET /status`**：回 `{"sealed": …}`，AAD 仍是 `rc:<agentId>`（GET 没有请求体，回复钉不到请求上；旧 Mac 也有这个端点，手机靠它认出新功能）。明文是 `WorkspaceStatus`：`features`（`files` / `terminal` / `screen` / `pointer` 的子集，开集：不认得的值忽略；Mac 报 `["files", "terminal", "screen", "pointer"]`（没有嵌入 `botbus` 命令行的开发构建不报 `terminal`；`pointer` 见下），没有屏幕的宿主没有 `screen`（Linux 报 `["files", "terminal"]`；Windows 有 ConPTY——Windows 10 1809 起——时报 `["files", "terminal"]`，没有时只有 `files`）；3.6 的 Mac 没有这个键，按只有屏幕处理；1A 的 Mac 没有 `terminal`）、`armed`、`armedUntil`（解锁时是到期的毫秒时间戳，锁着时省略）、`home`（电脑上的主目录）、`platform`（`macos` / `linux` / `windows`），以及有屏幕服务时才有的屏幕字段（`accessibility`、`screenCapture`、`secureInput`、`streaming`、`frontmost`、`displays`，与 2.12 相同）。`POST /status` 回同样的内容，只是请求走下面的密封请求。
 - **锁**：屏幕的点击与键入、所有文件写操作（`/fs/write`、`/fs/mkdir`、`/fs/create`、`/fs/rename`、`/fs/trash`、`/fs/upload/*`）、终端的新开、关闭与输入共用一把。默认锁着；`/arm` 带 `on` 开关并回 `WorkspaceStatus`，请求体解不开按「锁上」处理并照常回状态：出了岔子时落在更安全的一边，手机从回复里看得到。解锁后闲置 10 分钟锁回，每次真实输入或写操作顺延 10 分钟。读（`/fs/list`、`/fs/read`、`/status`、屏幕画面、终端列表与输出）不受锁限制；写在锁着时回失败 `locked`。终端的尺寸锁着也收。
 
 #### 请求与防重放
