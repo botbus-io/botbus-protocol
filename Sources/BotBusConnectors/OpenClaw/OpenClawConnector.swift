@@ -40,10 +40,13 @@ public actor OpenClawConnector: TaskConnector {
         public var requestTimeout: TimeInterval
         public var challengeTimeout: TimeInterval
         public var pingInterval: TimeInterval
+        /// 首屏之后连接活够这么久再断，才把退避打回初始值。连上就断若每次都从 1 秒重来，健康状态每秒翻一次，
+        /// 每次都是一份全量快照发到 Relay。
+        public var stableConnectionInterval: TimeInterval
 
         public init(initialBackoff: TimeInterval = 1, maxBackoff: TimeInterval = 60, refreshDelay: TimeInterval = 0.5,
                     requestTimeout: TimeInterval = 15, challengeTimeout: TimeInterval = 2, pingInterval: TimeInterval = 30,
-                    refreshRetryDelay: TimeInterval = 10) {
+                    refreshRetryDelay: TimeInterval = 10, stableConnectionInterval: TimeInterval = 30) {
             self.initialBackoff = initialBackoff
             self.maxBackoff = maxBackoff
             self.refreshDelay = refreshDelay
@@ -51,6 +54,7 @@ public actor OpenClawConnector: TaskConnector {
             self.requestTimeout = requestTimeout
             self.challengeTimeout = challengeTimeout
             self.pingInterval = pingInterval
+            self.stableConnectionInterval = stableConnectionInterval
         }
     }
 
@@ -162,13 +166,14 @@ public actor OpenClawConnector: TaskConnector {
             let gateway = OpenClawGateway(transport: transport, configuration: configuration)
 
             var failure = "连不上 OpenClaw Gateway（\(address)）"
+            var connectedAt: ContinuousClock.Instant?
             do {
                 try await gateway.connect()
                 guard !Task.isCancelled else { await gateway.close(); return }
                 self.gateway = gateway
                 try await bootstrap(gateway)
                 await report(.ok, nil)
-                backoff = timing.initialBackoff
+                connectedAt = .now
                 // 首屏是基线：7 天内的完成 / 失败会话都在里面，逐条推送等于把一串私聊预览一次性发到手机上。
                 await publish(silently: true)
                 // 握手与首屏期间到达的事件都攒在流里，这里按序补上，再接着实时消费。
@@ -190,6 +195,9 @@ public actor OpenClawConnector: TaskConnector {
             await gateway.close()
             if self.gateway === gateway { self.gateway = nil }
             if Task.isCancelled { return }
+            if let connectedAt, ContinuousClock.now - connectedAt >= .seconds(timing.stableConnectionInterval) {
+                backoff = timing.initialBackoff
+            }
             await report(.degraded, failure)
             await publish(silently: true)
             await sleep(backoff)

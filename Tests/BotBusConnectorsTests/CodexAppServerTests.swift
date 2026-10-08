@@ -540,6 +540,69 @@ final class CodexAppServerTests: XCTestCase {
         await server.stop()
     }
 
+    /// 起不来 / 起来就崩：重启间隔 3 秒起翻倍，封顶 5 分钟。
+    func testRepeatedLaunchFailuresBackOffExponentiallyUpToFiveMinutes() async {
+        let launcher = FakeCodexLauncher()
+        let sleeper = FakeSleeper()
+        let server = makeServer(launcher: launcher, sleeper: sleeper)
+        let events = await server.events()
+        let restartDelays = Locked<[TimeInterval?]>([])
+        let collector = Task {
+            for await event in events {
+                if case .exited(_, let restartingIn) = event { restartDelays.withLock { $0.append(restartingIn) } }
+            }
+        }
+        let expected: [TimeInterval] = [3, 6, 12, 24, 48, 96, 192, 300, 300]
+        launcher.failNextLaunches(expected.count)
+        await server.start()
+        for (index, delay) in expected.enumerated() {
+            await assertEventually { restartDelays.current.count == index + 1 }
+            await assertEventually { sleeper.requested.contains(delay) }
+            sleeper.release(delay)
+        }
+        await assertEventually { launcher.count == 1 }
+        XCTAssertEqual(restartDelays.current, expected)
+        collector.cancel()
+        await server.stop()
+    }
+
+    /// 活够 60 秒再退出才打回 3 秒；起来就崩的照样翻倍。
+    func testStableRunResetsRestartDelay() async {
+        let launcher = FakeCodexLauncher()
+        let sleeper = FakeSleeper()
+        let clock = Locked(Date(timeIntervalSince1970: 1_800_000_000))
+        let server = CodexAppServer(launcher: launcher,
+                                    configuration: CodexAppServer.Configuration(clientName: "BotBusTest",
+                                                                                clientVersion: "0.0.0"),
+                                    sleeper: sleeper.sleep, now: { clock.current })
+        let events = await server.events()
+        let restartDelays = Locked<[TimeInterval?]>([])
+        let collector = Task {
+            for await event in events {
+                if case .exited(_, let restartingIn) = event { restartDelays.withLock { $0.append(restartingIn) } }
+            }
+        }
+        _ = await startAndWaitForHandshake(server, launcher)
+
+        launcher.latest?.closeStdout()
+        await assertEventually { restartDelays.current == [3] }
+        await assertEventually { sleeper.requested.contains(3) }
+        sleeper.release(3)
+        await assertEventually { launcher.count == 2 }
+
+        launcher.latest?.closeStdout()
+        await assertEventually { restartDelays.current == [3, 6] }
+        await assertEventually { sleeper.requested.contains(6) }
+        sleeper.release(6)
+        await assertEventually { launcher.count == 3 }
+
+        clock.withLock { $0 = $0.addingTimeInterval(CodexAppServer.stableRunInterval) }
+        launcher.latest?.closeStdout()
+        await assertEventually { restartDelays.current == [3, 6, 3] }
+        collector.cancel()
+        await server.stop()
+    }
+
     func testRestartResumesPreviouslyControlledRunningThreads() async {
         let launcher = FakeCodexLauncher()
         let sleeper = FakeSleeper()

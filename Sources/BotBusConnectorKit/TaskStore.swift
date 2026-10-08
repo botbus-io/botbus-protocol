@@ -37,6 +37,9 @@ public actor TaskStore {
     public static let maxArtifactTasks = 200
     /// 产物改动后多久落盘。一次分享常常连着几件（截图 + 预览 + 缩略图），合并成一次写。
     public static let defaultArtifactSaveDelay: TimeInterval = 1
+    /// 只有项目 `lastUsedAt` 变了的全量快照，最多这么久发一份。会话跑着时任务 `updatedAt` 每秒都可能变，
+    /// 项目跟着变；每份快照 Relay 都要写一次存储。手机只拿它排序与显示「几分钟前」，晚一分钟可以接受。
+    public static let defaultProjectActivitySnapshotInterval: TimeInterval = 60
     /// app 用的产物持久化位置。测试一律注入临时文件或不持久化（`artifactsURL: nil`）。
     public static var defaultArtifactsURL: URL {
         LocalHookServer.defaultSupportDirectory.appendingPathComponent("artifacts.json")
@@ -137,6 +140,12 @@ public actor TaskStore {
     private let artifactSaveDelay: TimeInterval
     private var pendingArtifactSave: Task<Void, Never>?
 
+    private let projectActivitySnapshotInterval: TimeInterval
+    /// 上一次往事件流里放全量快照的时间（不管为什么发）。
+    private var lastSnapshotEventAt: Date?
+    /// 被节流的「只改了 lastUsedAt」快照：到点补发；期间发了别的快照就取消（那份已经带上最新项目）。
+    private var deferredProjectSnapshot: Task<Void, Never>?
+
     /// 手机发起过的任务 id → 第一次见到的时间。`apply` 见到 `origin == .watch` 时记下，
     /// 之后任务的 origin 变回 `.desktop`（重启后由观察者读回）也照样认得。只给 Mac 菜单用，不进协议。
     private var phoneStarted: [String: String] = [:]
@@ -188,6 +197,7 @@ public actor TaskStore {
                 supportsConnectorRestart: Bool = false,
                 supportsProjectParent: Bool = false,
                 artifactSaveDelay: TimeInterval = TaskStore.defaultArtifactSaveDelay,
+                projectActivitySnapshotInterval: TimeInterval = TaskStore.defaultProjectActivitySnapshotInterval,
                 outsideProjects: OutsideProjectRule = OutsideProjectRule(),
                 worktrees: WorktreeResolver = WorktreeResolver(),
                 systemPermissionInspector: SystemPermissionInspector? = nil,
@@ -213,6 +223,7 @@ public actor TaskStore {
         self.supportsConnectorRestart = supportsConnectorRestart
         self.supportsProjectParent = supportsProjectParent
         self.artifactSaveDelay = artifactSaveDelay
+        self.projectActivitySnapshotInterval = projectActivitySnapshotInterval
         self.systemPermissionInspector = systemPermissionInspector
         self.systemPermissionInspectionTimeout = systemPermissionInspectionTimeout
         self.directoryProbe = directoryProbe
@@ -385,6 +396,11 @@ public actor TaskStore {
     }
 
     private func publish(_ events: [Event]) {
+        if events.contains(where: { $0.kind == .snapshot }) {
+            lastSnapshotEventAt = now()
+            deferredProjectSnapshot?.cancel()
+            deferredProjectSnapshot = nil
+        }
         guard let eventContinuation, !events.isEmpty else { return }
         for event in events {
             if event.kind == .taskUpdated, let task = event.task, projectDismissals.hides(task) { continue }
@@ -486,10 +502,53 @@ public actor TaskStore {
         }
         // 协议没有单独的项目事件，Relay 只在收到全量 snapshot 时才更新 projects；
         // 所以合并后的项目列表一变就补发一份全量快照，否则手机端的"最近项目"会停在连上那一刻。
+        // 只有 lastUsedAt 变了（路径、名称、置顶、自动批准、顺序都没变）时节流，见 `defaultProjectActivitySnapshotInterval`。
         let before = mergedProjects()
         projectsBySource[source] = mineProjects
-        if mergedProjects() != before { events.append(.snapshot(snapshot())) }
+        let after = mergedProjects()
+        if after != before {
+            if Self.differOnlyInActivity(before, after), let wait = projectActivitySnapshotWait() {
+                scheduleDeferredProjectSnapshot(after: wait)
+            } else {
+                events.append(.snapshot(snapshot()))
+            }
+        }
         return events
+    }
+
+    /// 两份项目列表除了 `lastUsedAt` 逐项相同（含顺序）。
+    static func differOnlyInActivity(_ lhs: [Project], _ rhs: [Project]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        return zip(lhs, rhs).allSatisfy { left, right in
+            var l = left, r = right
+            l.lastUsedAt = ""
+            r.lastUsedAt = ""
+            return l == r
+        }
+    }
+
+    /// 距离下一份「只改了 lastUsedAt」的快照还要等多久；nil = 现在就能发。
+    private func projectActivitySnapshotWait() -> TimeInterval? {
+        guard let last = lastSnapshotEventAt else { return nil }
+        let wait = projectActivitySnapshotInterval - now().timeIntervalSince(last)
+        return wait > 0 ? wait : nil
+    }
+
+    private func scheduleDeferredProjectSnapshot(after wait: TimeInterval) {
+        // 已经挂着一份：它到点时取的是那时的最新列表，不用再挂。
+        guard deferredProjectSnapshot == nil else { return }
+        deferredProjectSnapshot = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled else { return }
+            await self?.flushDeferredProjectSnapshot()
+        }
+    }
+
+    /// 补发被节流的项目快照（定时器到点时调；测试也可直接调）。没有挂着的就什么都不做。
+    func flushDeferredProjectSnapshot() {
+        guard deferredProjectSnapshot != nil else { return }
+        deferredProjectSnapshot = nil
+        publish([.snapshot(snapshot())])
     }
 
     /// 单个任务的实时更新（阶段二 b 的 app-server 通知会用）。不影响 reconcile 的首次基线判断。

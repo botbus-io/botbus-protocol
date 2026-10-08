@@ -96,7 +96,8 @@ final class CodexConnectorTests: XCTestCase {
 
     private func makeRig(installDefaults: Bool = true, tools: AgentToolsConfiguration? = nil,
                          registry: TaskContextRegistry = TaskContextRegistry(),
-                         sharedDesktop: Bool = false) async -> Rig {
+                         sharedDesktop: Bool = false,
+                         streamInterval: TimeInterval = 0.05) async -> Rig {
         let launcher = FakeCodexLauncher()
         let sleeper = FakeSleeper()
         let server = CodexAppServer(launcher: launcher,
@@ -108,7 +109,7 @@ final class CodexConnectorTests: XCTestCase {
         let connector = CodexConnector(server: server, store: store,
                                        statusObserver: { status in statuses.withLock { $0.append(status) } },
                                        tools: { tools }, registry: registry,
-                                       sharedDesktop: sharedDesktop)
+                                       sharedDesktop: sharedDesktop, streamInterval: streamInterval)
         await connector.start()
 
         var found: FakeCodexProcess?
@@ -816,6 +817,48 @@ final class CodexConnectorTests: XCTestCase {
         XCTAssertEqual(owner, .observer, "轮次结束就把任务交还给只读观察，别跟 CodexObserver 打架")
         let controlled = await rig.server.controlledThreads()
         XCTAssertFalse(controlled.contains("thread-1"), "交还控制后重启不该再 resume 它")
+        await teardown(rig)
+    }
+
+    func testStreamingDeltasAreThrottledAndSettledByTheNextNotification() async throws {
+        let rig = await makeRig(streamInterval: 60)
+        let events = await rig.store.events()
+        let messages = Locked<[String?]>([])
+        let collector = Task {
+            for await event in events where event.task?.id == "codex:thread-1" {
+                messages.withLock { $0.append(event.task?.lastMessage) }
+            }
+        }
+        defer { collector.cancel() }
+        _ = try await rig.connector.start(projectPath: "/tmp/project", prompt: "跑一下")
+        rig.process.deliver(object: ["method": "turn/started",
+                                     "params": ["threadId": "thread-1", "turn": ["id": "turn-1"]]])
+        for delta in ["一", "二", "三", "四"] {
+            rig.process.deliver(object: ["method": "item/agentMessage/delta",
+                                         "params": ["threadId": "thread-1", "itemId": "m1", "delta": delta]])
+        }
+        // 间隔内的 delta 只攒着；下一条别的通知把攒下的整段带出去。
+        rig.process.deliver(object: ["method": "item/started",
+                                     "params": ["threadId": "thread-1", "turnId": "turn-1",
+                                                "item": ["id": "c1", "type": "commandExecution"]]])
+        await assertEventually { await self.task(rig)?.lastMessage == "一二三四" }
+        await assertEventually { messages.current.last == "一二三四" }
+        let streamed = messages.current.compactMap { $0 }
+        XCTAssertEqual(streamed.filter { $0.hasPrefix("一") }, ["一", "一二三四"], "中间的 delta 不该各发一条")
+        await teardown(rig)
+    }
+
+    func testStreamingDeltasFlushAfterTheInterval() async throws {
+        let rig = await makeRig(streamInterval: 0.2)
+        _ = try await rig.connector.start(projectPath: "/tmp/project", prompt: "跑一下")
+        rig.process.deliver(object: ["method": "turn/started",
+                                     "params": ["threadId": "thread-1", "turn": ["id": "turn-1"]]])
+        rig.process.deliver(object: ["method": "item/agentMessage/delta",
+                                     "params": ["threadId": "thread-1", "itemId": "m1", "delta": "正在"]])
+        rig.process.deliver(object: ["method": "item/agentMessage/delta",
+                                     "params": ["threadId": "thread-1", "itemId": "m1", "delta": "看"]])
+        // 后面没有别的通知：到点由定时补写发出去，不能停在第一段。
+        await assertEventually { await self.task(rig)?.lastMessage == "正在看" }
         await teardown(rig)
     }
 

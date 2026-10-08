@@ -64,6 +64,9 @@ public actor CodexConnector: TaskConnector {
     /// 只发图、不写字新建任务时的标题。本连接器之后不再改标题；交还只读观察后，Codex 线程自己的标题会盖掉它。
     static let imageOnlyTitle = "图片"
     public static let messageLimit = 500
+    /// 流式 agent 消息最多隔多久改一次 `lastMessage`。每个 delta 都改的话，每个 token 都是一条 `taskUpdated`：
+    /// Relay 每条都要落一次存储、叫醒所有手机各拉一遍快照。
+    public static let defaultStreamInterval: TimeInterval = 1
     /// `PendingRequest.summary` 的上限：手表上就一行。
     public static let summaryLimit = 200
     /// `PendingRequest.detail` 的上限。整个补丁可能上兆，不能原样塞进 WebSocket 帧。
@@ -183,6 +186,12 @@ public actor CodexConnector: TaskConnector {
     /// itemId → 正在流式拼接的 agent 消息。不进 `LiveThread`：它不影响 `TaskRecord`，
     /// 塞进去会让每个 delta 都变成一次"记录变了"。
     private var messageBuffers: [String: [String: String]] = [:]
+    /// 流式节流（见 `defaultStreamInterval`）：上次因 delta 改 `lastMessage` 的时间、间隔内攒下还没写进记录的
+    /// 最新文本，和到点补写它的定时任务。都按线程记。
+    private let streamInterval: TimeInterval
+    private var streamWrittenAt: [String: Date] = [:]
+    private var pendingStreamText: [String: String] = [:]
+    private var streamFlushes: [String: Task<Void, Never>] = [:]
     private var eventLoop: Task<Void, Never>?
     private var activeCommands = 0
     private var handoffRequested = false
@@ -212,7 +221,8 @@ public actor CodexConnector: TaskConnector {
                 statusObserver: @escaping @Sendable (Status) -> Void = { _ in },
                 tools: @escaping @Sendable () -> AgentToolsConfiguration? = { nil },
                 registry: TaskContextRegistry = TaskContextRegistry(),
-                sharedDesktop: Bool = false) {
+                sharedDesktop: Bool = false,
+                streamInterval: TimeInterval = CodexConnector.defaultStreamInterval) {
         self.server = server
         self.store = store
         self.now = now
@@ -220,6 +230,7 @@ public actor CodexConnector: TaskConnector {
         self.tools = tools
         self.registry = registry
         self.sharedDesktop = sharedDesktop
+        self.streamInterval = streamInterval
     }
 
     // MARK: - 生命周期
@@ -253,6 +264,7 @@ public actor CodexConnector: TaskConnector {
         threads.removeAll()
         order.removeAll()
         messageBuffers.removeAll()
+        dropAllStreams()
         // `CodexAppServer.stop()` 不发 `.exited`（那条只给"自己死掉"的路径），状态得自己收。
         // liveTaskCount 由 updateStatus 自己按账本重算，上面刚清空，这里必然是 0。
         updateStatus {
@@ -579,6 +591,7 @@ public actor CodexConnector: TaskConnector {
            let id = params["threadId"]?.stringValue {
             threads.removeValue(forKey: id)
             order.removeAll { $0 == id }
+            dropStream(id)
             await store.hide(id: Self.protocolId(id))
             return
         }
@@ -600,6 +613,8 @@ public actor CodexConnector: TaskConnector {
             mutate(threadId) { $0.loadedGeneration = generation }
         }
         guard threads[threadId] != nil else { return }
+        // 节流攒下的文本先写进去，再处理别的通知：顺序不乱，后面的 item/completed 照样能盖掉它。
+        if case .agentMessageDelta = notification {} else { settleStream(threadId) }
 
         switch notification {
         case .turnStarted(_, let turnId):
@@ -619,6 +634,7 @@ public actor CodexConnector: TaskConnector {
             await claim(threadId)
         case .turnCompleted(_, let turnId, _, _, _):
             messageBuffers.removeValue(forKey: threadId)
+            dropStream(threadId)
             mutate(threadId) {
                 if turnId.isEmpty || $0.currentTurnId == turnId { $0.currentTurnId = nil }
                 // 往保守的方向收：任何一轮结束都不再算手机的轮次，下一轮要由手机重新起。
@@ -718,6 +734,7 @@ public actor CodexConnector: TaskConnector {
     /// 才是真相，交还给它就行。
     private func handleProcessExit() async {
         messageBuffers.removeAll()
+        dropAllStreams()
         for threadId in order {
             mutate(threadId) {
                 $0.pendingKey = nil
@@ -930,7 +947,58 @@ public actor CodexConnector: TaskConnector {
         text += delta
         buffers[itemId] = text
         messageBuffers[threadId] = buffers
-        mutate(threadId) { $0.lastMessage = CodexThreadReader.truncate(text, limit: Self.messageLimit) }
+        let truncated = CodexThreadReader.truncate(text, limit: Self.messageLimit)
+        let current = now()
+        if let written = streamWrittenAt[threadId], current.timeIntervalSince(written) < streamInterval {
+            pendingStreamText[threadId] = truncated
+            scheduleStreamFlush(threadId, after: streamInterval - current.timeIntervalSince(written))
+            return
+        }
+        streamWrittenAt[threadId] = current
+        mutate(threadId) { $0.lastMessage = truncated }
+    }
+
+    private func scheduleStreamFlush(_ threadId: String, after delay: TimeInterval) {
+        guard streamFlushes[threadId] == nil else { return }
+        streamFlushes[threadId] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(max(0, delay)))
+            guard !Task.isCancelled else { return }
+            await self?.flushStream(threadId)
+        }
+    }
+
+    /// 间隔到点：把攒下的文本写进记录并发出去。这期间没有新的 delta 就什么都不做。
+    private func flushStream(_ threadId: String) async {
+        streamFlushes[threadId] = nil
+        guard applyPendingStream(threadId) else { return }
+        await publish(threadId)
+    }
+
+    /// 别的通知到了：取消定时补写，攒下的文本直接写进记录（随这条通知一起发出去）。
+    private func settleStream(_ threadId: String) {
+        streamFlushes.removeValue(forKey: threadId)?.cancel()
+        _ = applyPendingStream(threadId)
+    }
+
+    private func applyPendingStream(_ threadId: String) -> Bool {
+        guard let text = pendingStreamText.removeValue(forKey: threadId),
+              threads[threadId]?.hasFinalAnswer != true else { return false }
+        streamWrittenAt[threadId] = now()
+        mutate(threadId) { $0.lastMessage = text }
+        return true
+    }
+
+    private func dropStream(_ threadId: String) {
+        streamFlushes.removeValue(forKey: threadId)?.cancel()
+        pendingStreamText.removeValue(forKey: threadId)
+        streamWrittenAt.removeValue(forKey: threadId)
+    }
+
+    private func dropAllStreams() {
+        for flush in streamFlushes.values { flush.cancel() }
+        streamFlushes.removeAll()
+        pendingStreamText.removeAll()
+        streamWrittenAt.removeAll()
     }
 
     private func complete(threadId: String, item: CodexItem) {
@@ -1064,6 +1132,7 @@ public actor CodexConnector: TaskConnector {
               let victim = order.first(where: { $0 != threadId && threads[$0]?.owned != true }) {
             threads.removeValue(forKey: victim)
             messageBuffers.removeValue(forKey: victim)
+            dropStream(victim)
             order.removeAll { $0 == victim }
         }
     }
