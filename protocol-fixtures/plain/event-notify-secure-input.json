@@ -1,0 +1,11 @@
+{
+  "kind": "notify",
+  "notify": {
+    "taskId": "acp:my-agent:7d2e9f10-3c4b-4a5d-8e6f-708192a3b4c5",
+    "category": "TASK_INPUT",
+    "title": "My Agent 在等你回答",
+    "body": "电脑上有个密码框在等着填，可以直接在手机上操作电脑",
+    "kind": "secureInput",
+    "connectorName": "My Agent"
+  }
+}

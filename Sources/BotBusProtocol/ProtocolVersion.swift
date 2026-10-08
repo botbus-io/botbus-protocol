@@ -9,7 +9,7 @@ import Foundation
 ///
 /// 没带版本头的一方按 `legacy` 算：版本头是 2.8 才有的，之前的实现一律视为 2.7。
 public enum ProtocolVersion {
-    public static let current = "3.9"
+    public static let current = "3.10"
     public static let legacy = "2.7"
     /// 本端（Mac、手机、手表）要求 Relay 至少是这个版本。依赖 Relay 新行为的改动发版前，把它抬上去。
     /// 2.10：旧 Relay 会剥掉 TaskRecord / CommandResult 的 systemPermission 字段。
@@ -21,6 +21,7 @@ public enum ProtocolVersion {
     /// （2.15 的 `/agent/devices` 手机表与电脑移除手机一并由这条线盖住。）
     /// 3.7 的 `AgentInfo.workspace` 与工作区端点同样在密文里（端点走远程操作的加密预览），对 Relay 的要求不变。
     /// 3.8 的列表管理与 3.9 的 `restartConnector`、`startTask.newProjectParent` 也都在密文里，最低线不动。
+    /// 3.10 的 `Notify.kind` / `connectorName` / `hasScreenshot`（手机按本机语言拼推送文案）在推送密文里，最低线不动。
     public static let minimumRelay = "3.0"
     /// 要求手机最低版本的电脑（ready 帧带 `minClientProtocol`，协议 3.6；Linux 宿主）要的 Relay 版本。
     /// 更早的 Relay 不认这个字段、也不按组回 412：旧手机见到 `platform: "linux"` 会拒收整份快照，只会一直"正在连接"。

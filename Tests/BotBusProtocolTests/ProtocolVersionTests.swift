@@ -9,7 +9,7 @@ final class ProtocolVersionTests: XCTestCase {
     /// 3.6 的 `minClientProtocol` 只有要求手机版本的电脑（Linux）才发，它们另要 Relay 3.6（`minimumRelayForClientMinimum`）。
     /// 3.7 的失败诊断（密文里的可选字段）、`AgentInfo.workspace` 与工作区端点也都在密文里，最低线不动。
     func testSealedWireRequiresRelayThatSpeaksIt() {
-        XCTAssertEqual(ProtocolVersion.current, "3.9")
+        XCTAssertEqual(ProtocolVersion.current, "3.10")
         XCTAssertEqual(ProtocolVersion.minimumRelay, "3.0")
         XCTAssertEqual(ProtocolVersion.incompatibility(status: 200, relayVersion: "2.14"), .relayOutdated)
         XCTAssertEqual(ProtocolVersion.incompatibility(status: 200, relayVersion: "2.11"), .relayOutdated)

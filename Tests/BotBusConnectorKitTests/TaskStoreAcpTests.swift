@@ -158,5 +158,6 @@ final class TaskStoreAcpTests: XCTestCase {
         let store = makeAcpStore(["my-agent"])
         let events = await store.upsert(acpRecord("my-agent", "s1", status: .completed))
         XCTAssertEqual(events.compactMap(\.notify).map(\.title), ["My Agent 任务完成"])
+        XCTAssertEqual(events.compactMap(\.notify).map(\.connectorName), ["My Agent"])
     }
 }

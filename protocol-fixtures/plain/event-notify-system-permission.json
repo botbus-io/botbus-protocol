@@ -1,0 +1,12 @@
+{
+  "kind": "notify",
+  "notify": {
+    "taskId": "",
+    "category": "TASK_FAILED",
+    "title": "电脑需要系统授权",
+    "body": "任务失败后检测到系统授权弹窗，请到电脑屏幕上查看并处理。 可在 App 中查看截图。",
+    "requestId": "permission-notice-03",
+    "kind": "systemPermission",
+    "hasScreenshot": true
+  }
+}
