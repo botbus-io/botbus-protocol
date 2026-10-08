@@ -81,6 +81,27 @@ final class AcpSessionStateTests: XCTestCase {
         XCTAssertNil(state.record.pendingRequest)
     }
 
+    /// 协议 3.11：工具调用的标题与 kind 都是空白时，摘要才是电脑写的「工具调用」，带短语；标题空串时退到 kind。
+    func testUnnamedToolCallGetsTheToolCallPhrase() throws {
+        var state = fresh()
+        state.beginTurn(prompt: "x", images: [], at: t0)
+        let blank = try XCTUnwrap(AcpPermissionRequest(params: [
+            "sessionId": "s1", "toolCall": ["toolCallId": "call_2", "title": " "],
+            "options": [["optionId": "once", "name": "允许", "kind": "allow_once"]],
+        ]))
+        state.setPending(blank, at: t1)
+        XCTAssertEqual(state.record.pendingRequest?.summary, "工具调用")
+        XCTAssertEqual(state.record.pendingRequest?.summaryPhrase, .toolCall)
+
+        let kindOnly = try XCTUnwrap(AcpPermissionRequest(params: [
+            "sessionId": "s1", "toolCall": ["toolCallId": "call_3", "title": "", "kind": "fetch"],
+            "options": [["optionId": "once", "name": "允许", "kind": "allow_once"]],
+        ]))
+        state.setPending(kindOnly, at: t1)
+        XCTAssertEqual(state.record.pendingRequest?.summary, "fetch")
+        XCTAssertNil(state.record.pendingRequest?.summaryPhrase, "agent 给的 kind 是原文")
+    }
+
     func testTranscriptIdsAreStableAcrossReplay() throws {
         func play(_ state: inout AcpSessionState) throws {
             state.apply(.userMessage(text: "第一问", images: []), at: t0)

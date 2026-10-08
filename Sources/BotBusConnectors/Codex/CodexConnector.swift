@@ -858,32 +858,33 @@ public actor CodexConnector: TaskConnector {
     // MARK: - PendingRequest 的构造
 
     /// 把服务端请求翻成协议里的 `PendingRequest`。**只挑要给用户看的**，原始 params 不外泄。
+    ///
+    /// 电脑写的话（「执行命令：…」「工作目录：…」）先建成短语（协议 3.11），中文的 `summary` / `detail` 由短语拼出来；
+    /// agent 的原话（理由、提问）原样放，摘要是原话时不带 `summaryPhrase`，详情里没有电脑写的话时不带 `detailPhrases`。
     static func pendingRequest(from request: CodexServerRequest, kind: PendingRequest.Kind) -> PendingRequest {
         let reason = nonEmpty(request.params["reason"]?.stringValue)
         switch kind {
         case .command:
-            let command = nonEmpty(request.params["command"]?.stringValue)
-            let summary = command.map { "执行命令：\($0)" } ?? reason ?? "请求执行命令"
-            let detail = [reason, nonEmpty(request.params["cwd"]?.stringValue).map { "工作目录：\($0)" }]
-                .compactMap { $0 }.joined(separator: "\n")
-            return PendingRequest(id: request.key, kind: .command,
-                                  summary: clampLine(summary, limit: summaryLimit),
-                                  detail: nonEmpty(detail).map { clampBlock($0, limit: detailLimit) })
+            let command = nonEmpty(request.params["command"]?.stringValue).map { clampLine($0, limit: summaryLimit) }
+            let summaryPhrase = command.map(RequestPhrase.runCommand) ?? (reason == nil ? .requestCommand : nil)
+            let detail = [reason.map { RequestPhrase.text(clampBlock($0, limit: detailLimit)) },
+                          nonEmpty(request.params["cwd"]?.stringValue).map(RequestPhrase.workingDirectory)]
+                .compactMap { $0 }
+            return makeRequest(request, kind: .command, summary: summaryPhrase?.chineseText ?? reason ?? "",
+                               summaryPhrase: summaryPhrase, detail: detail)
         case .fileChange:
             let paths = request.fileChanges.map { URL(fileURLWithPath: $0.path).lastPathComponent }
-            let summary = paths.isEmpty
-                ? (reason ?? "请求修改文件")
-                : "修改 \(paths.count) 个文件：\(paths.joined(separator: "、"))"
+            let summaryPhrase = paths.isEmpty ? (reason == nil ? RequestPhrase.requestFileChange : nil) : .editFiles(paths)
             let diffs = request.fileChanges.map { "--- \($0.path) (\($0.kind))\n\($0.diff)" }
                 .joined(separator: "\n")
             return PendingRequest(id: request.key, kind: .fileChange,
-                                  summary: clampLine(summary, limit: summaryLimit),
-                                  detail: nonEmpty(diffs).map { clampBlock($0, limit: detailLimit) } ?? reason)
+                                  summary: clampLine(summaryPhrase?.chineseText ?? reason ?? "", limit: summaryLimit),
+                                  detail: nonEmpty(diffs).map { clampBlock($0, limit: detailLimit) } ?? reason,
+                                  summaryPhrase: summaryPhrase)
         case .permission:
-            return PendingRequest(id: request.key, kind: .permission,
-                                  summary: clampLine(reason ?? "请求额外权限", limit: summaryLimit),
-                                  detail: nonEmpty(describePermissions(request.params["permissions"]))
-                                      .map { clampBlock($0, limit: detailLimit) })
+            let summaryPhrase = reason == nil ? RequestPhrase.requestExtraPermissions : nil
+            return makeRequest(request, kind: .permission, summary: summaryPhrase?.chineseText ?? reason ?? "",
+                               summaryPhrase: summaryPhrase, detail: permissionPhrases(request.params["permissions"]))
         case .input:
             let questions = request.params["questions"]?.arrayValue ?? []
             let first = questions.first
@@ -891,16 +892,27 @@ public actor CodexConnector: TaskConnector {
             let header = nonEmpty(first?["header"]?.stringValue)
             let options = (first?["options"]?.arrayValue ?? [])
                 .compactMap { $0["label"]?.stringValue }
-            var detail = options.isEmpty ? "" : "可选项：\(options.joined(separator: "、"))"
-            if questions.count > 1 {
-                detail = detail.isEmpty ? "还有 \(questions.count - 1) 个问题" : detail + "\n还有 \(questions.count - 1) 个问题"
-            }
-            return PendingRequest(id: request.key, kind: .input,
-                                  summary: clampLine(header ?? question ?? "Codex 在等你回答", limit: summaryLimit),
-                                  detail: nonEmpty(detail).map { clampBlock($0, limit: detailLimit) },
-                                  question: question.map { clampBlock($0, limit: detailLimit) },
-                                  questions: pendingQuestions(questions))
+            let summaryPhrase = (header ?? question) == nil ? RequestPhrase.awaitingAnswer(agent: "Codex") : nil
+            var detail: [RequestPhrase] = []
+            if !options.isEmpty { detail.append(.options(options)) }
+            if questions.count > 1 { detail.append(.moreQuestions(questions.count - 1)) }
+            var pending = makeRequest(request, kind: .input, summary: header ?? question ?? summaryPhrase?.chineseText ?? "",
+                                      summaryPhrase: summaryPhrase, detail: detail)
+            pending.question = question.map { clampBlock($0, limit: detailLimit) }
+            pending.questions = pendingQuestions(questions)
+            return pending
         }
+    }
+
+    /// 摘要截成一行；详情由短语拼出中文，详情里只有 agent 原话（`text`）时不带短语——原文就是它。
+    private static func makeRequest(_ request: CodexServerRequest, kind: PendingRequest.Kind, summary: String,
+                                    summaryPhrase: RequestPhrase?, detail: [RequestPhrase]) -> PendingRequest {
+        let localizable = detail.contains { $0.kind != .text }
+        return PendingRequest(id: request.key, kind: kind,
+                              summary: clampLine(summary, limit: summaryLimit),
+                              detail: detail.isEmpty ? nil : clampBlock(detail.chineseText, limit: detailLimit),
+                              summaryPhrase: summaryPhrase,
+                              detailPhrases: localizable ? detail : nil)
     }
 
     /// `requestUserInput` 的问题 → 协议 2.14 的 `questions`，好让手机点选。Codex 的问题没有多选；
@@ -921,19 +933,19 @@ public actor CodexConnector: TaskConnector {
     }
 
     /// `RequestPermissionProfile` 的一句人话。只读字段名与路径，不带任何会话内容。
-    static func describePermissions(_ value: JSONValue?) -> String {
-        var lines: [String] = []
+    static func permissionPhrases(_ value: JSONValue?) -> [RequestPhrase] {
+        var phrases: [RequestPhrase] = []
         if let network = value?["network"], !network.isNull {
-            lines.append(network["enabled"]?.boolValue == true ? "网络访问" : "网络策略调整")
+            phrases.append(network["enabled"]?.boolValue == true ? .networkAccess : .networkPolicy)
         }
         if let fileSystem = value?["fileSystem"], !fileSystem.isNull {
-            for (label, key) in [("读取", "read"), ("写入", "write")] {
+            for (phrase, key) in [(RequestPhrase.readPaths, "read"), (RequestPhrase.writePaths, "write")] {
                 let paths = (fileSystem[key]?.arrayValue ?? []).compactMap { $0.stringValue }
                 guard !paths.isEmpty else { continue }
-                lines.append("\(label)：\(paths.joined(separator: "、"))")
+                phrases.append(phrase(paths))
             }
         }
-        return lines.joined(separator: "\n")
+        return phrases
     }
 
     // MARK: - agent 消息的累积

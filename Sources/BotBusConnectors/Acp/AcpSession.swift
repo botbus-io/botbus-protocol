@@ -234,11 +234,14 @@ struct AcpSessionState: Hashable, Sendable {
         if pending == nil { statusBeforePending = record.status }
         pending = request
         record.status = .waitingApproval
+        // 摘要是 agent 给这次调用起的名字（或它的 kind）；都没有时才是电脑写的「工具调用」（协议 3.11 带短语）。
+        let named = [call.title, call.kind].lazy.compactMap { $0.map(Self.singleLine) }.first { !$0.isEmpty }
+        let phrase = named == nil ? RequestPhrase.toolCall : nil
         record.pendingRequest = PendingRequest(
             id: call.toolCallId, kind: call.pendingKind,
-            summary: SessionFormatting.truncate(Self.singleLine(call.title ?? call.kind ?? "工具调用"), Self.summaryLimit),
+            summary: SessionFormatting.truncate(named ?? phrase?.chineseText ?? "", Self.summaryLimit),
             detail: call.detail.map { SessionFormatting.truncate($0, SessionFormatting.detailLimit) },
-            questions: request.pendingQuestions)
+            questions: request.pendingQuestions, summaryPhrase: phrase)
         record.updatedAt = timestamp
     }
 

@@ -103,12 +103,19 @@ final class DshTaskMappingTests: XCTestCase {
         let command = DshTaskMapping.pendingRequest(bash, live: live)
         XCTAssertEqual(command?.status, .waitingApproval)
         XCTAssertEqual(command?.request, PendingRequest(id: "e1", kind: .command, summary: "执行命令：rm -rf build ls",
-                                                        detail: "需要网络"))
+                                                        detail: "需要网络", summaryPhrase: .runCommand("rm -rf build ls")))
         // 没见过这次调用：退成 permission，摘要是理由。
         let unknown = DshTaskMapping.pendingRequest(
             DshWaterfall(eventId: "e2", sessionId: "s", request: .approval(toolName: "bash", callId: "zz", reason: nil)), live: live)
         XCTAssertEqual(unknown?.request.kind, .permission)
         XCTAssertEqual(unknown?.request.summary, "bash 请求授权")
+        XCTAssertEqual(unknown?.request.summaryPhrase, .requestPermission(tool: "bash"))
+        // 有理由时摘要是 dsh 的原话，不带短语。
+        let reasoned = DshTaskMapping.pendingRequest(
+            DshWaterfall(eventId: "e3", sessionId: "s", request: .approval(toolName: "bash", callId: "zz", reason: "写到工作区外")),
+            live: live)
+        XCTAssertEqual(reasoned?.request.summary, "写到工作区外")
+        XCTAssertNil(reasoned?.request.summaryPhrase)
         // 很长的参数截到 2000。
         var big = DshLiveState()
         big.apply(DshSessionEvent(type: "tool/call", seq: 1, time: now, data: [

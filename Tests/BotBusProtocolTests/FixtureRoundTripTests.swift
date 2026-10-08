@@ -62,6 +62,7 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(Snapshot.self, "plain/snapshot-dsh.json"),
         roundTripCase(Snapshot.self, "plain/snapshot-linux-host.json"),
         roundTripCase(Snapshot.self, "plain/snapshot-auto-approve.json"),
+        roundTripCase(Snapshot.self, "plain/snapshot-request-phrases.json"),
     ] }
 
     private static var taskCases: [FixtureCase] { [
@@ -128,6 +129,7 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(Event.self, "plain/event-notify-approval-kind.json"),
         roundTripCase(Event.self, "plain/event-notify-secure-input.json"),
         roundTripCase(Event.self, "plain/event-notify-system-permission.json"),
+        roundTripCase(Event.self, "plain/event-notify-approval-phrase.json"),
         roundTripCase(Event.self, "plain/event-task-messages.json"),
         roundTripCase(Event.self, "plain/event-task-messages-with-attachments.json"),
     ] }
@@ -186,6 +188,7 @@ final class FixtureRoundTripTests: XCTestCase {
         "invalid/command-missing-agent-id.json",
         "invalid/event-payload-mismatch.json",
         "plain/invalid/pending-request-bad-kind.json",
+        "plain/invalid/pending-request-phrase-missing-kind.json",
         "plain/invalid/pending-question-missing-options.json",
         "plain/invalid/agent-info-bad-connector-kind.json",
         "plain/invalid/artifact-bad-kind.json",
@@ -287,6 +290,93 @@ final class FixtureRoundTripTests: XCTestCase {
         let legacy = Notify.done(taskId: "codex:x", title: "t", body: "b")
         let json = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(legacy)) as! [String: Any]
         XCTAssertEqual(json.keys.sorted(), ["body", "category", "taskId", "title"])
+    }
+
+    /// 协议 3.11：审批摘要的短语是开集，不认得的种类原样往返；没带短语的请求与推送编码时也不凭空多出键。
+    func testRequestPhrasesRoundTripAndAreAnOpenSet() throws {
+        let snapshot = try decodeFixture(Snapshot.self, "plain/snapshot-request-phrases.json")
+        let command = try XCTUnwrap(snapshot.tasks.first?.pendingRequest)
+        XCTAssertEqual(command.summaryPhrase, .runCommand("rm -rf build/"))
+        XCTAssertEqual(command.detailPhrases, [.text("先清掉旧的构建产物"), .workingDirectory("/Users/demo/Projects/demo-app")])
+        let files = try XCTUnwrap(snapshot.tasks[1].pendingRequest?.summaryPhrase)
+        XCTAssertEqual(files.kind, .editFiles)
+        XCTAssertEqual(files.itemCount, 23)
+        XCTAssertTrue(files.isTruncated)
+        XCTAssertNil(snapshot.tasks[1].pendingRequest?.detailPhrases, "详情是 diff 原文时不带短语")
+        let notify = try XCTUnwrap(decodeFixture(Event.self, "plain/event-notify-approval-phrase.json").notify)
+        XCTAssertEqual(notify.bodyPhrase, .runCommand("rm -rf build/"))
+
+        let future = Data(#"{"count":2,"kind":"diskFull","text":"/Volumes/Data"}"#.utf8)
+        let decoded = try ProtocolJSON.decoder().decode(RequestPhrase.self, from: future)
+        XCTAssertEqual(decoded.kind, .unknown("diskFull"))
+        XCTAssertFalse(decoded.isComplete, "不认得的种类写不出来")
+        XCTAssertEqual(try ProtocolJSON.encoder().encode(decoded), future)
+
+        let legacy = PendingRequest(id: "r", kind: .command, summary: "ls")
+        let json = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(legacy)) as! [String: Any]
+        XCTAssertEqual(json.keys.sorted(), ["id", "kind", "summary"])
+    }
+
+    /// 每种短语要的参数缺了就写不出来（手机整段退回原文）；没有参数的种类总能写。
+    func testRequestPhraseCompleteness() {
+        XCTAssertTrue(RequestPhrase.runCommand("ls").isComplete)
+        XCTAssertFalse(RequestPhrase(kind: .runCommand).isComplete)
+        XCTAssertFalse(RequestPhrase.runCommand("").isComplete)
+        XCTAssertFalse(RequestPhrase(kind: .text).isComplete)
+        XCTAssertFalse(RequestPhrase(kind: .awaitingAnswer).isComplete)
+        XCTAssertFalse(RequestPhrase(kind: .workingDirectory).isComplete)
+        XCTAssertFalse(RequestPhrase(kind: .editFiles).isComplete)
+        XCTAssertFalse(RequestPhrase(kind: .editFiles, items: []).isComplete)
+        XCTAssertTrue(RequestPhrase.editFiles(["a.swift"]).isComplete)
+        XCTAssertFalse(RequestPhrase(kind: .readPaths).isComplete)
+        XCTAssertFalse(RequestPhrase(kind: .options, items: []).isComplete)
+        XCTAssertFalse(RequestPhrase(kind: .moreQuestions).isComplete)
+        XCTAssertFalse(RequestPhrase.moreQuestions(0).isComplete)
+        XCTAssertTrue(RequestPhrase.moreQuestions(2).isComplete)
+        for phrase in [RequestPhrase.requestCommand, .requestFileChange, .requestPermission(), .requestExtraPermissions,
+                       .toolCall, .networkAccess, .networkPolicy] {
+            XCTAssertTrue(phrase.isComplete, phrase.kind.rawValue)
+        }
+        // 文件名超过上限只留前面的，总数记在 count 里；没超时不写 count。
+        let many = RequestPhrase.editFiles((1...25).map { "f\($0).swift" })
+        XCTAssertEqual(many.items?.count, RequestPhrase.maxItems)
+        XCTAssertEqual(many.count, 25)
+        XCTAssertNil(RequestPhrase.editFiles(["a", "b"]).count)
+        XCTAssertFalse(RequestPhrase.editFiles(["a", "b"]).isTruncated)
+    }
+
+    /// 一组原文连起来不超过 `maxItemsLength`：个数没到上限也会少留几个，至少留一个（太长就截断）；所有列表种类同一规则。
+    func testListsStayWithinTheirLengthBudget() throws {
+        let long = (1...10).map { "/Users/demo/Projects/demo-app/\(String(repeating: "目录", count: 10))/\($0)" }
+        for phrase in [RequestPhrase.readPaths(long), .writePaths(long), .options(long), .editFiles(long)] {
+            let items = try XCTUnwrap(phrase.items)
+            XCTAssertLessThan(items.count, 10, phrase.kind.rawValue)
+            XCTAssertLessThanOrEqual(items.joined(separator: "、").count, RequestPhrase.maxItemsLength)
+            XCTAssertEqual(phrase.count, 10)
+            XCTAssertTrue(phrase.isTruncated)
+        }
+        let huge = RequestPhrase.readPaths([String(repeating: "x", count: 500), "/b"])
+        XCTAssertEqual(huge.items?.count, 1)
+        XCTAssertEqual(huge.items?.first?.count, RequestPhrase.maxItemsLength)
+        XCTAssertTrue(huge.items?.first?.hasSuffix("…") ?? false)
+        XCTAssertEqual(huge.count, 2)
+        XCTAssertEqual(RequestPhrase.workingDirectory(String(repeating: "d", count: 5000)).text?.count, RequestPhrase.maxTextLength)
+    }
+
+    /// 线上写法钉死：手写的 switch 里写错一个字母，往返测试不一定发现（读写同错），这里逐个核对。
+    func testRequestPhraseKindRawValuesArePinned() {
+        let kinds: [(RequestPhrase.Kind, String)] = [
+            (.text, "text"), (.runCommand, "runCommand"), (.requestCommand, "requestCommand"),
+            (.editFiles, "editFiles"), (.requestFileChange, "requestFileChange"),
+            (.requestPermission, "requestPermission"), (.requestExtraPermissions, "requestExtraPermissions"),
+            (.toolCall, "toolCall"), (.awaitingAnswer, "awaitingAnswer"), (.workingDirectory, "workingDirectory"),
+            (.networkAccess, "networkAccess"), (.networkPolicy, "networkPolicy"), (.readPaths, "readPaths"),
+            (.writePaths, "writePaths"), (.options, "options"), (.moreQuestions, "moreQuestions"),
+        ]
+        for (kind, wire) in kinds {
+            XCTAssertEqual(kind.rawValue, wire)
+            XCTAssertEqual(RequestPhrase.Kind(rawValue: wire), kind)
+        }
     }
 
     func testNotifyKindRawValuesAndCategoriesArePinned() {
@@ -507,6 +597,10 @@ final class FixtureRoundTripTests: XCTestCase {
 
     func testPendingRequestBadKindIsRejected() throws {
         XCTAssertThrowsError(try decodeFixture(TaskRecord.self, "plain/invalid/pending-request-bad-kind.json"))
+    }
+
+    func testRequestPhraseWithoutKindIsRejected() throws {
+        XCTAssertThrowsError(try decodeFixture(TaskRecord.self, "plain/invalid/pending-request-phrase-missing-kind.json"))
     }
 
     func testQuestionWithoutOptionsIsRejected() throws {

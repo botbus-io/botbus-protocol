@@ -31,15 +31,27 @@ public struct PendingRequest: Codable, Hashable, Sendable {
     /// （OpenClaw 的只这一次 / 以后都允许、ACP 的 `allow_once` / `allow_always`）：
     /// 客户端默认选第一个，「批准」带 `answers`，「拒绝」照旧不带；旧客户端不带 `answers` 时 Agent 取第一个。
     public var questions: [PendingQuestion]?
+    /// 协议 3.11：`summary` 是由哪一句话拼的（见 `RequestPhrase`），手机据此用自己的语言重写。
+    /// 摘要是 agent 的原话（Claude 的工具名、Codex 的理由、提问的标签）时省略，手机照原样显示 `summary`。
+    public var summaryPhrase: RequestPhrase?
+    /// 协议 3.11：`detail` 逐行由哪些话拼的（按行的顺序，`\n` 连接；agent 的原话是 `text`）。
+    /// 只在详情里有电脑写的中文时才带；1–`maxDetailPhrases` 句，省略时手机照原样显示 `detail`。
+    public var detailPhrases: [RequestPhrase]?
+
+    /// `detailPhrases` 的上限，生产方负责截断。
+    public static let maxDetailPhrases = 8
 
     public init(id: String, kind: Kind, summary: String, detail: String? = nil, question: String? = nil,
-                questions: [PendingQuestion]? = nil) {
+                questions: [PendingQuestion]? = nil, summaryPhrase: RequestPhrase? = nil,
+                detailPhrases: [RequestPhrase]? = nil) {
         self.id = id
         self.kind = kind
         self.summary = summary
         self.detail = detail
         self.question = question
         self.questions = questions
+        self.summaryPhrase = summaryPhrase
+        self.detailPhrases = detailPhrases
     }
 }
 

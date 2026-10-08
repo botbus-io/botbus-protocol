@@ -73,7 +73,8 @@ public actor OpenClawConnector: TaskConnector {
     struct Approval: Sendable, Equatable {
         var id: String
         var sessionKey: String
-        var command: String
+        /// 要执行的命令原文；Gateway 没给时为 nil（卡片上写「请求执行命令」）。
+        var command: String?
         var cwd: String?
         var createdAt: Date
         var expiresAt: Date?
@@ -407,7 +408,7 @@ public actor OpenClawConnector: TaskConnector {
             .lazy.compactMap({ $0?.stringValue }).first(where: { !$0.isEmpty }) else { return nil }
         let argv = request["commandArgv"]?.arrayValue?.compactMap(\.stringValue).joined(separator: " ")
         let command = [request["command"]?.stringValue, plan?["commandText"]?.stringValue, argv]
-            .lazy.compactMap { $0?.trimmed }.first { !$0.isEmpty } ?? "执行命令"
+            .lazy.compactMap { $0?.trimmed }.first { !$0.isEmpty }
         let cwd = [request["cwd"]?.stringValue, plan?["cwd"]?.stringValue].lazy.compactMap { $0 }.first { !$0.isEmpty }
         let expiresAt = date(payload["expiresAtMs"])
         if let expiresAt, expiresAt <= now { return nil }
@@ -428,11 +429,17 @@ public actor OpenClawConnector: TaskConnector {
         } else if status == .completed, current.timeIntervalSince(session.updatedAt) > SessionFormatting.idleAfter {
             status = .idle
         }
-        let pending = approval.map {
-            PendingRequest(id: $0.id, kind: .command,
-                           summary: SessionFormatting.truncate($0.command, Self.pendingSummaryLimit),
-                           detail: $0.cwd.map { SessionFormatting.truncate("目录：\($0)", SessionFormatting.detailLimit) },
-                           questions: [Self.scopeQuestion])
+        // 摘要是命令原文；Gateway 没给命令时是电脑写的「请求执行命令」，详情「工作目录：…」也是电脑写的（协议 3.11 带短语）。
+        let pending = approval.map { approval in
+            let summaryPhrase = approval.command == nil ? RequestPhrase.requestCommand : nil
+            let directory = approval.cwd.map { RequestPhrase.workingDirectory(SessionFormatting.truncate($0, SessionFormatting.detailLimit)) }
+            return PendingRequest(id: approval.id, kind: .command,
+                                  summary: SessionFormatting.truncate(approval.command ?? summaryPhrase?.chineseText ?? "",
+                                                                      Self.pendingSummaryLimit),
+                                  detail: directory.map { SessionFormatting.truncate($0.chineseText, SessionFormatting.detailLimit) },
+                                  questions: [Self.scopeQuestion],
+                                  summaryPhrase: summaryPhrase,
+                                  detailPhrases: directory.map { [$0] })
         }
         return TaskRecord(id: taskId(for: session.key),
                           agentId: "",

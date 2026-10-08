@@ -1199,6 +1199,7 @@ public actor TaskStore {
     ///
     /// 标题正文写的是简体中文，给 3.9 及更早的手机；3.10 起另带 `kind` 与 `connectorName`，
     /// 新手机按自己的界面语言拼标题与固定说明，agent 说的话（`body`）照原样显示。
+    /// 3.11 起正文是电脑写的请求摘要时另带 `bodyPhrase`，手机连正文也按自己的语言写。
     private func notification(for task: TaskRecord) -> Notify? {
         let current = now()
         guard let key = Self.notificationKey(task) else { return nil }
@@ -1213,16 +1214,20 @@ public actor TaskStore {
             guard let request = task.pendingRequest else { return nil }
             notify = .approval(taskId: task.id, requestId: request.id, title: "\(label) 等待审批", body: request.summary)
             notify.kind = .approval
+            notify.bodyPhrase = Self.bodyPhrase(request.summaryPhrase)
         case .waitingInput:
             // agent 停下来等人，而电脑上此刻正好有个密码框聚焦着——这基本就是「它自己填不了，
             // 要人来输」。这时顺手把远程操作开起来，并在通知里说明可以直接在手机上处理。
             // 判据刻意取 Secure Input 而不是猜消息内容：它由应用自己打开，不会误判，也不分语言。
             let needsHands = remoteControlProbe?() ?? false
+            let question = task.pendingRequest?.question
             notify = .input(taskId: task.id, title: "\(label) 在等你回答",
                             body: needsHands
                                 ? "电脑上有个密码框在等着填，可以直接在手机上操作电脑"
-                                : (task.pendingRequest?.question ?? task.pendingRequest?.summary ?? task.title))
+                                : (question ?? task.pendingRequest?.summary ?? task.title))
             notify.kind = needsHands ? .secureInput : .input
+            // 正文是请求摘要时带上它的短语（协议 3.11），手机按自己的语言写；问题原文与任务标题不带。
+            if !needsHands, question == nil { notify.bodyPhrase = Self.bodyPhrase(task.pendingRequest?.summaryPhrase) }
             if needsHands { onRemoteControlNeeded?(task.id) }
         case .completed:
             notify = .done(taskId: task.id, title: "\(label) 任务完成", body: task.lastMessage ?? task.title)
@@ -1236,6 +1241,17 @@ public actor TaskStore {
         notify.connectorName = label
         lastNotified[task.id] = (key, current)
         return notify
+    }
+
+    /// 推送正文的短语编码后最多多少字节。推送密文要塞进 APNs / FCM 的 4 KB，短语超了就不带，手机照旧显示中文的 `body`；
+    /// 连接器经 `RequestPhrase` 的构造器建的摘要短语（一行、列表有总长上限）远小于它，这只是兜底。
+    static let bodyPhraseBudget = 1024
+
+    private static func bodyPhrase(_ phrase: RequestPhrase?) -> RequestPhrase? {
+        guard let phrase, let data = try? ProtocolJSON.encoder().encode(phrase), data.count <= bodyPhraseBudget else {
+            return nil
+        }
+        return phrase
     }
 
     /// 推送标题里的来源名。ACP agent（协议 2.13）共用一个来源，名字各不相同：用注册表里它的显示名，

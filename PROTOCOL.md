@@ -1,6 +1,6 @@
 # BotBus 协议
 
-版本 **3.10**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
+版本 **3.11**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
 
 Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，Kotlin 实现（Android）是 `Protocol.kt`，密封层在同目录的 `Sealing.kt` / `SealedTypes.kt`。在 app 仓库里它们分别位于 `Packages/BotBusProtocol`、`relay/src/protocol.ts` 与 `android/core/src/main/kotlin/io/botbus/core/`；公开仓库 `botbus-io/botbus-protocol` 由 app 仓库自动同步，前两者在那里是 `Sources/BotBusProtocol` 与 `src/protocol.ts`。三端都必须通过 `protocol-fixtures/` 下全部样本的往返测试，且拒绝 `invalid/` 下的样本：顶层是线上的密封形状，`plain/` 是密文里的明文结构（见文末「Fixture 与类型对应」）。Swift 中 `Task` 命名为 `TaskRecord`。
 
@@ -11,7 +11,7 @@ Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，K
 | 总则 | Snapshot / Event / Command 三种载体、端到端加密、WebSocket 帧、版本握手、Relay HTTP 一览 |
 | 一、电脑与连接器 | AgentInfo、ConnectorInfo、ModelOption、Project、`setConnectorEnabled`、`restartConnector` |
 | 二、任务与状态 | Task、TaskStatus、`startTask` / `followUp` / `interrupt` |
-| 三、审批与提问 | PendingRequest、PendingQuestion、`approve`、SystemPermissionNotice |
+| 三、审批与提问 | PendingRequest、PendingQuestion、RequestPhrase（3.11）、`approve`、SystemPermissionNotice |
 | 四、对话与附件 | Message、MessageAttachment、MessageFileRef、TaskMessages、`fetchMessages` / `fetchFile` |
 | 五、产物与文件 | Artifact、产物字节的加密、WorkingChanges、`fetchChanges` |
 | 六、屏幕共享与远程操作 | `remoteControl`、远程操作的加密、「操作电脑」工作区（3.7）、预览主机与隧道 |
@@ -337,11 +337,41 @@ TaskStatus：`running` 有轮次进行中；`waitingApproval` 有 pendingRequest
 
 ### PendingRequest 与 PendingQuestion
 
-PendingRequest：`id` string，`kind` `command` \| `fileChange` \| `permission` \| `input`，`summary` string（一行），`detail` string?（截断 2000 字），`question` string?（kind = input 时 agent 的提问），`questions` [PendingQuestion]?（2.14 起，1–8 道：kind = input 时是要用户回答的问题；挂在审批上时是「允许」的几种范围，见下）。
+PendingRequest：`id` string，`kind` `command` \| `fileChange` \| `permission` \| `input`，`summary` string（一行），`detail` string?（截断 2000 字），`question` string?（kind = input 时 agent 的提问），`questions` [PendingQuestion]?（2.14 起，1–8 道：kind = input 时是要用户回答的问题；挂在审批上时是「允许」的几种范围，见下），`summaryPhrase` RequestPhrase?、`detailPhrases` [RequestPhrase]?（3.11 起，见下「审批摘要的短语」）。
 
 PendingQuestion（2.14）：`id` string（同一请求内唯一，作 `approve.answers` 的键；Claude 是问题下标 `"0"`、`"1"`…，Codex 是它自己的问题 id），`question` string，`header` string?（短标签），`multiSelect` `true`?（单选时整个键省略），`options` [{`label` string, `description` string?}]（最多 16 个，可以为空——只能打字答的问题）。有 `questions` 时 `question` 仍是写好选项的纯文字，给不认新字段的旧客户端看。客户端在**每道题都有选项**时画点选，选好后发 `approve {decision: allow, answers}`，`deny` 表示跳过不答；也可以照旧 `followUp` 一段文字，Agent 把它当作所有问题的回答（带图的 `followUp` 此时被拒，免得图被丢掉）。Claude 的 AskUserQuestion 经 `PermissionRequest` hook 到达，Agent 把它记为 `waitingInput`（不再是要批准的 `permission`），回答写进 hook 的 `updatedInput.answers`（问题原文 → label，多选用 `, ` 连接），与电脑上的提问框先答者生效；`allow` 却没带任何认得的答案时回 `ok: false`，请求继续挂着。
 
 审批（kind = `command` / `fileChange` / `permission`）也可以带 `questions`：那是「允许」的几种范围，不是要回答的问题——OpenClaw 的 exec 审批带一道单选 `scope`（「只这一次」/「以后都允许」，后者写进它的白名单）；ACP 的 `session/request_permission` 把 agent 的 `allow_once` / `allow_always` 选项按这个顺序列出（拒绝类的不列，那是「拒绝」按钮；agent 一个允许选项都没给时不带 `questions`）。客户端照旧显示命令与「拒绝」/「批准」，选项默认选第一个（第一个总是最保守的一次性允许），「批准」带 `answers`，「拒绝」不带；`answers` 缺失或认不出时 Agent 按第一个选项处理，所以旧客户端点「批准」的效果和 2.13 之前完全一样。
+
+### 审批摘要的短语（3.11）
+
+`summary` / `detail` 由连接器生成，里面有电脑写的简体中文（「执行命令：<命令>」「修改 2 个文件：…」「工作目录：…」）。3.11 起电脑另报拼这些话用的**短语**，手机按自己的界面语言重写；中文原文照写，留给 3.10 及更早的手机：
+
+- `summaryPhrase` RequestPhrase?：`summary` 是由哪一句话拼的。摘要是 agent 的原话（Claude 的工具名 `Bash`、Codex 与 DeepSeek Harness 给的理由、提问的短标签、ACP 工具调用的标题或 kind、OpenClaw 的命令原文）时省略。
+- `detailPhrases` [RequestPhrase]?（1–8 句）：`detail` 逐行由哪些话拼的，按行的顺序、`\n` 连接；agent 的原话是 `text` 一句。只在详情里有电脑写的话时才带——详情是补丁、工具参数这类原文时省略。
+
+RequestPhrase：`kind` string（开集），`text` string?，`items` [string]?（1–20 个），`count` integer?（≥ 0）。参数是 agent 或电脑上的原文（命令、路径、文件名、agent 名），手机不翻译它们。生产方负责截断（Swift 的构造器已经做了）：命令、路径、工具名、agent 名这类单段原文最多 1000 字；`items` 按顺序留到 20 个、连起来（每个之间算一个分隔字）不超过 200 字为止，至少留一个（太长就截断）。`items` 丢过时 `count` 记总数，两端写句子都在列表末尾加「…」——审批的范围不能被悄悄藏起来。
+
+| kind | 参数 | 简体中文（电脑写进 `summary` / `detail` 的原文，也是手机词条的 key） | 谁在用 |
+|---|---|---|---|
+| `text` | `text` | 原样 | 详情里 agent 的原话（Codex 的理由） |
+| `runCommand` | `text`：命令（一行） | 执行命令：<命令> | Codex、DeepSeek Harness |
+| `requestCommand` | — | 请求执行命令 | Codex、OpenClaw 没给命令时 |
+| `editFiles` | `items`：文件名（最后一段）；`count`：总数，省略 = `items` 的个数 | 修改 <n> 个文件：<a>、<b>（`count` 大于 `items` 的个数时列表末尾加「…」，下面几种列表同样） | Codex |
+| `requestFileChange` | — | 请求修改文件 | Codex 没说改哪些文件时 |
+| `requestPermission` | `text`?：工具名 | <工具> 请求授权；没有工具名时「请求权限」 | DeepSeek Harness、Claude 没有工具名时 |
+| `requestExtraPermissions` | — | 请求额外权限 | Codex 的 permissions 请求 |
+| `toolCall` | — | 工具调用 | ACP 工具调用没有标题时 |
+| `awaitingAnswer` | `text`：agent 名 | <agent> 在等你回答 | 提问没有标签也没有问题文字时 |
+| `workingDirectory` | `text`：路径 | 工作目录：<路径> | Codex、OpenClaw 的详情 |
+| `networkAccess` / `networkPolicy` | — | 网络访问 / 网络策略调整 | Codex permissions 的详情 |
+| `readPaths` / `writePaths` | `items`：路径；`count`：总数 | 读取：<a>、<b> / 写入：<a>、<b> | 同上 |
+| `options` | `items`：选项名；`count`：总数 | 可选项：<a>、<b> | Codex 提问的详情 |
+| `moreQuestions` | `count` ≥ 1 | 还有 <n> 个问题 | 同上 |
+
+- 手机写摘要：`summaryPhrase` 认得、参数齐全（`text` 非空、`items` 非空、`count` ≥ 1，各按上表）时按本机语言写，否则显示 `summary`。写详情：`detailPhrases` **每一句**都写得出时逐行写，有一句写不出就整段显示 `detail`，不拼半段。规则在 ClientCore 的 `RequestPhraseText` 与 Android 的同名文件里，审批卡、手表、推送正文（见「七、通知」的 `bodyPhrase`）共用。
+- 电脑先建短语，再用 ConnectorKit 的 `RequestPhrase.chineseText` 拼出中文，两份说的是同一件事；手机 zh-Hans 的词条 key 就是这份原文，中文手机看到的与电脑写的一字不差。
+- 还没覆盖的电脑写的中文：审批「允许范围」的选项名（OpenClaw 的「只这一次」「以后都允许」，手机以 `approve.answers` 原样回传这个名字，要改得先给选项加 id），以及只给不认 `questions` 的旧手机看的 `question` 纯文字（「（可多选）」）。
 
 ### 项目级自动批准（3.3）
 
@@ -687,14 +717,14 @@ WebSocket（三期）的细节：
 
 ### Notify
 
-Notify：`taskId` string，`category` `TASK_APPROVAL` \| `TASK_INPUT` \| `TASK_DONE` \| `TASK_FAILED`，`title` string，`body` string，`requestId` string?（TASK_APPROVAL 必填，Relay 收到时校验信封外面那一份），`agentName` string?（3.0 起：发通知的电脑名，由 Mac 在密封前填上，Relay 读不到），`kind` string?、`connectorName` string?、`hasScreenshot` boolean?（3.10 起，见下）。
+Notify：`taskId` string，`category` `TASK_APPROVAL` \| `TASK_INPUT` \| `TASK_DONE` \| `TASK_FAILED`，`title` string，`body` string，`requestId` string?（TASK_APPROVAL 必填，Relay 收到时校验信封外面那一份），`agentName` string?（3.0 起：发通知的电脑名，由 Mac 在密封前填上，Relay 读不到），`kind` string?、`connectorName` string?、`hasScreenshot` boolean?（3.10 起，见下），`bodyPhrase` RequestPhrase?（3.11 起，见下）。
 
 `title` / `body` 是电脑写好的简体中文。3.10 起电脑另报通知**种类** `kind`，手机按自己的界面语言拼标题与固定说明（iPhone 的通知扩展与 Android 用同一套规则）；`title` / `body` 照写，留给旧手机。`kind` 是开集，每种只配一个类别：
 
 | `kind` | `category` | 手机写的标题 | 手机写的正文 |
 |---|---|---|---|
-| `approval` | TASK_APPROVAL | 「<connectorName> 等待审批」 | `body`（请求摘要，原样） |
-| `input` | TASK_INPUT | 「<connectorName> 在等你回答」 | `body`（问题，原样） |
+| `approval` | TASK_APPROVAL | 「<connectorName> 等待审批」 | 请求摘要：有 `bodyPhrase` 时按它写（3.11），否则 `body` 原样 |
+| `input` | TASK_INPUT | 「<connectorName> 在等你回答」 | 问题（`body` 原样）；没有问题文字、正文是请求摘要时同 `approval` |
 | `secureInput` | TASK_INPUT | 同 `input` | 固定说明：电脑上有个密码框在等着填，可以直接在手机上操作电脑（见「远程操作」的 Secure Input） |
 | `done` | TASK_DONE | 「<connectorName> 任务完成」 | `body`（最后一条消息，原样） |
 | `failed` | TASK_FAILED | 「<connectorName> 任务失败」 | `body`（最后一条消息，原样） |
@@ -703,7 +733,8 @@ Notify：`taskId` string，`category` `TASK_APPROVAL` \| `TASK_INPUT` \| `TASK_D
 - `connectorName`：标题里的 agent 名（`Codex`、`Claude`、ACP agent 在注册表里的显示名），品牌名不翻译；随 `systemPermission` 以外的种类。缺了或是空白时手机标题退回 `title`。
 - `hasScreenshot`：只随 `systemPermission`，电脑截到了弹窗（截图在 `Task` / `CommandResult.systemPermission` 里）；只写 true 或省略。
 - 手机不认得的 `kind`、`kind` 与 `category` 对不上、或没有 `kind`（3.9 及更早的电脑）时，照旧显示 `title` / `body`。
-- 除 `secureInput` / `systemPermission` 的固定说明外，`body` 一律原样显示。提问与最后一条消息是 agent 的原话；审批摘要（`PendingRequest.summary`）由连接器生成，有的带电脑写的中文（Codex 的「执行命令：<命令>」「修改 N 个文件：…」、没有原话时的「请求额外权限」等），3.10 不翻译它们——App 里待审批卡片显示的也是同一段摘要。
+- `bodyPhrase`（3.11）：只随 `approval` / `input`，且 `body` 就是那条请求的 `summary` 时，带上它的 `summaryPhrase`（见「审批摘要的短语」）；手机照审批卡的规则写正文，写不出时显示 `body`。正文是问题原文、最后一条消息时不带。推送密文要塞进 APNs / FCM 的 4 KB，短语编码后超过 1 KB 时电脑不带它（按上面的截断规则建的摘要短语远小于这个数）。
+- 除上面这些，`body` 一律原样显示：提问与最后一条消息是 agent 的原话。3.10 的电脑不带 `bodyPhrase`，审批摘要照旧是电脑写的中文。
 
 ### 推送
 
@@ -779,6 +810,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - 终端（「操作电脑」第二期，2026-10）**不改版本号**：管理端点与 `/term/attach` 都在 3.7 的工作区加密预览里，Relay 不变；手机按 `/status.features` 里的 `terminal` 判断，旧手机不认它、照常只有文件与屏幕。
 - 「操作电脑」第三期（不改版本号）：Linux / Windows 宿主也报 `AgentInfo.workspace`（文件与终端，没有屏幕；`capabilities` 不变）；工作区补上 Windows 的路径写法与「此电脑」（空串）、失败码 `noTrash`（开集，旧手机按 `failed`）、目录项的 `undecodable`（可选，旧手机忽略）。三条最低线与宿主的 `minClientProtocol` 都不动；3.7–3.8 的手机连 Windows 宿主时路径的面包屑与「上一级」不完整（见计划 `docs/superpowers/plans/2026-10-04-remote-workspace-3-hosts.md` 关键决定 1）。
 - 版本 3.10 让**推送按手机的语言显示**：`Notify` 加 `kind`（开集：`approval` / `input` / `secureInput` / `done` / `failed` / `systemPermission`）、`connectorName` 与 `hasScreenshot`，手机按种类用本机语言拼标题与固定说明，电脑照旧写中文的 `title` / `body` 给旧手机（见「七、通知」）。都在推送密文里，Relay 只改版本号，三条最低线不动；新电脑配旧手机、旧电脑配新手机都显示原来的中文。
+- 版本 3.11 让**审批摘要按手机的语言显示**：`PendingRequest` 加 `summaryPhrase` / `detailPhrases`、`Notify` 加 `bodyPhrase`（类型 `RequestPhrase`，`kind` 开集），连接器写的「执行命令：…」「工作目录：…」等由手机用本机语言重写，agent 的原话照旧（见「审批摘要的短语」）。电脑照旧写中文的 `summary` / `detail` / `body` 给旧手机；短语里不认得或缺参数的，手机整段退回中文原文。都在密文里，Relay 只改版本号，三条最低线不动。
 
 ## 附录 B：Fixture 与类型对应
 
@@ -810,6 +842,8 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | event-notify-approval-kind.json | Event notify（3.10 带 `kind: approval` 与 `connectorName`） |
 | event-notify-secure-input.json | Event notify（3.10 `secureInput`，ACP agent 的显示名） |
 | event-notify-system-permission.json | Event notify（3.10 `systemPermission`，`taskId` 为空、带 `hasScreenshot`） |
+| event-notify-approval-phrase.json | Event notify（3.11 审批推送带 `bodyPhrase: runCommand`） |
+| snapshot-request-phrases.json | Snapshot（3.11 审批摘要的短语：Codex 的命令带理由与工作目录、改 23 个文件只列 2 个、额外权限、提问的选项与其余问题数，DeepSeek Harness 的「bash 请求授权」） |
 | frame-agent-event.json | AgentFrame |
 | frame-agent-ready.json | AgentReadyFrame（Mac 的 ready 帧，不带 `minClientProtocol`） |
 | frame-agent-ready-min-client.json | AgentReadyFrame（3.6 带 `minClientProtocol: "3.5"`，Linux 宿主） |
@@ -875,6 +909,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | invalid/command-missing-agent-id.json | 必须被拒绝：Command 缺少必填的 agentId |
 | invalid/event-payload-mismatch.json | 必须被拒绝：Event 的 kind 与配套字段不匹配 |
 | invalid/pending-request-bad-kind.json | 必须被拒绝 |
+| invalid/pending-request-phrase-missing-kind.json | 必须被拒绝：`summaryPhrase` 缺 `kind`（3.11） |
 | invalid/agent-info-bad-connector-kind.json | 必须被拒绝：未知 connector kind |
 | invalid/artifact-bad-kind.json | 必须被拒绝：未知 artifact kind |
 | invalid/client-frame-payload-mismatch.json | 必须被拒绝：ClientFrame 的 type 与配套字段不匹配 |

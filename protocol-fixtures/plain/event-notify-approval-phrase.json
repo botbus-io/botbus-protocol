@@ -1,0 +1,17 @@
+{
+  "kind": "notify",
+  "notify": {
+    "taskId": "codex:01a0b000-0000-7000-8000-000000000011",
+    "category": "TASK_APPROVAL",
+    "title": "Codex 等待审批",
+    "body": "执行命令：rm -rf build/",
+    "requestId": "req-11",
+    "agentName": "Demo 的 MacBook Pro",
+    "kind": "approval",
+    "connectorName": "Codex",
+    "bodyPhrase": {
+      "kind": "runCommand",
+      "text": "rm -rf build/"
+    }
+  }
+}
