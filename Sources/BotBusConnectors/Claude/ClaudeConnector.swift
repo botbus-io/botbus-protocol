@@ -474,14 +474,18 @@ public actor ClaudeConnector: TaskConnector {
             if let asked {
                 session.status = .waitingInput
                 session.pendingRequest = PendingRequest(id: requestID, kind: .input, summary: asked.summary,
-                                                        question: asked.plainText, questions: asked.questions)
+                                                        question: asked.plainText, questions: asked.questions,
+                                                        summaryPhrase: asked.summaryPhrase)
             } else {
                 session.status = .waitingApproval
+                // 摘要是工具名（`Bash`、`Edit`）；hook 没给工具名时才是电脑写的「请求权限」（协议 3.11 带短语）。
+                let summaryPhrase = toolName == nil ? RequestPhrase.requestPermission() : nil
                 session.pendingRequest = PendingRequest(
                     id: requestID,
                     kind: .permission,
-                    summary: toolName ?? "请求权限",
-                    detail: detail.map { String($0.prefix(Self.detailLimit)) })
+                    summary: toolName ?? summaryPhrase?.chineseText ?? "",
+                    detail: detail.map { String($0.prefix(Self.detailLimit)) },
+                    summaryPhrase: summaryPhrase)
             }
         }
     }

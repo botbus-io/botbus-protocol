@@ -1,0 +1,21 @@
+{
+  "id": "codex:phrase-missing-kind",
+  "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+  "source": "codex",
+  "title": "摘要短语缺种类",
+  "projectPath": "/Users/me/Projects/x",
+  "projectName": "x",
+  "status": "waitingApproval",
+  "pendingRequest": {
+    "id": "req-x",
+    "kind": "command",
+    "summary": "执行命令：ls",
+    "summaryPhrase": {
+      "text": "ls"
+    }
+  },
+  "origin": "desktop",
+  "controllable": true,
+  "startedAt": "2026-09-17T08:00:00Z",
+  "updatedAt": "2026-09-17T08:00:00Z"
+}

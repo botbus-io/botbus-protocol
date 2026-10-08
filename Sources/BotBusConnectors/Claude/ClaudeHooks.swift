@@ -374,11 +374,19 @@ public struct ClaudeAskedQuestions: Sendable, Equatable {
         self.texts = texts
     }
 
-    /// 一行摘要：第一个问题的短标签，没有就用问题本身。
+    /// 一行摘要：第一个问题的短标签，没有就用问题本身；都是空白时「Claude 在等你回答」（`summaryPhrase`）。
     public var summary: String {
+        summaryPhrase?.chineseText ?? String(firstLine.prefix(120))
+    }
+
+    /// 协议 3.11：摘要是电脑写的那句话时的短语；摘要是问题原文时为 nil。
+    public var summaryPhrase: RequestPhrase? {
+        firstLine.isEmpty ? .awaitingAnswer(agent: "Claude") : nil
+    }
+
+    private var firstLine: String {
         let first = questions[0]
-        let line = (first.header ?? first.question).split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
-        return line.isEmpty ? "Claude 在提问" : String(line.prefix(120))
+        return (first.header ?? first.question).split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
     }
 
     /// 写好选项的纯文字，给不认 `questions` 的旧手机和手表看（它们只会画 `question`）。

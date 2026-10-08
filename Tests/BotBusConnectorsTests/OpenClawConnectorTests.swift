@@ -199,8 +199,9 @@ final class OpenClawConnectorTests: XCTestCase {
         let waiting = try XCTUnwrap(waitingFound)
         XCTAssertEqual(waiting.status, .waitingApproval)
         XCTAssertEqual(waiting.pendingRequest, PendingRequest(id: "ap-1", kind: .command, summary: "rm -rf build",
-                                                              detail: "目录：/Users/me/proj",
-                                                              questions: [OpenClawConnector.scopeQuestion]))
+                                                              detail: "工作目录：/Users/me/proj",
+                                                              questions: [OpenClawConnector.scopeQuestion],
+                                                              detailPhrases: [.workingDirectory("/Users/me/proj")]))
 
         let outcome = try await connector.approve(taskId: id, requestId: "ap-1", decision: .allow)
         XCTAssertEqual(outcome, ConnectorOutcome(taskId: id, retainsLiveOwnership: true))
@@ -244,6 +245,18 @@ final class OpenClawConnectorTests: XCTestCase {
 
     /// 首屏是基线：7 天内已完成 / 失败 / 等审批的会话一条都不推（正文是各渠道私聊的预览）；
     /// 之后真正发生的状态变化照常推。
+    /// Gateway 没给命令时不编一个出来：`command` 为 nil，卡片上是电脑写的「请求执行命令」（协议 3.11 带短语）。
+    func testApprovalWithoutCommandKeepsCommandEmpty() throws {
+        let now = Date()
+        let bare = try XCTUnwrap(OpenClawConnector.approval(from: ["id": "ap-9", "request": ["sessionKey": "agent:main:main"]],
+                                                             now: now))
+        XCTAssertNil(bare.command)
+        let argv = try XCTUnwrap(OpenClawConnector.approval(from: [
+            "id": "ap-10", "request": ["sessionKey": "agent:main:main", "commandArgv": ["git", "push"]],
+        ], now: now))
+        XCTAssertEqual(argv.command, "git push")
+    }
+
     func testBootstrapIsSilentButLaterTransitionsNotify() async throws {
         let server = FakeOpenClawServer()
         server.rows = [

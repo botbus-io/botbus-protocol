@@ -215,7 +215,8 @@ enum DshTaskMapping {
     /// 审批与提问（协议 2.14 的 `questions`）。`PendingRequest.id` 用 waterfall 的 `eventId`——回答就靠它。
     ///
     /// - 审批：bash 一类工具、且 follow 流里见过这次调用的 `command` 时记 `command`（摘要「执行命令：…」，详情是 dsh 给的理由）；
-    ///   其余记 `permission`（摘要是理由，详情是参数原文）。dsh 的审批只有"允许这一次 / 拒绝"，不带「允许范围」。
+    ///   其余记 `permission`（摘要是理由，没有理由时「<工具> 请求授权」，详情是参数原文）。电脑写的摘要带协议 3.11 的短语。
+    ///   dsh 的审批只有"允许这一次 / 拒绝"，不带「允许范围」。
     /// - 提问：`input`，`questions` 照搬（选项只有名字）；`question` 是写好选项的纯文字，给不认 `questions` 的旧手机看。
     static func pendingRequest(_ waterfall: DshWaterfall, live: DshLiveState?) -> (status: TaskStatus, request: PendingRequest)? {
         switch waterfall.request {
@@ -224,24 +225,28 @@ enum DshTaskMapping {
             let tool = toolName ?? call?.name
             let reasonLine = reason.map(AcpSessionState.singleLine).flatMap { $0.isEmpty ? nil : $0 }
             if isCommandTool(tool), let command = call?.command {
+                let phrase = RequestPhrase.runCommand(SessionFormatting.truncate(AcpSessionState.singleLine(command), summaryLimit))
                 return (.waitingApproval, PendingRequest(
                     id: waterfall.eventId, kind: .command,
-                    summary: SessionFormatting.truncate("执行命令：\(AcpSessionState.singleLine(command))", summaryLimit),
-                    detail: reason.map { SessionFormatting.truncate($0, SessionFormatting.detailLimit) }))
+                    summary: SessionFormatting.truncate(phrase.chineseText, summaryLimit),
+                    detail: reason.map { SessionFormatting.truncate($0, SessionFormatting.detailLimit) },
+                    summaryPhrase: phrase))
             }
-            let summary = reasonLine ?? "\(tool ?? "工具") 请求授权"
+            let phrase = reasonLine == nil ? RequestPhrase.requestPermission(tool: tool) : nil
             return (.waitingApproval, PendingRequest(
                 id: waterfall.eventId, kind: .permission,
-                summary: SessionFormatting.truncate(summary, summaryLimit),
-                detail: (call?.arguments ?? reason).map { SessionFormatting.truncate($0, SessionFormatting.detailLimit) }))
+                summary: SessionFormatting.truncate(reasonLine ?? phrase?.chineseText ?? "", summaryLimit),
+                detail: (call?.arguments ?? reason).map { SessionFormatting.truncate($0, SessionFormatting.detailLimit) },
+                summaryPhrase: phrase))
         case .questions(let questions):
             let mapped = pendingQuestions(questions)
             guard let mapped, let first = mapped.first else { return nil }
             let line = AcpSessionState.singleLine(first.header ?? first.question)
+            let phrase = line.isEmpty ? RequestPhrase.awaitingAnswer(agent: "DeepSeek Harness") : nil
             return (.waitingInput, PendingRequest(
                 id: waterfall.eventId, kind: .input,
-                summary: SessionFormatting.truncate(line.isEmpty ? "DeepSeek Harness 在等你回答" : line, summaryLimit),
-                question: plainText(mapped), questions: mapped))
+                summary: SessionFormatting.truncate(phrase?.chineseText ?? line, summaryLimit),
+                question: plainText(mapped), questions: mapped, summaryPhrase: phrase))
         case .other:
             return nil
         }
