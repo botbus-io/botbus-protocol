@@ -70,6 +70,9 @@ const SCHEMA: Record<string, ZodType> = {
   "event-notify-failed.json": P.SealedEvent,
   "event-notify-input.json": P.SealedEvent,
   "event-notify.json": P.SealedEvent,
+  "event-notify-approval-kind.json": P.SealedEvent,
+  "event-notify-secure-input.json": P.SealedEvent,
+  "event-notify-system-permission.json": P.SealedEvent,
   "event-snapshot.json": P.SealedEvent,
   "event-task-messages-with-attachments.json": P.SealedEvent,
   "event-task-messages.json": P.SealedEvent,
@@ -196,6 +199,9 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "event-notify-done.json": P.Event,
   "event-notify-input.json": P.Event,
   "event-notify-failed.json": P.Event,
+  "event-notify-approval-kind.json": P.Event,
+  "event-notify-secure-input.json": P.Event,
+  "event-notify-system-permission.json": P.Event,
   "event-task-messages.json": P.Event,
   "event-task-messages-with-attachments.json": P.Event,
   "frame-agent-event.json": PlainAgentFrame,
@@ -243,9 +249,9 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
 describe("fixture 目录与对照表一一对应", () => {
   it("每个 valid fixture 都在 SCHEMA / PLAIN_SCHEMA 表里，且表里没有已删除的文件", () => {
     expect([...validFixtures.keys()].sort()).toEqual(Object.keys(SCHEMA).sort());
-    expect(validFixtures.size).toBe(83);
+    expect(validFixtures.size).toBe(86);
     expect([...plainFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_SCHEMA).sort());
-    expect(plainFixtures.size).toBe(76);
+    expect(plainFixtures.size).toBe(79);
   });
   it("每个 invalid fixture 都在 MUST_REJECT / PLAIN_MUST_REJECT 表里", () => {
     expect([...invalidFixtures.keys()].sort()).toEqual(Object.keys(MUST_REJECT).sort());
@@ -508,6 +514,11 @@ describe("protocol schemas reject bad input", () => {
     const { requestId: _omitted, ...withoutRequestId } = eventNotify.notify!;
     expect(P.Notify.safeParse(withoutRequestId).success).toBe(false);
     expect(P.Notify.safeParse(eventNotifyDone.notify).success).toBe(true);
+  });
+  it("3.10 的 Notify.kind 是开集：不认得的种类原样透传", () => {
+    const future = { ...eventNotifyDone.notify!, kind: "diskFull", connectorName: "Codex" };
+    expect(P.Notify.parse(future)).toEqual(future);
+    expect(P.Notify.safeParse({ ...eventNotifyDone.notify!, hasScreenshot: "yes" }).success).toBe(false);
   });
   it("command whose payload does not match kind", () => {
     expect(P.Command.safeParse({ ...commandApprove, kind: "interrupt" }).success).toBe(false);

@@ -1,6 +1,6 @@
 # BotBus 协议
 
-版本 **3.9**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
+版本 **3.10**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
 
 Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，Kotlin 实现（Android）是 `Protocol.kt`，密封层在同目录的 `Sealing.kt` / `SealedTypes.kt`。在 app 仓库里它们分别位于 `Packages/BotBusProtocol`、`relay/src/protocol.ts` 与 `android/core/src/main/kotlin/io/botbus/core/`；公开仓库 `botbus-io/botbus-protocol` 由 app 仓库自动同步，前两者在那里是 `Sources/BotBusProtocol` 与 `src/protocol.ts`。三端都必须通过 `protocol-fixtures/` 下全部样本的往返测试，且拒绝 `invalid/` 下的样本：顶层是线上的密封形状，`plain/` 是密文里的明文结构（见文末「Fixture 与类型对应」）。Swift 中 `Task` 命名为 `TaskRecord`。
 
@@ -355,7 +355,7 @@ PendingQuestion（2.14）：`id` string（同一请求内唯一，作 `approve.a
 
 ### SystemPermissionNotice
 
-2.10 起，Agent 在任务或命令执行失败后检测到系统授权弹窗时，随 `Task.systemPermission` 或 `CommandResult.systemPermission` 返回一次检测证据，并发一条提醒手机回电脑处理的 `TASK_FAILED` 通知；同一弹窗的额外通知按 id 去重。任务尚未创建（没有 `taskId`）时也可通过命令结果返回，通知的 `taskId` 为 `""`，点开只进入 App 首页。它不证明弹窗导致了失败，也不表示弹窗当前仍在等待处理；不能据此生成 `pendingRequest`、改成 `waitingApproval` 或提供远程批准操作。客户端提供本地化说明，提示用户回电脑确认；`dialogText` 保留电脑系统弹窗原文。
+2.10 起，Agent 在任务或命令执行失败后检测到系统授权弹窗时，随 `Task.systemPermission` 或 `CommandResult.systemPermission` 返回一次检测证据，并发一条提醒手机回电脑处理的 `TASK_FAILED` 通知（3.10 起种类是 `systemPermission`，手机用本机语言写标题正文）；同一弹窗的额外通知按 id 去重。任务尚未创建（没有 `taskId`）时也可通过命令结果返回，通知的 `taskId` 为 `""`，点开只进入 App 首页。它不证明弹窗导致了失败，也不表示弹窗当前仍在等待处理；不能据此生成 `pendingRequest`、改成 `waitingApproval` 或提供远程批准操作。客户端提供本地化说明，提示用户回电脑确认；`dialogText` 保留电脑系统弹窗原文。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -461,7 +461,7 @@ ChangedFile：`path` string（相对 `directory`）；`oldPath` string?（改名
 
 输入默认锁着，要在手机上显式解锁，闲置 10 分钟自动锁回；能看是无害的，能打字不是。注入走 `CGEvent` 的 `.cghidEventTap`，网页登录框、1Password 原生弹窗、`sudo` 提示都收得到——**Chrome 的密码框会打开 macOS 的 Secure Input，但它挡的是监听不是注入**，远程输密码因此成立。**TCC 授权弹窗按不动**（macOS 不允许合成事件点权限授权框），只能读出来给人看，必须本人回电脑处理，这也是 `SystemPermissionNotice` 一直只做提示的原因。
 
-Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时，Mac 会自动开一份挂在那条任务上的远程操作预览，`TASK_INPUT` 通知的正文随之改成「电脑上有个密码框在等着填，可以直接在手机上操作电脑」。判据取 Secure Input 而不是猜消息内容：由应用自己打开，不会误判，也不分语言。没有辅助功能权限时不自动开。
+Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时，Mac 会自动开一份挂在那条任务上的远程操作预览，`TASK_INPUT` 通知的正文随之改成「电脑上有个密码框在等着填，可以直接在手机上操作电脑」（3.10 起通知种类是 `secureInput`，手机用本机语言写这句，见「七、通知」）。判据取 Secure Input 而不是猜消息内容：由应用自己打开，不会误判，也不分语言。没有辅助功能权限时不自动开。
 
 ### 远程操作
 
@@ -687,13 +687,29 @@ WebSocket（三期）的细节：
 
 ### Notify
 
-Notify：`taskId` string，`category` `TASK_APPROVAL` \| `TASK_INPUT` \| `TASK_DONE` \| `TASK_FAILED`，`title` string，`body` string，`requestId` string?（TASK_APPROVAL 必填，Relay 收到时校验信封外面那一份），`agentName` string?（3.0 起：发通知的电脑名，由 Mac 在密封前填上，Relay 读不到）。
+Notify：`taskId` string，`category` `TASK_APPROVAL` \| `TASK_INPUT` \| `TASK_DONE` \| `TASK_FAILED`，`title` string，`body` string，`requestId` string?（TASK_APPROVAL 必填，Relay 收到时校验信封外面那一份），`agentName` string?（3.0 起：发通知的电脑名，由 Mac 在密封前填上，Relay 读不到），`kind` string?、`connectorName` string?、`hasScreenshot` boolean?（3.10 起，见下）。
+
+`title` / `body` 是电脑写好的简体中文。3.10 起电脑另报通知**种类** `kind`，手机按自己的界面语言拼标题与固定说明（iPhone 的通知扩展与 Android 用同一套规则）；`title` / `body` 照写，留给旧手机。`kind` 是开集，每种只配一个类别：
+
+| `kind` | `category` | 手机写的标题 | 手机写的正文 |
+|---|---|---|---|
+| `approval` | TASK_APPROVAL | 「<connectorName> 等待审批」 | `body`（请求摘要，原样） |
+| `input` | TASK_INPUT | 「<connectorName> 在等你回答」 | `body`（问题，原样） |
+| `secureInput` | TASK_INPUT | 同 `input` | 固定说明：电脑上有个密码框在等着填，可以直接在手机上操作电脑（见「远程操作」的 Secure Input） |
+| `done` | TASK_DONE | 「<connectorName> 任务完成」 | `body`（最后一条消息，原样） |
+| `failed` | TASK_FAILED | 「<connectorName> 任务失败」 | `body`（最后一条消息，原样） |
+| `systemPermission` | TASK_FAILED | 固定说明：电脑需要系统授权 | 固定说明：任务失败后检测到系统授权弹窗……；`hasScreenshot: true` 时多一句「可在 App 中查看截图」 |
+
+- `connectorName`：标题里的 agent 名（`Codex`、`Claude`、ACP agent 在注册表里的显示名），品牌名不翻译；随 `systemPermission` 以外的种类。缺了或是空白时手机标题退回 `title`。
+- `hasScreenshot`：只随 `systemPermission`，电脑截到了弹窗（截图在 `Task` / `CommandResult.systemPermission` 里）；只写 true 或省略。
+- 手机不认得的 `kind`、`kind` 与 `category` 对不上、或没有 `kind`（3.9 及更早的电脑）时，照旧显示 `title` / `body`。
+- 除 `secureInput` / `systemPermission` 的固定说明外，`body` 一律原样显示。提问与最后一条消息是 agent 的原话；审批摘要（`PendingRequest.summary`）由连接器生成，有的带电脑写的中文（Codex 的「执行命令：<命令>」「修改 N 个文件：…」、没有原话时的「请求额外权限」等），3.10 不翻译它们——App 里待审批卡片显示的也是同一段摘要。
 
 ### 推送
 
-Relay 发给 APNs 的只有 `aps.alert.loc-key`（按类别选一句固定文案，key 是简体中文原文：`有任务在等你审批`、`有任务在等你回复`、`任务完成了`、`任务失败了`，app 的词条表里有各语言译文）、`mutable-content: 1`、`category`、`thread-id`，以及顶层的 `taskId`、`requestId?`、`agentId`、`sealed`。iPhone 的通知服务扩展用 `K_notify` 解开 `sealed`，换上电脑发来的标题、正文与电脑名（`Notify.agentName`）；解不开或没有扩展（手表）时停在固定文案。
+Relay 发给 APNs 的只有 `aps.alert.loc-key`（按类别选一句固定文案，key 是简体中文原文：`有任务在等你审批`、`有任务在等你回复`、`任务完成了`、`任务失败了`，app 的词条表里有各语言译文）、`mutable-content: 1`、`category`、`thread-id`，以及顶层的 `taskId`、`requestId?`、`agentId`、`sealed`。iPhone 的通知服务扩展用 `K_notify` 解开 `sealed`，换上标题、正文（3.10 起按 `Notify.kind` 用手机的语言写，见上）与电脑名（`Notify.agentName`）；解不开或没有扩展（手表）时停在固定文案。
 
-Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先级 data message，保留 600 秒。`message.data` 只有字符串 `agentId`、`taskId`、`category`、可选 `requestId` 和 `sealed`；标题、正文和电脑名仍在 `K_notify` 密文里，Relay 和 Firebase 都读不到。Android 在本机核对信封外字段与解密结果后才显示系统通知；解不开时不显示。收到第一条有效 FCM 消息之前，Android 每 15 分钟查一次快照作为后备提醒；Relay 没配 FCM 凭据时也能提醒。
+Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先级 data message，保留 600 秒。`message.data` 只有字符串 `agentId`、`taskId`、`category`、可选 `requestId` 和 `sealed`；标题、正文和电脑名仍在 `K_notify` 密文里，Relay 和 Firebase 都读不到。Android 在本机核对信封外字段与解密结果后才显示系统通知，标题与正文的规则同 iPhone；解不开时不显示。收到第一条有效 FCM 消息之前，Android 每 15 分钟查一次快照作为后备提醒；Relay 没配 FCM 凭据时也能提醒。
 
 ## 八、配对、凭据与设备
 
@@ -762,6 +778,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - 版本 3.9 加入**手机上的 Agent 管理**与**新建项目选位置**：`restartConnector` 命令与 `AgentInfo.canRestartConnectors`（手机的「停止 / 启动」沿用 2.x 起就有的 `setConnectorEnabled`）；`startTask.newProjectParent` 与 `AgentInfo.canChooseProjectParent`。都在密文里，新命令与新字段只发给声明支持的电脑，旧端忽略能力字段；Relay 只改版本号，三条最低线不动。
 - 终端（「操作电脑」第二期，2026-10）**不改版本号**：管理端点与 `/term/attach` 都在 3.7 的工作区加密预览里，Relay 不变；手机按 `/status.features` 里的 `terminal` 判断，旧手机不认它、照常只有文件与屏幕。
 - 「操作电脑」第三期（不改版本号）：Linux / Windows 宿主也报 `AgentInfo.workspace`（文件与终端，没有屏幕；`capabilities` 不变）；工作区补上 Windows 的路径写法与「此电脑」（空串）、失败码 `noTrash`（开集，旧手机按 `failed`）、目录项的 `undecodable`（可选，旧手机忽略）。三条最低线与宿主的 `minClientProtocol` 都不动；3.7–3.8 的手机连 Windows 宿主时路径的面包屑与「上一级」不完整（见计划 `docs/superpowers/plans/2026-10-04-remote-workspace-3-hosts.md` 关键决定 1）。
+- 版本 3.10 让**推送按手机的语言显示**：`Notify` 加 `kind`（开集：`approval` / `input` / `secureInput` / `done` / `failed` / `systemPermission`）、`connectorName` 与 `hasScreenshot`，手机按种类用本机语言拼标题与固定说明，电脑照旧写中文的 `title` / `body` 给旧手机（见「七、通知」）。都在推送密文里，Relay 只改版本号，三条最低线不动；新电脑配旧手机、旧电脑配新手机都显示原来的中文。
 
 ## 附录 B：Fixture 与类型对应
 
@@ -790,6 +807,9 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | event-notify-done.json | Event |
 | event-notify-input.json | Event |
 | event-notify-failed.json | Event |
+| event-notify-approval-kind.json | Event notify（3.10 带 `kind: approval` 与 `connectorName`） |
+| event-notify-secure-input.json | Event notify（3.10 `secureInput`，ACP agent 的显示名） |
+| event-notify-system-permission.json | Event notify（3.10 `systemPermission`，`taskId` 为空、带 `hasScreenshot`） |
 | frame-agent-event.json | AgentFrame |
 | frame-agent-ready.json | AgentReadyFrame（Mac 的 ready 帧，不带 `minClientProtocol`） |
 | frame-agent-ready-min-client.json | AgentReadyFrame（3.6 带 `minClientProtocol: "3.5"`，Linux 宿主） |

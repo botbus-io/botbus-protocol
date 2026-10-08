@@ -547,6 +547,16 @@ export const Notify = z
     requestId: z.string().optional(),
     /** 协议 3.0：发通知的电脑名。整条 Notify 在密文里，由 Mac 自己填，给 iPhone 的通知扩展显示。 */
     agentName: z.string().optional(),
+    /**
+     * 协议 3.10：通知种类，手机据此按自己的语言拼标题与固定说明（`title` / `body` 是给旧手机的中文原文）。
+     * approval / input / secureInput / done / failed / systemPermission；开集：任何字符串都透传（与 Swift / Kotlin 一致），
+     * 手机不认得、或与 category 对不上时照旧显示 title / body。
+     */
+    kind: z.string().optional(),
+    /** 协议 3.10：标题里的 agent 名（Codex、Claude、ACP agent 的显示名），随 systemPermission 以外的种类。 */
+    connectorName: z.string().optional(),
+    /** 协议 3.10：只随 systemPermission：电脑截到了弹窗，App 里能看。只写 true 或省略。 */
+    hasScreenshot: z.boolean().optional(),
   })
   .superRefine((n, ctx) => {
     if (n.category === "TASK_APPROVAL" && n.requestId === undefined) {

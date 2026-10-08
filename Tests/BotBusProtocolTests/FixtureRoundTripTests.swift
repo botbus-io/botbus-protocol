@@ -125,6 +125,9 @@ final class FixtureRoundTripTests: XCTestCase {
         roundTripCase(Event.self, "plain/event-notify-done.json"),
         roundTripCase(Event.self, "plain/event-notify-input.json"),
         roundTripCase(Event.self, "plain/event-notify-failed.json"),
+        roundTripCase(Event.self, "plain/event-notify-approval-kind.json"),
+        roundTripCase(Event.self, "plain/event-notify-secure-input.json"),
+        roundTripCase(Event.self, "plain/event-notify-system-permission.json"),
         roundTripCase(Event.self, "plain/event-task-messages.json"),
         roundTripCase(Event.self, "plain/event-task-messages-with-attachments.json"),
     ] }
@@ -264,6 +267,39 @@ final class FixtureRoundTripTests: XCTestCase {
         XCTAssertFalse(plainJSON.keys.contains("diagnosis"))
         let bare = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(FailureDiagnosis.projectMissing)) as! [String: Any]
         XCTAssertEqual(bare.keys.sorted(), ["kind"])
+    }
+
+    /// 协议 3.10：推送的种类是开集，不认得的值原样往返；旧电脑不写这三个键，编码时也不凭空多出来。
+    func testNotifyKindRoundTripsAndIsAnOpenSet() throws {
+        let secure = try XCTUnwrap(decodeFixture(Event.self, "plain/event-notify-secure-input.json").notify)
+        XCTAssertEqual(secure.kind, .secureInput)
+        XCTAssertEqual(secure.connectorName, "My Agent")
+        let permission = try XCTUnwrap(decodeFixture(Event.self, "plain/event-notify-system-permission.json").notify)
+        XCTAssertEqual(permission.kind, .systemPermission)
+        XCTAssertEqual(permission.hasScreenshot, true)
+
+        let future = Data(#"{"body":"b","category":"TASK_DONE","kind":"diskFull","taskId":"codex:x","title":"t"}"#.utf8)
+        let decoded = try ProtocolJSON.decoder().decode(Notify.self, from: future)
+        XCTAssertEqual(decoded.kind, .unknown("diskFull"))
+        XCTAssertNil(decoded.kind?.category)
+        XCTAssertEqual(try ProtocolJSON.encoder().encode(decoded), future)
+
+        let legacy = Notify.done(taskId: "codex:x", title: "t", body: "b")
+        let json = try JSONSerialization.jsonObject(with: ProtocolJSON.encoder().encode(legacy)) as! [String: Any]
+        XCTAssertEqual(json.keys.sorted(), ["body", "category", "taskId", "title"])
+    }
+
+    func testNotifyKindRawValuesAndCategoriesArePinned() {
+        let kinds: [(Notify.Kind, String, Notify.Category)] = [
+            (.approval, "approval", .taskApproval), (.input, "input", .taskInput),
+            (.secureInput, "secureInput", .taskInput), (.done, "done", .taskDone),
+            (.failed, "failed", .taskFailed), (.systemPermission, "systemPermission", .taskFailed),
+        ]
+        for (kind, wire, category) in kinds {
+            XCTAssertEqual(kind.rawValue, wire)
+            XCTAssertEqual(Notify.Kind(rawValue: wire), kind)
+            XCTAssertEqual(kind.category, category)
+        }
     }
 
     /// 线上写法钉死：手写的 switch 里写错一个字母，往返测试不一定发现（读写同错），这里逐个核对。

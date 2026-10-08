@@ -1,0 +1,9 @@
+{
+  "kind": "notify",
+  "notify": {
+    "taskId": "acp:my-agent:7d2e9f10-3c4b-4a5d-8e6f-708192a3b4c5",
+    "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+    "category": "TASK_INPUT",
+    "sealed": "Ac5FTJVH8ls36hzn1KfV9qkMb455EhiqfSG37zxazKvqbk0JyswLLNUKTakejrgbd2tbk4dR0t587R_O7YmRHtVtbXUP_5qESlTOr2rvdzDL1EQesQ5diNB3oSpnExOuhc49TKbzd6C-5mrQ2Sq_qM5wkEcg1dm5j23_jaCwLm6TZ3ekxA_yKOAE3NDY2-Rjt_nw_MZnhBhyhgt0pymWwWzbe7ODGBjbIM0T0gdV5RSNnAA1lf7aQkqaQJw07E-MlHW8o0HLbsBU8MOWM_TQMLqBSjqsGveTOuolWiUe22bFPoJ9UB8tdDdt2FAoa_4zb341qeHbuMuQzIIKS8go1SOqgMjj3K1ghibIehsx-3c_2HhNY4ne75QUYA"
+  }
+}

@@ -1108,10 +1108,12 @@ public actor TaskStore {
             .min(by: { $0.value < $1.value })?.key {
             systemPermissionNotifications.removeValue(forKey: oldest)
         }
+        // 中文标题正文留给 3.9 及更早的手机；新手机按 `kind` 用自己的语言写（协议 3.10）。
         let screenshot = notice.screenshot == nil ? "" : " 可在 App 中查看截图。"
         return Notify(taskId: taskId, category: .taskFailed, title: "电脑需要系统授权",
                       body: "任务失败后检测到系统授权弹窗，请到电脑屏幕上查看并处理。" + screenshot,
-                      requestId: notice.id)
+                      requestId: notice.id, kind: .systemPermission,
+                      hasScreenshot: notice.screenshot == nil ? nil : true)
     }
 
     /// 此刻电脑上是不是有只有人能填的东西在等（密码框聚焦 → Secure Input 打开）。
@@ -1135,6 +1137,9 @@ public actor TaskStore {
     private var onRemoteControlNeeded: (@Sendable (String) -> Void)?
 
     /// 只在进入四种值得打扰用户的状态时通知；同一任务同一身份（状态 + 请求）30 秒内不重复。
+    ///
+    /// 标题正文写的是简体中文，给 3.9 及更早的手机；3.10 起另带 `kind` 与 `connectorName`，
+    /// 新手机按自己的界面语言拼标题与固定说明，agent 说的话（`body`）照原样显示。
     private func notification(for task: TaskRecord) -> Notify? {
         let current = now()
         guard let key = Self.notificationKey(task) else { return nil }
@@ -1143,11 +1148,12 @@ public actor TaskStore {
             return nil
         }
         let label = notificationLabel(for: task)
-        let notify: Notify
+        var notify: Notify
         switch task.status {
         case .waitingApproval:
             guard let request = task.pendingRequest else { return nil }
             notify = .approval(taskId: task.id, requestId: request.id, title: "\(label) 等待审批", body: request.summary)
+            notify.kind = .approval
         case .waitingInput:
             // agent 停下来等人，而电脑上此刻正好有个密码框聚焦着——这基本就是「它自己填不了，
             // 要人来输」。这时顺手把远程操作开起来，并在通知里说明可以直接在手机上处理。
@@ -1157,14 +1163,18 @@ public actor TaskStore {
                             body: needsHands
                                 ? "电脑上有个密码框在等着填，可以直接在手机上操作电脑"
                                 : (task.pendingRequest?.question ?? task.pendingRequest?.summary ?? task.title))
+            notify.kind = needsHands ? .secureInput : .input
             if needsHands { onRemoteControlNeeded?(task.id) }
         case .completed:
             notify = .done(taskId: task.id, title: "\(label) 任务完成", body: task.lastMessage ?? task.title)
+            notify.kind = .done
         case .failed:
             notify = .failed(taskId: task.id, title: "\(label) 任务失败", body: task.lastMessage ?? task.title)
+            notify.kind = .failed
         case .running, .interrupted, .idle:
             return nil
         }
+        notify.connectorName = label
         lastNotified[task.id] = (key, current)
         return notify
     }
