@@ -178,6 +178,10 @@ let isArmed = false, bytesIn = 0, framesOut = 0;
 const canvas = $('screen');
 const ctx = canvas.getContext('2d');
 let decoder = null, streamAbort = null, restartTimer = null;
+// 重连退避：0.8 秒起翻倍到 30 秒，乘 0.5–1.5 的抖动；一条流活够 10 秒才从头算。
+// 预览过期或被拒（401 / 403 / 404）不再重试：停掉所有定时器，回到 app 重新打开。
+let streamFailures = 0, streamOpenedAt = 0, stopped = false, statusTimer = null;
+const GONE = [401, 403, 404];
 
 function fatal(message) {
   $('fatal').style.display = 'block';
@@ -211,11 +215,26 @@ async function configureDecoder(header, avcc) {
 }
 
 function restartStream() {
-  if (restartTimer) return;
-  restartTimer = setTimeout(() => { restartTimer = null; openStream(); }, 800);
+  if (restartTimer || stopped) return;
+  if (streamOpenedAt && Date.now() - streamOpenedAt >= 10000) streamFailures = 0;
+  streamOpenedAt = 0;
+  const delay = Math.min(30000, 800 * Math.pow(2, streamFailures)) * (0.5 + Math.random());
+  streamFailures++;
+  restartTimer = setTimeout(() => { restartTimer = null; openStream(); }, delay);
+}
+
+function stopAll() {
+  stopped = true;
+  if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+  if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+  if (streamAbort) { streamAbort.abort(); streamAbort = null; }
+  if (decoder) { try { decoder.close(); } catch (e) {} decoder = null; }
+  fatal('预览链接已失效：请回到 BotBus 重新打开预览。');
 }
 
 async function openStream() {
+  if (stopped) return;
+  if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
   if (!(await rcReady())) {
     fatal('请在 BotBus app 里打开远程操作：画面是端到端加密的，浏览器里没有密钥。');
     return;
@@ -237,8 +256,10 @@ async function openStream() {
   let response;
   try {
     response = await fetch('/stream?' + params, { signal: controller.signal });
-  } catch (e) { restartStream(); return; }
+  } catch (e) { if (!controller.signal.aborted) restartStream(); return; }
+  if (GONE.includes(response.status)) { stopAll(); return; }
   if (!response.ok || !response.body) { restartStream(); return; }
+  streamOpenedAt = Date.now();
 
   const reader = response.body.getReader();
   let buf = new Uint8Array(0);
@@ -287,8 +308,11 @@ async function openStream() {
 // ---------- 状态 ----------
 async function refreshStatus() {
   try {
-    if (!(await rcReady())) return;
-    const s = await getJSON('/status');
+    if (stopped || !(await rcReady())) return;
+    const response = await fetch('/status');
+    if (GONE.includes(response.status)) { stopAll(); return; }
+    if (stopped) return;
+    const s = await openJSON(response);
     if (s.features && !rcChannel) rcChannel = newChannel();
     displays = s.displays || [];
     if (displayId === null && displays.length) displayId = displays[0].id;
@@ -641,9 +665,10 @@ if (BB && BB.embedded) {
 hint();
 refreshStatus();
 openStream();
-setInterval(refreshStatus, 4000);
+// 页面在后台时不问状态；回到前台立刻问一次。
+statusTimer = setInterval(() => { if (!document.hidden) refreshStatus(); }, 4000);
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) { refreshStatus(); openStream(); }
+  if (!document.hidden && !stopped) { refreshStatus(); openStream(); }
 });
 </script></body></html>
 """#

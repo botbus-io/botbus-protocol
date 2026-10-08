@@ -164,25 +164,25 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 
 | 方法 | 路径 | 鉴权 | 请求 | 响应 |
 |---|---|---|---|---|
-| POST | /agent/register | 无，按 IP 每分钟 10 次 | 空 | 201 `{agentId, agentToken, code, expiresAt}`；429 限速 |
-| POST | /agent/invite | agent，按 IP 每分钟 10 次 | 空 | 201 `{code, expiresAt}`；409 本 Agent 尚未被认领；429 限速 |
+| POST | /agent/register | 无，按 IP 每分钟 10 次；与 `/agent/invite` 合计每来源每小时 30 张码、全局每分钟 300 张 | 空 | 201 `{agentId, agentToken, code, expiresAt}`；429 限速 |
+| POST | /agent/invite | agent，按 IP 每分钟 10 次；发码上限同 `/agent/register` | 空 | 201 `{code, expiresAt}`；409 本 Agent 尚未被认领；429 限速 |
 | POST | /pair/claim | 无，按 IP 每分钟 10 次 | `{code, sealedName?, keyEnvelope?}`（3.0：注册码建新组时 `keyEnvelope` 必填，邀请码时省略；`sealedName` 是手机名的密文） | 201 `{pairId, clientToken, agents:[SealedAgent]}`；400 格式错，或注册码缺 `keyEnvelope`（码已消费）；404 码不存在或过期；409 该组已有 10 台手机；429 限速，或该来源猜错太多次被锁（见「配对码」） |
 | POST | /pair/agents | client | `{code, keyEnvelope}`（3.0 起信封必填，缺了 400 且码不消费） | 201 `{agent: SealedAgent}`；400 这是手机邀请码（码不消费）；404 码无效；409 已有 10 台电脑；429 该来源猜错太多次被锁 |
 | DELETE | /pair/agents/:agentId | client | | 204；404 不属于本 Pair |
 | GET | /pair/clients | client | | 200 `{clients:[{id, sealedName?, addedAt, current}]}`（3.0：名字是各手机自己封的密文，v2 时代的记录没有） |
 | DELETE | /pair/clients/:id | client 或 agent（agent 2.15 起） | | 204，这份凭据的推送连接以 4001 关闭，它（与同步了它的手表）注册的推送设备一并删除；404 不属于本 Pair；409 这是最后一份凭据 |
-| GET | /agent/ws | agent（Bearer + `X-Agent-Id`） | `Upgrade: websocket` | 101；409 尚未被认领 |
+| GET | /agent/ws | agent（Bearer + `X-Agent-Id`） | `Upgrade: websocket` | 101；409 尚未被认领。每台电脑的上行帧按令牌桶限速（突发 600、每秒 10 帧），超了以 1008 关闭，Agent 按普通断线退避重连；`notify` 另有每分钟 10 条（突发 20）的上限，超了只丢推送 |
 | GET | /agent/devices | agent | | 200 `{devices:[{sealedName, platform, lastSeenAt, clientId?}], clients:[{id, sealedName?, addedAt}]}`（3.0：两处名字都是手机自己封的密文，AAD `client`；`clients` 与 `clientId` 2.15 起；所属手机已不在组里的注册不列出） |
 | GET | /client/snapshot?since=N | client | | 200 SealedSnapshot；304 无变化（最多挂 25 秒）；401 |
 | GET | /client/ws?since=N | client | `Upgrade: websocket` | 101，之后推送 ClientFrame（见「WebSocket 帧」）；401；403 角色不符；426 缺 `Upgrade: websocket` |
 | POST | /client/commands | client | SealedCommand | 202 `{commandId, delivered}`；400 格式错（含 2.x 的明文命令）；404 `agentId` 不属于本 Pair；413 单条超过 16 KiB；503 该 Agent 的离线队列已满（50 条） |
 | POST | /client/devices | client | `{token, platform: ios\|watchos\|android, environment: sandbox\|production, sealedName}`（3.0：设备名是密文，AAD `client`；Android 固定传 `production`，FCM 不使用该字段） | 204；iOS / Android 登记时将名称密文同步到所属手机凭据，供 `/pair/clients` 与 `/agent/devices` 显示改名；手表不覆盖手机名。400 格式错或 token 超过 4096 字符；409 已有 10 台设备 |
 | DELETE | /client/devices/:token | client | | 204；400 token 百分号编码非法 |
-| PUT | /agent/artifacts/:artifactId | agent，按 agentId 每小时 120 次 | 密封字节，`Content-Type: application/octet-stream`（3.0） | 201 ArtifactUploadResponse `{id, size, expiresAt}`；400 id 格式错或缺 `Content-Type`；415 不是 octet-stream（明文不落 Relay）；409 该 id 已被别的 Agent 占用（本 Agent 尚未被认领也是 409）；413 超过 10 MiB；429 限速。同一 Agent 重传同一 id 即覆盖并重新计 TTL |
+| PUT | /agent/artifacts/:artifactId | agent，按 agentId 每小时 120 次 | 密封字节，`Content-Type: application/octet-stream`（3.0） | 201 ArtifactUploadResponse `{id, size, expiresAt}`；400 id 格式错或缺 `Content-Type`；415 不是 octet-stream（明文不落 Relay）；409 该 id 已被别的 Agent 占用（本 Agent 尚未被认领也是 409）；413 超过 10 MiB；429 限速，或本组存活的产物超过配额（2000 件或 2 GiB，与手机上传合计）。同一 Agent 重传同一 id 即覆盖并重新计 TTL |
 | GET | /client/artifacts/:agentId/:artifactId | client（该电脑须属于本 Pair） | | 200 存下的（密封）字节 + 原 `Content-Type`（3.0 起总是 octet-stream）+ `Cache-Control: private, max-age=86400`（另带 `X-Content-Type-Options: nosniff`、`Content-Security-Policy: sandbox`）；404 不存在、已过期或不属于该电脑 |
-| PUT | /client/uploads/:agentId/:artifactId | client（该电脑须属于本 Pair），按组每小时 60 次 | 密封字节，`Content-Type` 必须是 `application/octet-stream`（3.0；真实类型在命令的 attachments 里） | 201 ArtifactUploadResponse `{id, size, expiresAt}`；400 id 格式错或缺 `Content-Type`；401/403/404 鉴权与归属同 `GET /client/artifacts`；409 该 id 已被占用（同组手机重传同一 id 直接覆盖并重新计 TTL）；413 超过 10 MiB；415 不是 octet-stream；429 限速 |
+| PUT | /client/uploads/:agentId/:artifactId | client（该电脑须属于本 Pair），按组每小时 60 次 | 密封字节，`Content-Type` 必须是 `application/octet-stream`（3.0；真实类型在命令的 attachments 里） | 201 ArtifactUploadResponse `{id, size, expiresAt}`；400 id 格式错或缺 `Content-Type`；401/403/404 鉴权与归属同 `GET /client/artifacts`；409 该 id 已被占用（同组手机重传同一 id 直接覆盖并重新计 TTL）；413 超过 10 MiB；415 不是 octet-stream；429 限速，或本组产物配额已满 |
 | GET | /agent/uploads/:artifactId | agent | | 200 原始字节 + 原 `Content-Type`（响应头同 `GET /client/artifacts`）；404 不存在、已过期，或不是手机传给这台电脑的 |
-| POST | /agent/previews | agent，按 agentId 每小时 60 次 | PreviewCreateRequest `{title?}`，可为空 | 201 PreviewCreateResponse `{previewId, expiresAt}`；400 不是合法 JSON；413 超过 4 KiB；429 限速 |
+| POST | /agent/previews | agent，按 agentId 每小时 60 次 | PreviewCreateRequest `{title?}`，可为空 | 201 PreviewCreateResponse `{previewId, expiresAt}`；400 不是合法 JSON；413 超过 4 KiB；429 限速，或本组同时存活的预览已满 30 个（停止分享即释放） |
 | DELETE | /agent/previews/:previewId | agent（须是创建者） | | 204，隧道以 4001 关闭、浏览器 WebSocket 以 1001 关闭并删除预览状态；404 不存在、已过期或不是创建者 |
 | GET | /agent/previews/:previewId/tunnel | agent（须是创建者） | `Upgrade: websocket` | 101；同一预览的新连接以 4000 顶掉旧连接；404 不存在、已过期或不是创建者；426 缺 `Upgrade: websocket` |
 | POST | /client/previews/:previewId/session | client（预览须属于本 Pair） | 空 | 201 PreviewSessionResponse `{url, expiresAt}`：`url` 是带一次性 ticket 的预览入口，`expiresAt` 是 ticket 的失效时间（签发后 60 秒）；404 不存在、已过期或不属于本 Pair |
