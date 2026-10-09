@@ -3,7 +3,7 @@ import XCTest
 @testable import BotBusConnectors
 import BotBusProtocol
 
-/// `~/.hermes/state.db` → 任务与项目。库是按 spec 列出的 v30 列现造的假数据，另有一份缺列的老库。
+/// `~/.hermes/state.db` → 任务与项目。假库覆盖当前 display 字段，另有缺列的老库。
 final class HermesStateReaderTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_789_700_000) // 2026-09-18T02:53:20Z
     private var home: URL!
@@ -29,8 +29,31 @@ final class HermesStateReaderTests: XCTestCase {
           message_count INTEGER DEFAULT 0, archived INTEGER DEFAULT 0, hidden INTEGER DEFAULT 0);
         CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL,
           content TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL, finish_reason TEXT,
-          active INTEGER DEFAULT 1, reasoning TEXT, reasoning_details TEXT);
+          active INTEGER DEFAULT 1, reasoning TEXT, reasoning_details TEXT, display_kind TEXT, display_metadata TEXT);
         """
+
+    private let cronSession = "cron_job_with_parts_20261009_125608"
+
+    private func makeFailedTurnFixture(ended: Bool = true, metadata: String? = #"{"error":"  Connection refused  "}"#) throws -> SQLiteDatabase {
+        let database = try SQLiteDatabase(path: databasePath, readOnly: false)
+        try database.execute(Self.currentSchema)
+        try insertCronRun(database, sessionID: cronSession, secondsAgo: 40, ended: ended, metadata: metadata)
+        return database
+    }
+
+    private func insertCronRun(_ database: SQLiteDatabase, sessionID: String, secondsAgo: TimeInterval,
+                               ended: Bool = true, metadata: String?) throws {
+        let timestamp = now.timeIntervalSince1970 - secondsAgo
+        _ = try database.query("""
+            INSERT INTO sessions (id, source, title, started_at, ended_at, last_activity_at, end_reason)
+            VALUES (?, 'cron', '夜间检查', ?, ?, ?, ?)
+            """, [.text(sessionID), .real(timestamp - 20), ended ? .real(timestamp) : .null,
+                    .real(timestamp), ended ? .text("cron_complete") : .null])
+        _ = try database.query("""
+            INSERT INTO messages (session_id, role, content, timestamp, display_kind, display_metadata)
+            VALUES (?, 'assistant', 'Your request was not processed. Send it again if you still want me to carry it out.', ?, 'failed_turn', ?)
+            """, [.text(sessionID), .real(timestamp), metadata.map(SQLiteValue.text) ?? .null])
+    }
 
     private func makeFixture() throws {
         let db = try SQLiteDatabase(path: databasePath, readOnly: false)
@@ -105,6 +128,163 @@ final class HermesStateReaderTests: XCTestCase {
         XCTAssertEqual(HermesStateReader.status(endReason: nil, ended: false, activityAt: now.addingTimeInterval(-121), now: now), .completed)
         XCTAssertEqual(HermesStateReader.status(endReason: "agent_error", ended: true,
                                                 activityAt: now.addingTimeInterval(-90_000), now: now), .idle)
+        XCTAssertEqual(HermesStateReader.status(endReason: "cron_complete", ended: true, activityAt: recent, now: now,
+                                                turnFailed: true), .failed)
+        XCTAssertEqual(HermesStateReader.status(endReason: nil, ended: false,
+                                                activityAt: now.addingTimeInterval(-90_000), now: now, turnFailed: true), .idle)
+    }
+
+    func testFailedTurnOverridesCronCompleteAndUsesStructuredError() throws {
+        _ = try makeFailedTurnFixture()
+        let task = try XCTUnwrap(reader().readSnapshot(agentId: "a").tasks.first)
+        XCTAssertEqual(task.status, .failed, "cron_complete 只代表进程收尾，failed_turn 才是这一轮的结果")
+        XCTAssertEqual(task.lastMessage, "Connection refused", "保留原错误，不把 timeout 等分类改写为超时")
+        XCTAssertTrue(task.controllable)
+        XCTAssertEqual(task.title, "夜间检查")
+    }
+
+    func testUnendedFailedTurnFailsImmediatelyWithoutFinishReason() throws {
+        _ = try makeFailedTurnFixture(ended: false)
+        let task = try XCTUnwrap(reader().readSnapshot(agentId: "a").tasks.first)
+        XCTAssertEqual(task.status, .failed, "不需要等两分钟，也不需要非空 finish_reason")
+    }
+
+    func testFailedTurnOnlyAppliesToLatestActiveAssistant() throws {
+        let database = try makeFailedTurnFixture(ended: false)
+        try database.execute("""
+            INSERT INTO messages (session_id, role, content, timestamp, display_kind, display_metadata) VALUES
+              ('\(cronSession)', 'user', '重试', \(t(20)), 'failed_turn', '{"error":"旧错误"}');
+            """)
+        var task = try XCTUnwrap(reader().readSnapshot(agentId: "a").tasks.first)
+        XCTAssertEqual(task.status, .running, "最新 user 开始新轮次，即便带了同名 display_kind 也不是失败")
+        XCTAssertEqual(task.lastMessage, "Your request was not processed. Send it again if you still want me to carry it out.",
+                       "不会把上一轮 metadata.error 当成新轮次正文")
+        try database.execute("""
+            INSERT INTO messages (session_id, role, content, timestamp, finish_reason, display_metadata) VALUES
+              ('\(cronSession)', 'assistant', '已经恢复', \(t(10)), 'stop', '{"error":"不用这个字段猜失败"}');
+            INSERT INTO messages (session_id, role, content, timestamp, display_kind, active) VALUES
+              ('\(cronSession)', 'assistant', '已回退的失败', \(t(1)), 'failed_turn', 0);
+            """)
+        task = try XCTUnwrap(reader().readSnapshot(agentId: "a").tasks.first)
+        XCTAssertEqual(task.status, .completed, "成功回答或 inactive 分支不能沿用旧失败")
+        XCTAssertEqual(task.lastMessage, "已经恢复")
+    }
+
+    func testFailureMetadataFallsBackToContentAndClipsError() throws {
+        let database = try makeFailedTurnFixture(metadata: nil)
+        let missingMetadata = try reader().readObservedSnapshot(agentId: "a")
+        XCTAssertNil(missingMetadata.notifications["hermes:\(cronSession)"]?.failureFingerprint)
+        for metadata in ["not JSON", #"{"error":17}"#, #"{"error":null}"#, #"{"error":false}"#,
+                         #"{"error":{"message":"not a string"}}"#, #"{"error":"  "}"#, #"{}"#] {
+            _ = try database.query("UPDATE messages SET display_metadata = ?", [.text(metadata)])
+            let snapshot = try reader().readObservedSnapshot(agentId: "a")
+            let task = try XCTUnwrap(snapshot.tasks.first)
+            XCTAssertEqual(task.status, .failed)
+            XCTAssertEqual(task.lastMessage, "Your request was not processed. Send it again if you still want me to carry it out.")
+            XCTAssertNil(snapshot.notifications[task.id]?.failureFingerprint,
+                         "占位正文不是故障诊断，不能据此抑制下一次未知失败")
+        }
+        let error = String(repeating: "错", count: 700)
+        _ = try database.query("UPDATE messages SET display_metadata = ?", [.text("{\"error\":\"  \(error)  \"}")])
+        let snapshot = try reader().readObservedSnapshot(agentId: "a")
+        XCTAssertEqual(snapshot.tasks.first?.lastMessage, String(repeating: "错", count: 500))
+        let context = try XCTUnwrap(snapshot.notifications["hermes:\(cronSession)"])
+        XCTAssertEqual(context.failureFingerprint, "error:\(error)", "去重不只比较已经截到500字的正文")
+        XCTAssertEqual(context.failureBody?.count, 500)
+        XCTAssertTrue(context.failureBody?.hasPrefix("夜间检查\n") == true)
+        _ = try database.query("UPDATE messages SET display_metadata = ?", [.text("{\"error\":\"\(String(repeating: "错", count: 2700))\"}")])
+        let bounded = try reader().readObservedSnapshot(agentId: "a")
+        XCTAssertEqual(bounded.notifications["hermes:\(cronSession)"]?.failureFingerprint,
+                       "error:\(String(repeating: "错", count: SessionFormatting.detailLimit))")
+    }
+
+    func testDisplayKindWithoutMetadataColumnStillRecognizesFailure() throws {
+        let database = try makeFailedTurnFixture()
+        try database.execute("ALTER TABLE messages DROP COLUMN display_metadata")
+        let snapshot = try reader().readObservedSnapshot(agentId: "a")
+        let task = try XCTUnwrap(snapshot.tasks.first)
+        XCTAssertEqual(task.status, .failed)
+        XCTAssertEqual(task.lastMessage, "Your request was not processed. Send it again if you still want me to carry it out.")
+        XCTAssertNil(snapshot.notifications[task.id]?.failureFingerprint)
+    }
+
+    func testCronNotificationContextUsesStableSurfaceAndDatabaseNamespace() throws {
+        let database = try makeFailedTurnFixture(metadata: #"{"error":"error run 1","error_surface":{"code":"timeout","provider":"local","model":"model-a","layer":"transport","run_id":"1","time":"yesterday"}}"#)
+        let second = "cron_job_with_parts_20261009_133212"
+        try insertCronRun(database, sessionID: second, secondsAgo: 10,
+                          metadata: #"{"error":"error run 2","error_surface":{"layer":"transport","model":"model-a","provider":"local","code":"timeout","run_id":"2","title":"different"}}"#)
+        let snapshot = try reader().readObservedSnapshot(agentId: "a")
+        let firstContext = try XCTUnwrap(snapshot.notifications["hermes:\(cronSession)"])
+        let secondContext = try XCTUnwrap(snapshot.notifications["hermes:\(second)"])
+        XCTAssertEqual(firstContext.groupID, databasePath + "\u{0}" + "job_with_parts")
+        XCTAssertEqual(firstContext.groupID, secondContext.groupID)
+        XCTAssertEqual(firstContext.failureFingerprint, #"surface:{"code":"timeout","layer":"transport","model":"model-a","provider":"local"}"#)
+        XCTAssertEqual(firstContext.failureFingerprint, secondContext.failureFingerprint,
+                       "运行id、标题、时间与错误字符串不影响有结构化分类的失败去重")
+        XCTAssertEqual(secondContext.failureBody, "夜间检查\nerror run 2")
+
+        try database.execute("UPDATE messages SET display_kind = NULL, finish_reason = 'stop', content = '成功' WHERE session_id = '\(second)'")
+        let recovered = try reader().readObservedSnapshot(agentId: "a")
+        let successContext = try XCTUnwrap(recovered.notifications["hermes:\(second)"])
+        XCTAssertEqual(successContext.groupID, firstContext.groupID)
+        XCTAssertNil(successContext.failureFingerprint, "成功任务也携带分组，好让 store 清掉连续失败记录")
+        XCTAssertNil(successContext.failureBody)
+    }
+
+    func testCronIDParsingRejectsMalformedOrInvalidDates() throws {
+        XCTAssertEqual(HermesStateReader.cronJobID(sessionID: cronSession), "job_with_parts")
+        XCTAssertEqual(HermesStateReader.cronJobID(sessionID: "cron_a_20260228_235959"), "a")
+        for id in ["desktop_a_20261009_125608", "cron__20261009_125608", "cron_a_2026109_125608", "cron_a_20261009_12560x",
+                   "cron_a_20260230_125608", "cron_a_20261009_246000", "cron_a_20261009_125608_extra"] {
+            XCTAssertNil(HermesStateReader.cronJobID(sessionID: id), id)
+        }
+        let database = try makeFailedTurnFixture()
+        try database.execute("UPDATE sessions SET source = 'cli'")
+        XCTAssertTrue(try reader().readObservedSnapshot(agentId: "a").notifications.isEmpty, "id 像 cron 也必须 source=cron")
+        try database.execute("UPDATE sessions SET source = 'cron', id = 'cron_malformed'")
+        XCTAssertTrue(try reader().readObservedSnapshot(agentId: "a").notifications.isEmpty)
+    }
+
+    func testCronStructuredFingerprintBoundsFields() throws {
+        let code = String(repeating: "c", count: 600)
+        _ = try makeFailedTurnFixture(metadata: "{\"error_surface\":{\"code\":\"\(code)\"},\"error\":\"Connection refused\"}")
+        let snapshot = try reader().readObservedSnapshot(agentId: "a")
+        XCTAssertEqual(snapshot.notifications["hermes:\(cronSession)"]?.failureFingerprint,
+                       "surface:{\"code\":\"\(String(code.prefix(200)))\"}")
+    }
+
+    func testPartialSurfaceWithoutErrorCodeUsesRawFailureFingerprint() throws {
+        let database = try makeFailedTurnFixture()
+        for surface in [#"{"provider":"local","model":"model-a"}"#, #"{"layer":"transport","code":"   ","provider":"local"}"#] {
+            var fingerprints: [String?] = []
+            for error in ["Connection refused", "Authentication failed"] {
+                _ = try database.query("UPDATE messages SET display_metadata = ?", [.text("{\"error\":\"\(error)\",\"error_surface\":\(surface)}")])
+                let snapshot = try reader().readObservedSnapshot(agentId: "a")
+                let fingerprint = snapshot.notifications["hermes:\(cronSession)"]?.failureFingerprint
+                XCTAssertEqual(fingerprint, "error:\(error)", "只有provider/model/layer不能把不同错误当成同一次故障")
+                fingerprints.append(fingerprint)
+            }
+            XCTAssertNotEqual(fingerprints[0], fingerprints[1])
+        }
+    }
+
+    func testUnknownSurfaceCodeUsesRealErrorOrLeavesFingerprintUnknown() throws {
+        let database = try makeFailedTurnFixture()
+        for code in ["unknown", "UNKNOWN", "unknown_error", "unknown-error"] {
+            for error in ["Connection refused", "Authentication failed"] {
+                _ = try database.query("UPDATE messages SET display_metadata = ?", [
+                    .text("{\"error\":\"\(error)\",\"error_surface\":{\"code\":\"\(code)\",\"provider\":\"local\"}}"),
+                ])
+                let snapshot = try reader().readObservedSnapshot(agentId: "a")
+                XCTAssertEqual(snapshot.notifications["hermes:\(cronSession)"]?.failureFingerprint, "error:\(error)")
+            }
+            _ = try database.query("UPDATE messages SET display_metadata = ?", [
+                .text("{\"error_surface\":{\"code\":\"\(code)\",\"provider\":\"local\"}}"),
+            ])
+            let snapshot = try reader().readObservedSnapshot(agentId: "a")
+            XCTAssertNil(snapshot.notifications["hermes:\(cronSession)"]?.failureFingerprint,
+                         "不明确的类别且没有真实错误，不能合并不同占位回复")
+        }
     }
 
     /// Hermes 桌面端、Telegram、cron 的会话没有 cwd：归到主目录这个项目下，续聊也在那里起进程。
@@ -243,5 +423,48 @@ final class HermesStateReaderTests: XCTestCase {
         let record = await store.task(id: "hermes:s-done")
         XCTAssertEqual(record?.agentId, "agent-1")
         XCTAssertEqual(record?.status, .completed)
+    }
+
+    func testObserverSuppressesSameCronFailureAcrossRuns() async throws {
+        let database = try SQLiteDatabase(path: databasePath, readOnly: false)
+        try database.execute(Self.currentSchema)
+        let store = TaskStore(identity: AgentIdentity(agentId: "agent-1"),
+                              connectors: ConnectorRegistry(descriptors: [
+                                  ConnectorDescriptor(kind: .hermes, displayName: "Hermes", defaultEnabled: true) {
+                                      ConnectorProbe(available: true, status: .ok)
+                                  },
+                              ]))
+        let paths = HermesPaths(hermesHome: home)
+        let now = self.now
+        let observer = SessionObserver(source: .hermes, store: store,
+                                       provider: { HermesStateSource(paths: paths, now: { now }) })
+        await observer.pollOnce() // 空库建立静默基线，之后两次 cron 都是新活动。
+        let stream = await store.events()
+        let collected = Locked<[Event]>([])
+        let collector = Task {
+            for await event in stream { collected.withLock { $0.append(event) } }
+        }
+        defer { collector.cancel() }
+
+        try insertCronRun(database, sessionID: cronSession, secondsAgo: 40, metadata: #"{"error":"Connection refused"}"#)
+        await observer.pollOnce()
+        let second = "cron_job_with_parts_20261009_133212"
+        try insertCronRun(database, sessionID: second, secondsAgo: 10, metadata: #"{"error":"Connection refused"}"#)
+        await observer.pollOnce()
+        // 事件围栏：读到这份快照时，前两轮通知已经全部被消费，不靠等待一段墙钟时间判断“没再通知”。
+        await store.broadcastSnapshot()
+        await assertEventually {
+            collected.current.contains { event in
+                event.kind == .snapshot && event.snapshot?.tasks.contains { $0.id == "hermes:\(second)" } == true
+            }
+        }
+
+        let notifications = collected.current.compactMap(\.notify)
+        XCTAssertEqual(notifications.count, 1)
+        XCTAssertEqual(notifications.first?.kind, .failed)
+        XCTAssertEqual(notifications.first?.body, "夜间检查\nConnection refused")
+        let record = await store.task(id: "hermes:\(second)")
+        XCTAssertEqual(record?.status, .failed, "去重只抑制推送，第二次运行仍出现在任务列表")
+        XCTAssertEqual(record?.lastMessage, "Connection refused")
     }
 }

@@ -81,6 +81,7 @@ public actor TaskStore {
     /// 连接器与观察者不感知，它们记的仍是真实的工作目录，续聊照旧在那里跑。
     private let worktrees: WorktreeResolver
     private var lastNotified: [String: (key: NotificationKey, at: Date)] = [:]
+    private var observedNotifications = ObservedTaskNotifications()
     /// 只有 reconcile 会写：某来源第一次全量对账是静默基线。
     private var syncedSources: Set<TaskSource> = []
     /// ACP 的通知基线按 agent 走（协议 2.13）：只有上一轮对账时就已建立基线的 agent，这一轮的变化才推通知。
@@ -249,6 +250,7 @@ public actor TaskStore {
     public func setAgentId(_ agentId: String) {
         guard identity.agentId != agentId else { return }
         identity.agentId = agentId
+        observedNotifications.reset()
         _ = clearSystemPermissionDiagnostics()
         for inspection in directoryInspections.values { inspection.task.cancel() }
         directoryInspections.removeAll()
@@ -440,8 +442,10 @@ public actor TaskStore {
     ///
     /// `.acp` 走这里等于"没有哪个 agent 的基线就绪"：全部静默。生产代码用 `reconcileAcp`。
     @discardableResult
-    public func reconcile(source: TaskSource, tasks incoming: [TaskRecord], projects incomingProjects: [Project]) -> [Event] {
-        let events = performReconcile(source: source, tasks: incoming, projects: incomingProjects)
+    public func reconcile(source: TaskSource, tasks incoming: [TaskRecord], projects incomingProjects: [Project],
+                          notifications: [String: ObservedTaskNotification] = [:]) -> [Event] {
+        let events = performReconcile(source: source, tasks: incoming, projects: incomingProjects,
+                                      notifications: notifications)
         publish(events)
         return events
     }
@@ -456,7 +460,8 @@ public actor TaskStore {
     }
 
     private func performReconcile(source: TaskSource, tasks incoming: [TaskRecord], projects incomingProjects: [Project],
-                                  acpBaselined: Set<String> = []) -> [Event] {
+                                  acpBaselined: Set<String> = [],
+                                  notifications: [String: ObservedTaskNotification] = [:]) -> [Event] {
         // `.acp` 这一层的启用恒为 true（每个 agent 的开关在 `isEnabled(_ task:)` 里单独判），
         // 这里只是沿用"来源级"判断给 reconcile 的整体短路用，不代表按 agent 过滤——那一步在下面的
         // `isEnabled($0)` 里做。
@@ -468,7 +473,25 @@ public actor TaskStore {
 
         let firstSync = !syncedSources.contains(source)
         // 禁用期间不留基线：重新启用后的第一次对账仍是静默的，不会把积压状态一次性推成通知。
-        if enabled { syncedSources.insert(source) } else { syncedSources.remove(source) }
+        if enabled { syncedSources.insert(source) } else {
+            syncedSources.remove(source)
+            observedNotifications.reset(source: source)
+        }
+
+        let observedDecisions: [String: ObservedTaskNotifications.Decision]
+        if enabled {
+            let eligible = mine.filter { task in
+                guard notifications[task.id] != nil, owner(of: task.id) == .observer, hidden[task.id] == nil,
+                      task.id.hasPrefix("\(source.rawValue):") else { return false }
+                // 新活动会让已移出的项目恢复；按这次写入后的可见性判断，不让旧历史推进故障记忆。
+                let stampedTask = stamped(task)
+                var dismissals = projectDismissals
+                dismissals.reconcile([stampedTask])
+                return !dismissals.hides(stampedTask)
+            }
+            observedDecisions = observedNotifications.decisions(source: source, tasks: eligible,
+                                                               notifications: notifications, silent: firstSync)
+        } else { observedDecisions = [:] }
 
         var events: [Event] = []
         let incomingIds = Set(mine.map(\.id))
@@ -479,7 +502,8 @@ public actor TaskStore {
             let notifyAllowed = source == .acp
                 ? !firstSync && syncedAcpConnectors.contains(task.connectorId ?? "")
                 : !firstSync
-            events.append(contentsOf: apply(task, notifyAllowed: notifyAllowed))
+            events.append(contentsOf: apply(task, notifyAllowed: notifyAllowed,
+                                           observedNotification: observedDecisions[task.id]))
             // 观察真的看到了它 → 交接完成，下一轮起缺席就是真的消失。
             handoffDeadlines.removeValue(forKey: task.id)
         }
@@ -1027,7 +1051,8 @@ public actor TaskStore {
     }
 
     /// `incoming` 是连接器 / 观察者报上来、还没盖章的记录：先记下它带的失败原因，再盖章写入。
-    private func apply(_ incoming: TaskRecord, notifyAllowed: Bool) -> [Event] {
+    private func apply(_ incoming: TaskRecord, notifyAllowed: Bool,
+                       observedNotification: ObservedTaskNotifications.Decision? = nil) -> [Event] {
         // id 必须带来源前缀，否则不同来源会在同一个字典键上互相覆盖。
         // 这里不能 assertionFailure：upsert 是 public，Debug 构建下一个畸形 id 就会 trap 打死菜单栏进程；
         // 记一条告警后丢弃即可，宁可少一条任务也不要整个 Agent 消失。
@@ -1040,7 +1065,14 @@ public actor TaskStore {
         captureConnectorDiagnosis(incoming)
         let task = stamped(incoming)
         let previous = tasks[task.id]
-        guard previous != task else { return [] }
+        if previous == task {
+            // 故障元数据可能在会话记录不变时补齐；同一轮出现新的错误身份也要提醒。
+            guard notifyAllowed, !projectDismissals.hides(task), observedNotification?.notify == true,
+                  observedNotification?.notifyUnchangedTask == true,
+                  let notify = notification(for: task, failureBody: observedNotification?.failureBody,
+                                            dedupe: false) else { return [] }
+            return [.notify(notify)]
+        }
         if task.status != .failed { clearFailureDiagnostics(for: task.id) }
         tasks[task.id] = task
         if task.origin == .watch { rememberPhoneStarted(task.id) }
@@ -1048,8 +1080,11 @@ public actor TaskStore {
         if restoredProject { try? saveProjectDismissals() }
         var events: [Event] = projectDismissals.hides(task) ? [] : [.taskUpdated(task)]
         if restoredProject { events.append(.snapshot(snapshot())) }
-        if notifyAllowed, !projectDismissals.hides(task), Self.notificationKey(previous) != Self.notificationKey(task),
-           let notify = notification(for: task) {
+        let notificationChanged = observedNotification?.notify
+            ?? (Self.notificationKey(previous) != Self.notificationKey(task))
+        if notifyAllowed, !projectDismissals.hides(task), notificationChanged,
+           let notify = notification(for: task, failureBody: observedNotification?.failureBody,
+                                     dedupe: observedNotification == nil) {
             events.append(.notify(notify))
         }
         // 初次 reconcile 与静默恢复不扫描；同一次 failed 的文字/时间变化也不重复扫描。
@@ -1200,10 +1235,10 @@ public actor TaskStore {
     /// 标题正文写的是简体中文，给 3.9 及更早的手机；3.10 起另带 `kind` 与 `connectorName`，
     /// 新手机按自己的界面语言拼标题与固定说明，agent 说的话（`body`）照原样显示。
     /// 3.11 起正文是电脑写的请求摘要时另带 `bodyPhrase`，手机连正文也按自己的语言写。
-    private func notification(for task: TaskRecord) -> Notify? {
+    private func notification(for task: TaskRecord, failureBody: String? = nil, dedupe: Bool = true) -> Notify? {
         let current = now()
         guard let key = Self.notificationKey(task) else { return nil }
-        if let last = lastNotified[task.id], last.key == key,
+        if dedupe, let last = lastNotified[task.id], last.key == key,
            current.timeIntervalSince(last.at) < Self.notifyDedupeInterval {
             return nil
         }
@@ -1233,7 +1268,8 @@ public actor TaskStore {
             notify = .done(taskId: task.id, title: "\(label) 任务完成", body: task.lastMessage ?? task.title)
             notify.kind = .done
         case .failed:
-            notify = .failed(taskId: task.id, title: "\(label) 任务失败", body: task.lastMessage ?? task.title)
+            let body = failureBody.map { SessionFormatting.truncate($0, SessionFormatting.lastMessageLimit) }
+            notify = .failed(taskId: task.id, title: "\(label) 任务失败", body: body ?? task.lastMessage ?? task.title)
             notify.kind = .failed
         case .running, .interrupted, .idle:
             return nil

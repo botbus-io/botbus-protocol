@@ -11,6 +11,15 @@ import BotBusProtocol
 /// 空列表会被对账当成"任务都没了"，把手机上的记录全部摘掉。
 public protocol SessionSnapshotSource: Sendable {
     func readSnapshot(agentId: String) throws -> (tasks: [TaskRecord], projects: [Project])
+    func readObservedSnapshot(agentId: String) throws -> ObservedSessionSnapshot
+}
+
+public extension SessionSnapshotSource {
+    /// 保留原来的只读数据源契约；需要分组故障通知的数据源另行提供上下文。
+    func readObservedSnapshot(agentId: String) throws -> ObservedSessionSnapshot {
+        let snapshot = try readSnapshot(agentId: agentId)
+        return ObservedSessionSnapshot(tasks: snapshot.tasks, projects: snapshot.projects)
+    }
 }
 
 /// 这一轮读不到数据（不是"数据为空"）。`message` 直接进菜单栏。
@@ -100,9 +109,10 @@ public actor SessionObserver {
         do {
             // 文件与 SQLite 读取放到后台线程，actor 不被阻塞。
             let result = try await Task.detached(priority: .utility) {
-                try source.readSnapshot(agentId: agentId)
+                try source.readObservedSnapshot(agentId: agentId)
             }.value
-            await store.reconcile(source: self.source, tasks: result.tasks, projects: result.projects)
+            await store.reconcile(source: self.source, tasks: result.tasks, projects: result.projects,
+                                  notifications: result.notifications)
             consecutiveFailures = 0
             report("\(label)：\(result.tasks.count) 个任务（7 天内）")
         } catch let unavailable as SessionSourceUnavailable {
