@@ -183,6 +183,8 @@ public actor CodexConnector: TaskConnector {
     private var threads: [String: LiveThread] = [:]
     /// 插入顺序，淘汰时从队首找。
     private var order: [String] = []
+    /// 桌面上游也会广播内部子代理；记住最近的过滤结果，避免每条流式事件都去读一次元数据。
+    private var ignoredDesktopThreads: [String] = []
     /// itemId → 正在流式拼接的 agent 消息。不进 `LiveThread`：它不影响 `TaskRecord`，
     /// 塞进去会让每个 delta 都变成一次"记录变了"。
     private var messageBuffers: [String: [String: String]] = [:]
@@ -263,6 +265,7 @@ public actor CodexConnector: TaskConnector {
         }
         threads.removeAll()
         order.removeAll()
+        ignoredDesktopThreads.removeAll()
         messageBuffers.removeAll()
         dropAllStreams()
         // `CodexAppServer.stop()` 不发 `.exited`（那条只给"自己死掉"的路径），状态得自己收。
@@ -596,6 +599,7 @@ public actor CodexConnector: TaskConnector {
             return
         }
         guard let threadId = notification.threadId else { return }
+        guard !ignoredDesktopThreads.contains(threadId) else { return }
         if threads[threadId] == nil, sharedDesktop {
             // Desktop turns on the shared upstream are also actionable on the phone.
             let seed: JSONValue?
@@ -604,13 +608,9 @@ public actor CodexConnector: TaskConnector {
             } else {
                 // A phone can attach halfway through a desktop turn. In that case the
                 // thread/started event predates this Agent, so read its metadata once.
-                seed = try? await server.request("thread/read", params: [
-                    "threadId": .string(threadId), "includeTurns": .bool(false),
-                ])
+                seed = nil
             }
-            await adopt(threadId: threadId, resumeResponse: seed)
-            let generation = await server.processGeneration
-            mutate(threadId) { $0.loadedGeneration = generation }
+            guard await adoptDesktop(threadId: threadId, seed: seed) else { return }
         }
         guard threads[threadId] != nil else { return }
         // 节流攒下的文本先写进去，再处理别的通知：顺序不乱，后面的 item/completed 照样能盖掉它。
@@ -685,8 +685,10 @@ public actor CodexConnector: TaskConnector {
             return
         }
         if sharedDesktop, let threadId = request.threadId, threads[threadId] == nil {
-            await adopt(threadId: threadId, resumeResponse: nil)
+            guard await adoptDesktop(threadId: threadId) else { return }
         }
+        // 取元数据期间桌面可能已经回答，或轮次已经结束；不能再补发一条过期审批。
+        if sharedDesktop, await server.pendingServerRequest(key: request.key) == nil { return }
         guard let threadId = request.threadId, threads[threadId] != nil else {
             if sharedDesktop { return }
             // 没有任务可挂 = 没人能回答它。不能放着不管（codex 会一直等），只能按最保守的方向拒掉。
@@ -1082,6 +1084,30 @@ public actor CodexConnector: TaskConnector {
             $0.effort = existing?.effort
         }
         if let resumeResponse { applyModel(from: resumeResponse, to: threadId) }
+    }
+
+    /// 与数据库观察保持一致：子代理属于主任务内部，不建手机任务、不推审批或完成通知。
+    /// 重连接入可能只有轮次/审批，所以没有 thread/started 时先只读元数据；读取失败留给后续事件重试。
+    private func adoptDesktop(threadId: String, seed: JSONValue? = nil) async -> Bool {
+        guard !ignoredDesktopThreads.contains(threadId) else { return false }
+        let response: JSONValue?
+        if let seed {
+            response = seed
+        } else {
+            response = try? await server.request("thread/read", params: [
+                "threadId": .string(threadId), "includeTurns": .bool(false),
+            ])
+        }
+        guard let response else { return false }
+        if response.path("thread", "source")?["subAgent"] != nil {
+            ignoredDesktopThreads.append(threadId)
+            if ignoredDesktopThreads.count > Self.maxTrackedThreads { ignoredDesktopThreads.removeFirst() }
+            return false
+        }
+        await adopt(threadId: threadId, resumeResponse: response)
+        let generation = await server.processGeneration
+        mutate(threadId) { $0.loadedGeneration = generation }
+        return true
     }
 
     /// `thread/start` / `thread/resume` 的应答在顶层带 `model` / `reasoningEffort`；
