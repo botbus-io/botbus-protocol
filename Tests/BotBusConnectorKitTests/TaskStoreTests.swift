@@ -76,6 +76,86 @@ final class TaskStoreTests: XCTestCase {
         XCTAssertEqual(notify?.requestId, "req-1")
         XCTAssertEqual(notify?.body, "执行 rm -rf build/")
         XCTAssertEqual(notify?.title, "Codex 等待审批")
+        XCTAssertEqual(notify?.kind, .approval)
+        XCTAssertEqual(notify?.connectorName, "Codex")
+        XCTAssertNil(notify?.bodyPhrase, "请求没带短语，推送也不带")
+    }
+
+    /// 协议 3.11：推送正文是电脑写的请求摘要时带上它的短语；正文是提问原文时不带。
+    func testRequestNotificationsCarryTheSummaryPhrase() async {
+        let store = makeStore()
+        _ = await store.reconcile(source: .codex, tasks: [task("a", .running), task("b", .running), task("c", .running)],
+                                  projects: [])
+        let command = PendingRequest(id: "req-1", kind: .command, summary: "执行命令：ls",
+                                     summaryPhrase: .runCommand("ls"))
+        let blank = PendingRequest(id: "req-2", kind: .input, summary: "Codex 在等你回答",
+                                   summaryPhrase: .awaitingAnswer(agent: "Codex"))
+        let asked = PendingRequest(id: "req-3", kind: .input, summary: "Codex 在等你回答", question: "部署到哪？",
+                                   summaryPhrase: .awaitingAnswer(agent: "Codex"))
+        let events = await store.reconcile(source: .codex, tasks: [
+            task("a", .waitingApproval, pending: command), task("b", .waitingInput, pending: blank),
+            task("c", .waitingInput, pending: asked),
+        ], projects: [])
+        let byTask = Dictionary(uniqueKeysWithValues: events.compactMap(\.notify).map { ($0.taskId, $0) })
+        XCTAssertEqual(byTask["codex:a"]?.body, "执行命令：ls")
+        XCTAssertEqual(byTask["codex:a"]?.bodyPhrase, .runCommand("ls"))
+        XCTAssertEqual(byTask["codex:b"]?.body, "Codex 在等你回答")
+        XCTAssertEqual(byTask["codex:b"]?.bodyPhrase, .awaitingAnswer(agent: "Codex"))
+        XCTAssertEqual(byTask["codex:c"]?.body, "部署到哪？")
+        XCTAssertNil(byTask["codex:c"]?.bodyPhrase, "正文是问题原文")
+    }
+
+    /// 推送密文要塞进 4 KB：短语编码后超过预算就不带，手机照旧显示中文的 body。
+    func testOversizedBodyPhraseIsDropped() async {
+        let store = makeStore()
+        _ = await store.reconcile(source: .codex, tasks: [task("a", .running)], projects: [])
+        let huge = RequestPhrase(kind: .runCommand, text: String(repeating: "很长的命令", count: 200))
+        let pending = PendingRequest(id: "req-1", kind: .command, summary: "执行命令：很长的命令", summaryPhrase: huge)
+        let events = await store.reconcile(source: .codex, tasks: [task("a", .waitingApproval, pending: pending)], projects: [])
+        let notify = events.compactMap(\.notify).first
+        XCTAssertEqual(notify?.body, "执行命令：很长的命令")
+        XCTAssertNil(notify?.bodyPhrase)
+    }
+
+    /// 协议 3.10：每种通知都带 `kind` 与 `connectorName`，手机按自己的语言拼标题；中文的 title / body 留给旧手机。
+    func testNotificationsCarryKindAndConnectorNameForPhoneLocalization() async {
+        let store = makeStore()
+        _ = await store.reconcile(source: .claude, tasks: [task("q", .running, source: .claude)], projects: [])
+        _ = await store.reconcile(source: .codex, tasks: [task("d", .running), task("f", .running)], projects: [])
+        let question = PendingRequest(id: "req-q", kind: .input, summary: "问题", question: "要保留吗？")
+        let waiting = await store.reconcile(source: .claude, tasks: [task("q", .waitingInput, pending: question, source: .claude)],
+                                            projects: [])
+        let input = waiting.compactMap(\.notify).first
+        XCTAssertEqual(input?.kind, .input)
+        XCTAssertEqual(input?.category, .taskInput)
+        XCTAssertEqual(input?.connectorName, "Claude")
+        XCTAssertEqual(input?.title, "Claude 在等你回答")
+        XCTAssertEqual(input?.body, "要保留吗？")
+
+        let finished = await store.reconcile(source: .codex, tasks: [task("d", .completed), task("f", .failed)], projects: [])
+        let byTask = Dictionary(uniqueKeysWithValues: finished.compactMap(\.notify).map { ($0.taskId, $0) })
+        XCTAssertEqual(byTask["codex:d"]?.kind, .done)
+        XCTAssertEqual(byTask["codex:d"]?.title, "Codex 任务完成")
+        XCTAssertEqual(byTask["codex:f"]?.kind, .failed)
+        XCTAssertEqual(byTask["codex:f"]?.title, "Codex 任务失败")
+        XCTAssertEqual(Set(byTask.values.compactMap(\.connectorName)), ["Codex"])
+        XCTAssertTrue(byTask.values.allSatisfy { $0.hasScreenshot == nil })
+    }
+
+    /// 等人时电脑上有密码框（Secure Input）：种类是 `secureInput`，并触发自动开远程操作。
+    func testSecureInputWaitIsItsOwnKindAndTriggersRemoteControl() async {
+        let store = makeStore()
+        let triggered = Locked<[String]>([])
+        await store.setRemoteControlProbe { true }
+        await store.setRemoteControlTrigger { id in triggered.withLock { $0.append(id) } }
+        _ = await store.reconcile(source: .codex, tasks: [task("s", .running)], projects: [])
+        let events = await store.reconcile(source: .codex, tasks: [task("s", .waitingInput)], projects: [])
+        let notify = events.compactMap(\.notify).first
+        XCTAssertEqual(notify?.kind, .secureInput)
+        XCTAssertEqual(notify?.category, .taskInput)
+        XCTAssertEqual(notify?.connectorName, "Codex")
+        XCTAssertEqual(notify?.body, "电脑上有个密码框在等着填，可以直接在手机上操作电脑")
+        XCTAssertEqual(triggered.current, ["codex:s"])
     }
 
     func testWaitingApprovalWithoutRequestIsNotNotified() async {

@@ -1,0 +1,203 @@
+{
+  "agents": [
+    {
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "name": "Demo 的 MacBook Pro",
+      "platform": "macos",
+      "online": true,
+      "lastSeenAt": "2026-10-08T09:30:00Z",
+      "appVersion": "1.1.0",
+      "connectors": [
+        {
+          "kind": "codex",
+          "displayName": "Codex",
+          "available": true,
+          "enabled": true,
+          "status": "ok",
+          "taskCount": 4
+        },
+        {
+          "kind": "dsh",
+          "displayName": "DeepSeek Harness",
+          "available": true,
+          "enabled": true,
+          "status": "ok",
+          "taskCount": 1
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "codex:01a0b000-0000-7000-8000-000000000011",
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "source": "codex",
+      "title": "清理构建产物并重新打包",
+      "projectPath": "/Users/demo/Projects/demo-app",
+      "projectName": "demo-app",
+      "status": "waitingApproval",
+      "pendingRequest": {
+        "id": "req-11",
+        "kind": "command",
+        "summary": "执行命令：rm -rf build/",
+        "detail": "先清掉旧的构建产物\n工作目录：/Users/demo/Projects/demo-app",
+        "summaryPhrase": {
+          "kind": "runCommand",
+          "text": "rm -rf build/"
+        },
+        "detailPhrases": [
+          {
+            "kind": "text",
+            "text": "先清掉旧的构建产物"
+          },
+          {
+            "kind": "workingDirectory",
+            "text": "/Users/demo/Projects/demo-app"
+          }
+        ]
+      },
+      "origin": "watch",
+      "controllable": true,
+      "startedAt": "2026-10-08T09:20:00Z",
+      "updatedAt": "2026-10-08T09:29:00Z"
+    },
+    {
+      "id": "codex:01a0b000-0000-7000-8000-000000000012",
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "source": "codex",
+      "title": "把登录页改成深色主题",
+      "projectPath": "/Users/demo/Projects/demo-app",
+      "projectName": "demo-app",
+      "status": "waitingApproval",
+      "pendingRequest": {
+        "id": "req-12",
+        "kind": "fileChange",
+        "summary": "修改 23 个文件：App.swift、LoginView.swift…",
+        "detail": "--- /Users/demo/Projects/demo-app/App.swift (update)\n-old\n+new",
+        "summaryPhrase": {
+          "kind": "editFiles",
+          "items": [
+            "App.swift",
+            "LoginView.swift"
+          ],
+          "count": 23
+        }
+      },
+      "origin": "desktop",
+      "controllable": true,
+      "startedAt": "2026-10-08T09:10:00Z",
+      "updatedAt": "2026-10-08T09:28:00Z"
+    },
+    {
+      "id": "codex:01a0b000-0000-7000-8000-000000000013",
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "source": "codex",
+      "title": "发布 npm 包",
+      "projectPath": "/Users/demo/Projects/demo-app",
+      "projectName": "demo-app",
+      "status": "waitingApproval",
+      "pendingRequest": {
+        "id": "req-13",
+        "kind": "permission",
+        "summary": "请求额外权限",
+        "detail": "网络访问\n读取：/Users/demo/.npmrc\n写入：/Users/demo/Projects/demo-app/dist、/Users/demo/Library/Caches/npm",
+        "summaryPhrase": {
+          "kind": "requestExtraPermissions"
+        },
+        "detailPhrases": [
+          {
+            "kind": "networkAccess"
+          },
+          {
+            "kind": "readPaths",
+            "items": [
+              "/Users/demo/.npmrc"
+            ]
+          },
+          {
+            "kind": "writePaths",
+            "items": [
+              "/Users/demo/Projects/demo-app/dist",
+              "/Users/demo/Library/Caches/npm"
+            ]
+          }
+        ]
+      },
+      "origin": "watch",
+      "controllable": true,
+      "startedAt": "2026-10-08T09:05:00Z",
+      "updatedAt": "2026-10-08T09:27:00Z"
+    },
+    {
+      "id": "codex:01a0b000-0000-7000-8000-000000000014",
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "source": "codex",
+      "title": "部署到测试环境",
+      "projectPath": "/Users/demo/Projects/demo-app",
+      "projectName": "demo-app",
+      "status": "waitingInput",
+      "pendingRequest": {
+        "id": "req-14",
+        "kind": "input",
+        "summary": "Codex 在等你回答",
+        "detail": "可选项：staging、production\n还有 1 个问题",
+        "summaryPhrase": {
+          "kind": "awaitingAnswer",
+          "text": "Codex"
+        },
+        "detailPhrases": [
+          {
+            "kind": "options",
+            "items": [
+              "staging",
+              "production"
+            ]
+          },
+          {
+            "kind": "moreQuestions",
+            "count": 1
+          }
+        ]
+      },
+      "origin": "watch",
+      "controllable": true,
+      "startedAt": "2026-10-08T09:00:00Z",
+      "updatedAt": "2026-10-08T09:26:00Z"
+    },
+    {
+      "id": "dsh:7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f",
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "source": "dsh",
+      "title": "跑一遍集成测试",
+      "projectPath": "/Users/demo/Projects/demo-app",
+      "projectName": "demo-app",
+      "status": "waitingApproval",
+      "pendingRequest": {
+        "id": "evt-15",
+        "kind": "permission",
+        "summary": "bash 请求授权",
+        "summaryPhrase": {
+          "kind": "requestPermission",
+          "text": "bash"
+        }
+      },
+      "origin": "desktop",
+      "controllable": true,
+      "startedAt": "2026-10-08T08:50:00Z",
+      "updatedAt": "2026-10-08T09:25:00Z"
+    }
+  ],
+  "projects": [
+    {
+      "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+      "path": "/Users/demo/Projects/demo-app",
+      "name": "demo-app",
+      "lastUsedAt": "2026-10-08T09:29:00Z",
+      "pinned": false
+    }
+  ],
+  "recentResults": [],
+  "recentMessages": [],
+  "seq": 12,
+  "generatedAt": "2026-10-08T09:30:00Z"
+}

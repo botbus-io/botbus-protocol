@@ -96,19 +96,21 @@ final class CodexConnectorTests: XCTestCase {
 
     private func makeRig(installDefaults: Bool = true, tools: AgentToolsConfiguration? = nil,
                          registry: TaskContextRegistry = TaskContextRegistry(),
-                         sharedDesktop: Bool = false) async -> Rig {
+                         sharedDesktop: Bool = false,
+                         streamInterval: TimeInterval = 0.05,
+                         now: @escaping @Sendable () -> Date = { Date() }) async -> Rig {
         let launcher = FakeCodexLauncher()
         let sleeper = FakeSleeper()
         let server = CodexAppServer(launcher: launcher,
                                     configuration: CodexAppServer.Configuration(clientName: "BotBusTest",
                                                                                 clientVersion: "0.0.0"),
                                     sleeper: sleeper.sleep)
-        let store = TaskStore(identity: AgentIdentity(agentId: Self.agentId, name: "本机", appVersion: "1.0"))
+        let store = TaskStore(identity: AgentIdentity(agentId: Self.agentId, name: "本机", appVersion: "1.0"), now: now)
         let statuses = Locked<[CodexConnector.Status]>([])
-        let connector = CodexConnector(server: server, store: store,
+        let connector = CodexConnector(server: server, store: store, now: now,
                                        statusObserver: { status in statuses.withLock { $0.append(status) } },
                                        tools: { tools }, registry: registry,
-                                       sharedDesktop: sharedDesktop)
+                                       sharedDesktop: sharedDesktop, streamInterval: streamInterval)
         await connector.start()
 
         var found: FakeCodexProcess?
@@ -152,6 +154,132 @@ final class CodexConnectorTests: XCTestCase {
                                      "params": ["threadId": "desktop-task", "turnId": "desktop-turn"]])
         await assertEventually { await rig.server.pendingServerRequests().count == 1 }
         XCTAssertNil(reply(rig, id: 81), "桌面工具调用必须留给桌面处理")
+        await teardown(rig)
+    }
+
+    func testSharedDesktopSubagentDoesNotReappearOrNotifyAfterObserverReconcile() async throws {
+        let clock = Locked(Date(timeIntervalSince1970: 1_791_489_286))
+        let rig = await makeRig(sharedDesktop: true, now: { clock.current })
+        let events = Locked<[Event]>([])
+        let stream = await rig.store.events()
+        let collector = Task { for await event in stream { events.withLock { $0.append(event) } } }
+        defer { collector.cancel() }
+
+        rig.process.deliver(object: ["method": "thread/started", "params": ["thread": [
+            "id": "child", "cwd": "/tmp/desktop", "source": ["subAgent": ["thread_spawn": [
+                "parent_thread_id": "parent", "depth": 1,
+            ]]],
+        ]]])
+        rig.process.deliver(object: ["method": "turn/started", "params": [
+            "threadId": "child", "turn": ["id": "child-turn"],
+        ]])
+        let finalItem: [String: Any] = ["id": "child-answer", "type": "agentMessage",
+                                       "text": "内部审查完成", "phase": "final_answer"]
+        rig.process.deliver(object: ["method": "item/completed", "params": [
+            "threadId": "child", "turnId": "child-turn", "item": finalItem,
+        ]])
+        rig.process.deliver(object: ["method": "turn/completed", "params": [
+            "threadId": "child", "turn": ["id": "child-turn", "status": "completed"],
+        ]])
+        rig.process.deliver(object: ["method": "turn/started", "params": [
+            "threadId": "parent", "turn": ["id": "parent-turn"],
+        ]])
+        await assertEventually { await self.task(rig, "codex:parent")?.status == .running }
+
+        // 数据库观察者不列子代理。交接宽限过后再收到迟到条目，不能重新建任务、重复发完成通知。
+        clock.withLock { $0 = $0.addingTimeInterval(TaskStore.liveHandoffGrace + 1) }
+        _ = await rig.store.reconcile(source: .codex, tasks: [], projects: [])
+        rig.process.deliver(object: ["method": "item/completed", "params": [
+            "threadId": "child", "turnId": "child-turn", "item": finalItem,
+        ]])
+        rig.process.deliver(object: ["method": "item/completed", "params": [
+            "threadId": "parent", "turnId": "parent-turn", "item": [
+                "id": "parent-answer", "type": "agentMessage", "text": "主任务仍在执行", "phase": "final_answer",
+            ],
+        ]])
+        await assertEventually {
+            events.current.contains { $0.task?.id == "codex:parent" && $0.task?.lastMessage == "主任务仍在执行" }
+        }
+        let child = await task(rig, "codex:child")
+        let tracked = await rig.connector.liveThreadIds()
+        XCTAssertNil(child, "内部子代理不应成为手机任务")
+        XCTAssertFalse(tracked.contains("child"))
+        XCTAssertEqual(events.current.filter { $0.notify?.taskId == "codex:child" }.count, 0,
+                       "包括迟到条目在内，子代理都不推通知")
+        await teardown(rig)
+    }
+
+    func testSharedDesktopSubagentMetadataIsCheckedWhenAttachingMidTurn() async throws {
+        let rig = await makeRig(sharedDesktop: true)
+        rig.responder.on("thread/read") { params in
+            let id = params["threadId"] as? String ?? ""
+            return ["thread": ["id": id, "cwd": "/tmp/desktop",
+                                "source": id == "child" ? ["subAgent": "review"] as Any : "vscode"]]
+        }
+        rig.process.deliver(object: ["method": "turn/started", "params": [
+            "threadId": "child", "turn": ["id": "child-turn"],
+        ]])
+        rig.process.deliver(object: ["method": "turn/completed", "params": [
+            "threadId": "child", "turn": ["id": "child-turn", "status": "completed"],
+        ]])
+        rig.process.deliver(object: ["method": "turn/started", "params": [
+            "threadId": "parent", "turn": ["id": "parent-turn"],
+        ]])
+        await assertEventually { await self.task(rig, "codex:parent")?.status == .running }
+        let child = await task(rig, "codex:child")
+        XCTAssertNil(child, "重连时没有 thread/started，也必须按 thread/read 的来源过滤子代理")
+        XCTAssertEqual(rig.process.requests(method: "thread/read").filter {
+            ($0["params"] as? [String: Any])?["threadId"] as? String == "child"
+        }.count, 1, "后续事件复用过滤结果")
+        await teardown(rig)
+    }
+
+    func testSharedDesktopSubagentApprovalStaysWithDesktop() async throws {
+        let rig = await makeRig(sharedDesktop: true)
+        rig.responder.on("thread/read") { params in
+            let id = params["threadId"] as? String ?? ""
+            return ["thread": ["id": id, "cwd": "/tmp/desktop",
+                                "source": id == "child" ? ["subAgent": "review"] as Any : "vscode"]]
+        }
+        rig.process.deliver(object: ["id": 81, "method": "item/commandExecution/requestApproval", "params": [
+            "threadId": "child", "turnId": "child-turn", "command": "pwd",
+        ]])
+        rig.process.deliver(object: ["method": "turn/started", "params": [
+            "threadId": "parent", "turn": ["id": "parent-turn"],
+        ]])
+        await assertEventually { await self.task(rig, "codex:parent")?.status == .running }
+        let child = await task(rig, "codex:child")
+        XCTAssertNil(child, "重连补回的子代理审批也不能创建手机任务")
+        XCTAssertNil(reply(rig, id: 81), "过滤子代理不应替桌面回答审批")
+        await teardown(rig)
+    }
+
+    func testSharedDesktopResolvedApprovalDoesNotNotifyAfterMetadataRead() async throws {
+        let rig = await makeRig(installDefaults: false, sharedDesktop: true)
+        let events = Locked<[Event]>([])
+        let stream = await rig.store.events()
+        let collector = Task { for await event in stream { events.withLock { $0.append(event) } } }
+        defer { collector.cancel() }
+
+        rig.process.deliver(object: ["id": 81, "method": "item/commandExecution/requestApproval", "params": [
+            "threadId": "parent", "turnId": "parent-turn", "command": "pwd",
+        ]])
+        await assertEventually { !rig.process.requests(method: "thread/read").isEmpty }
+        let read = try XCTUnwrap(rig.process.requests(method: "thread/read").first)
+        // 取来源期间电脑已答完：不能在元数据应答之后再补发一条过期的审批通知。
+        rig.process.deliver(object: ["method": "serverRequest/resolved", "params": [
+            "threadId": "parent", "requestId": 81,
+        ]])
+        await assertEventually { await rig.server.pendingServerRequest(key: "#81") == nil }
+        rig.process.deliver(object: ["id": try XCTUnwrap(read["id"]), "result": ["thread": [
+            "id": "parent", "cwd": "/tmp/desktop", "source": "vscode",
+        ]]])
+        rig.process.deliver(object: ["method": "thread/started", "params": ["thread": [
+            "id": "barrier", "cwd": "/tmp/desktop", "source": "vscode",
+        ]]])
+        await assertEventually { events.current.contains { $0.task?.id == "codex:barrier" } }
+        XCTAssertFalse(events.current.contains { $0.notify?.requestId == "#81" }, "已经答完的请求不再发通知")
+        XCTAssertNil(reply(rig, id: 81), "不重复回答桌面已经处理的请求")
         await teardown(rig)
     }
 
@@ -816,6 +944,48 @@ final class CodexConnectorTests: XCTestCase {
         XCTAssertEqual(owner, .observer, "轮次结束就把任务交还给只读观察，别跟 CodexObserver 打架")
         let controlled = await rig.server.controlledThreads()
         XCTAssertFalse(controlled.contains("thread-1"), "交还控制后重启不该再 resume 它")
+        await teardown(rig)
+    }
+
+    func testStreamingDeltasAreThrottledAndSettledByTheNextNotification() async throws {
+        let rig = await makeRig(streamInterval: 60)
+        let events = await rig.store.events()
+        let messages = Locked<[String?]>([])
+        let collector = Task {
+            for await event in events where event.task?.id == "codex:thread-1" {
+                messages.withLock { $0.append(event.task?.lastMessage) }
+            }
+        }
+        defer { collector.cancel() }
+        _ = try await rig.connector.start(projectPath: "/tmp/project", prompt: "跑一下")
+        rig.process.deliver(object: ["method": "turn/started",
+                                     "params": ["threadId": "thread-1", "turn": ["id": "turn-1"]]])
+        for delta in ["一", "二", "三", "四"] {
+            rig.process.deliver(object: ["method": "item/agentMessage/delta",
+                                         "params": ["threadId": "thread-1", "itemId": "m1", "delta": delta]])
+        }
+        // 间隔内的 delta 只攒着；下一条别的通知把攒下的整段带出去。
+        rig.process.deliver(object: ["method": "item/started",
+                                     "params": ["threadId": "thread-1", "turnId": "turn-1",
+                                                "item": ["id": "c1", "type": "commandExecution"]]])
+        await assertEventually { await self.task(rig)?.lastMessage == "一二三四" }
+        await assertEventually { messages.current.last == "一二三四" }
+        let streamed = messages.current.compactMap { $0 }
+        XCTAssertEqual(streamed.filter { $0.hasPrefix("一") }, ["一", "一二三四"], "中间的 delta 不该各发一条")
+        await teardown(rig)
+    }
+
+    func testStreamingDeltasFlushAfterTheInterval() async throws {
+        let rig = await makeRig(streamInterval: 0.2)
+        _ = try await rig.connector.start(projectPath: "/tmp/project", prompt: "跑一下")
+        rig.process.deliver(object: ["method": "turn/started",
+                                     "params": ["threadId": "thread-1", "turn": ["id": "turn-1"]]])
+        rig.process.deliver(object: ["method": "item/agentMessage/delta",
+                                     "params": ["threadId": "thread-1", "itemId": "m1", "delta": "正在"]])
+        rig.process.deliver(object: ["method": "item/agentMessage/delta",
+                                     "params": ["threadId": "thread-1", "itemId": "m1", "delta": "看"]])
+        // 后面没有别的通知：到点由定时补写发出去，不能停在第一段。
+        await assertEventually { await self.task(rig)?.lastMessage == "正在看" }
         await teardown(rig)
     }
 

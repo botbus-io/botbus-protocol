@@ -37,6 +37,9 @@ public actor TaskStore {
     public static let maxArtifactTasks = 200
     /// 产物改动后多久落盘。一次分享常常连着几件（截图 + 预览 + 缩略图），合并成一次写。
     public static let defaultArtifactSaveDelay: TimeInterval = 1
+    /// 只有项目 `lastUsedAt` 变了的全量快照，最多这么久发一份。会话跑着时任务 `updatedAt` 每秒都可能变，
+    /// 项目跟着变；每份快照 Relay 都要写一次存储。手机只拿它排序与显示「几分钟前」，晚一分钟可以接受。
+    public static let defaultProjectActivitySnapshotInterval: TimeInterval = 60
     /// app 用的产物持久化位置。测试一律注入临时文件或不持久化（`artifactsURL: nil`）。
     public static var defaultArtifactsURL: URL {
         LocalHookServer.defaultSupportDirectory.appendingPathComponent("artifacts.json")
@@ -78,6 +81,7 @@ public actor TaskStore {
     /// 连接器与观察者不感知，它们记的仍是真实的工作目录，续聊照旧在那里跑。
     private let worktrees: WorktreeResolver
     private var lastNotified: [String: (key: NotificationKey, at: Date)] = [:]
+    private var observedNotifications = ObservedTaskNotifications()
     /// 只有 reconcile 会写：某来源第一次全量对账是静默基线。
     private var syncedSources: Set<TaskSource> = []
     /// ACP 的通知基线按 agent 走（协议 2.13）：只有上一轮对账时就已建立基线的 agent，这一轮的变化才推通知。
@@ -137,6 +141,12 @@ public actor TaskStore {
     private let artifactSaveDelay: TimeInterval
     private var pendingArtifactSave: Task<Void, Never>?
 
+    private let projectActivitySnapshotInterval: TimeInterval
+    /// 上一次往事件流里放全量快照的时间（不管为什么发）。
+    private var lastSnapshotEventAt: Date?
+    /// 被节流的「只改了 lastUsedAt」快照：到点补发；期间发了别的快照就取消（那份已经带上最新项目）。
+    private var deferredProjectSnapshot: Task<Void, Never>?
+
     /// 手机发起过的任务 id → 第一次见到的时间。`apply` 见到 `origin == .watch` 时记下，
     /// 之后任务的 origin 变回 `.desktop`（重启后由观察者读回）也照样认得。只给 Mac 菜单用，不进协议。
     private var phoneStarted: [String: String] = [:]
@@ -188,6 +198,7 @@ public actor TaskStore {
                 supportsConnectorRestart: Bool = false,
                 supportsProjectParent: Bool = false,
                 artifactSaveDelay: TimeInterval = TaskStore.defaultArtifactSaveDelay,
+                projectActivitySnapshotInterval: TimeInterval = TaskStore.defaultProjectActivitySnapshotInterval,
                 outsideProjects: OutsideProjectRule = OutsideProjectRule(),
                 worktrees: WorktreeResolver = WorktreeResolver(),
                 systemPermissionInspector: SystemPermissionInspector? = nil,
@@ -213,6 +224,7 @@ public actor TaskStore {
         self.supportsConnectorRestart = supportsConnectorRestart
         self.supportsProjectParent = supportsProjectParent
         self.artifactSaveDelay = artifactSaveDelay
+        self.projectActivitySnapshotInterval = projectActivitySnapshotInterval
         self.systemPermissionInspector = systemPermissionInspector
         self.systemPermissionInspectionTimeout = systemPermissionInspectionTimeout
         self.directoryProbe = directoryProbe
@@ -238,6 +250,7 @@ public actor TaskStore {
     public func setAgentId(_ agentId: String) {
         guard identity.agentId != agentId else { return }
         identity.agentId = agentId
+        observedNotifications.reset()
         _ = clearSystemPermissionDiagnostics()
         for inspection in directoryInspections.values { inspection.task.cancel() }
         directoryInspections.removeAll()
@@ -385,6 +398,11 @@ public actor TaskStore {
     }
 
     private func publish(_ events: [Event]) {
+        if events.contains(where: { $0.kind == .snapshot }) {
+            lastSnapshotEventAt = now()
+            deferredProjectSnapshot?.cancel()
+            deferredProjectSnapshot = nil
+        }
         guard let eventContinuation, !events.isEmpty else { return }
         for event in events {
             if event.kind == .taskUpdated, let task = event.task, projectDismissals.hides(task) { continue }
@@ -424,8 +442,10 @@ public actor TaskStore {
     ///
     /// `.acp` 走这里等于"没有哪个 agent 的基线就绪"：全部静默。生产代码用 `reconcileAcp`。
     @discardableResult
-    public func reconcile(source: TaskSource, tasks incoming: [TaskRecord], projects incomingProjects: [Project]) -> [Event] {
-        let events = performReconcile(source: source, tasks: incoming, projects: incomingProjects)
+    public func reconcile(source: TaskSource, tasks incoming: [TaskRecord], projects incomingProjects: [Project],
+                          notifications: [String: ObservedTaskNotification] = [:]) -> [Event] {
+        let events = performReconcile(source: source, tasks: incoming, projects: incomingProjects,
+                                      notifications: notifications)
         publish(events)
         return events
     }
@@ -440,7 +460,8 @@ public actor TaskStore {
     }
 
     private func performReconcile(source: TaskSource, tasks incoming: [TaskRecord], projects incomingProjects: [Project],
-                                  acpBaselined: Set<String> = []) -> [Event] {
+                                  acpBaselined: Set<String> = [],
+                                  notifications: [String: ObservedTaskNotification] = [:]) -> [Event] {
         // `.acp` 这一层的启用恒为 true（每个 agent 的开关在 `isEnabled(_ task:)` 里单独判），
         // 这里只是沿用"来源级"判断给 reconcile 的整体短路用，不代表按 agent 过滤——那一步在下面的
         // `isEnabled($0)` 里做。
@@ -452,7 +473,25 @@ public actor TaskStore {
 
         let firstSync = !syncedSources.contains(source)
         // 禁用期间不留基线：重新启用后的第一次对账仍是静默的，不会把积压状态一次性推成通知。
-        if enabled { syncedSources.insert(source) } else { syncedSources.remove(source) }
+        if enabled { syncedSources.insert(source) } else {
+            syncedSources.remove(source)
+            observedNotifications.reset(source: source)
+        }
+
+        let observedDecisions: [String: ObservedTaskNotifications.Decision]
+        if enabled {
+            let eligible = mine.filter { task in
+                guard notifications[task.id] != nil, owner(of: task.id) == .observer, hidden[task.id] == nil,
+                      task.id.hasPrefix("\(source.rawValue):") else { return false }
+                // 新活动会让已移出的项目恢复；按这次写入后的可见性判断，不让旧历史推进故障记忆。
+                let stampedTask = stamped(task)
+                var dismissals = projectDismissals
+                dismissals.reconcile([stampedTask])
+                return !dismissals.hides(stampedTask)
+            }
+            observedDecisions = observedNotifications.decisions(source: source, tasks: eligible,
+                                                               notifications: notifications, silent: firstSync)
+        } else { observedDecisions = [:] }
 
         var events: [Event] = []
         let incomingIds = Set(mine.map(\.id))
@@ -463,7 +502,8 @@ public actor TaskStore {
             let notifyAllowed = source == .acp
                 ? !firstSync && syncedAcpConnectors.contains(task.connectorId ?? "")
                 : !firstSync
-            events.append(contentsOf: apply(task, notifyAllowed: notifyAllowed))
+            events.append(contentsOf: apply(task, notifyAllowed: notifyAllowed,
+                                           observedNotification: observedDecisions[task.id]))
             // 观察真的看到了它 → 交接完成，下一轮起缺席就是真的消失。
             handoffDeadlines.removeValue(forKey: task.id)
         }
@@ -486,10 +526,53 @@ public actor TaskStore {
         }
         // 协议没有单独的项目事件，Relay 只在收到全量 snapshot 时才更新 projects；
         // 所以合并后的项目列表一变就补发一份全量快照，否则手机端的"最近项目"会停在连上那一刻。
+        // 只有 lastUsedAt 变了（路径、名称、置顶、自动批准、顺序都没变）时节流，见 `defaultProjectActivitySnapshotInterval`。
         let before = mergedProjects()
         projectsBySource[source] = mineProjects
-        if mergedProjects() != before { events.append(.snapshot(snapshot())) }
+        let after = mergedProjects()
+        if after != before {
+            if Self.differOnlyInActivity(before, after), let wait = projectActivitySnapshotWait() {
+                scheduleDeferredProjectSnapshot(after: wait)
+            } else {
+                events.append(.snapshot(snapshot()))
+            }
+        }
         return events
+    }
+
+    /// 两份项目列表除了 `lastUsedAt` 逐项相同（含顺序）。
+    static func differOnlyInActivity(_ lhs: [Project], _ rhs: [Project]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        return zip(lhs, rhs).allSatisfy { left, right in
+            var l = left, r = right
+            l.lastUsedAt = ""
+            r.lastUsedAt = ""
+            return l == r
+        }
+    }
+
+    /// 距离下一份「只改了 lastUsedAt」的快照还要等多久；nil = 现在就能发。
+    private func projectActivitySnapshotWait() -> TimeInterval? {
+        guard let last = lastSnapshotEventAt else { return nil }
+        let wait = projectActivitySnapshotInterval - now().timeIntervalSince(last)
+        return wait > 0 ? wait : nil
+    }
+
+    private func scheduleDeferredProjectSnapshot(after wait: TimeInterval) {
+        // 已经挂着一份：它到点时取的是那时的最新列表，不用再挂。
+        guard deferredProjectSnapshot == nil else { return }
+        deferredProjectSnapshot = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled else { return }
+            await self?.flushDeferredProjectSnapshot()
+        }
+    }
+
+    /// 补发被节流的项目快照（定时器到点时调；测试也可直接调）。没有挂着的就什么都不做。
+    func flushDeferredProjectSnapshot() {
+        guard deferredProjectSnapshot != nil else { return }
+        deferredProjectSnapshot = nil
+        publish([.snapshot(snapshot())])
     }
 
     /// 单个任务的实时更新（阶段二 b 的 app-server 通知会用）。不影响 reconcile 的首次基线判断。
@@ -968,7 +1051,8 @@ public actor TaskStore {
     }
 
     /// `incoming` 是连接器 / 观察者报上来、还没盖章的记录：先记下它带的失败原因，再盖章写入。
-    private func apply(_ incoming: TaskRecord, notifyAllowed: Bool) -> [Event] {
+    private func apply(_ incoming: TaskRecord, notifyAllowed: Bool,
+                       observedNotification: ObservedTaskNotifications.Decision? = nil) -> [Event] {
         // id 必须带来源前缀，否则不同来源会在同一个字典键上互相覆盖。
         // 这里不能 assertionFailure：upsert 是 public，Debug 构建下一个畸形 id 就会 trap 打死菜单栏进程；
         // 记一条告警后丢弃即可，宁可少一条任务也不要整个 Agent 消失。
@@ -981,7 +1065,14 @@ public actor TaskStore {
         captureConnectorDiagnosis(incoming)
         let task = stamped(incoming)
         let previous = tasks[task.id]
-        guard previous != task else { return [] }
+        if previous == task {
+            // 故障元数据可能在会话记录不变时补齐；同一轮出现新的错误身份也要提醒。
+            guard notifyAllowed, !projectDismissals.hides(task), observedNotification?.notify == true,
+                  observedNotification?.notifyUnchangedTask == true,
+                  let notify = notification(for: task, failureBody: observedNotification?.failureBody,
+                                            dedupe: false) else { return [] }
+            return [.notify(notify)]
+        }
         if task.status != .failed { clearFailureDiagnostics(for: task.id) }
         tasks[task.id] = task
         if task.origin == .watch { rememberPhoneStarted(task.id) }
@@ -989,8 +1080,11 @@ public actor TaskStore {
         if restoredProject { try? saveProjectDismissals() }
         var events: [Event] = projectDismissals.hides(task) ? [] : [.taskUpdated(task)]
         if restoredProject { events.append(.snapshot(snapshot())) }
-        if notifyAllowed, !projectDismissals.hides(task), Self.notificationKey(previous) != Self.notificationKey(task),
-           let notify = notification(for: task) {
+        let notificationChanged = observedNotification?.notify
+            ?? (Self.notificationKey(previous) != Self.notificationKey(task))
+        if notifyAllowed, !projectDismissals.hides(task), notificationChanged,
+           let notify = notification(for: task, failureBody: observedNotification?.failureBody,
+                                     dedupe: observedNotification == nil) {
             events.append(.notify(notify))
         }
         // 初次 reconcile 与静默恢复不扫描；同一次 failed 的文字/时间变化也不重复扫描。
@@ -1108,10 +1202,12 @@ public actor TaskStore {
             .min(by: { $0.value < $1.value })?.key {
             systemPermissionNotifications.removeValue(forKey: oldest)
         }
+        // 中文标题正文留给 3.9 及更早的手机；新手机按 `kind` 用自己的语言写（协议 3.10）。
         let screenshot = notice.screenshot == nil ? "" : " 可在 App 中查看截图。"
         return Notify(taskId: taskId, category: .taskFailed, title: "电脑需要系统授权",
                       body: "任务失败后检测到系统授权弹窗，请到电脑屏幕上查看并处理。" + screenshot,
-                      requestId: notice.id)
+                      requestId: notice.id, kind: .systemPermission,
+                      hasScreenshot: notice.screenshot == nil ? nil : true)
     }
 
     /// 此刻电脑上是不是有只有人能填的东西在等（密码框聚焦 → Secure Input 打开）。
@@ -1135,38 +1231,63 @@ public actor TaskStore {
     private var onRemoteControlNeeded: (@Sendable (String) -> Void)?
 
     /// 只在进入四种值得打扰用户的状态时通知；同一任务同一身份（状态 + 请求）30 秒内不重复。
-    private func notification(for task: TaskRecord) -> Notify? {
+    ///
+    /// 标题正文写的是简体中文，给 3.9 及更早的手机；3.10 起另带 `kind` 与 `connectorName`，
+    /// 新手机按自己的界面语言拼标题与固定说明，agent 说的话（`body`）照原样显示。
+    /// 3.11 起正文是电脑写的请求摘要时另带 `bodyPhrase`，手机连正文也按自己的语言写。
+    private func notification(for task: TaskRecord, failureBody: String? = nil, dedupe: Bool = true) -> Notify? {
         let current = now()
         guard let key = Self.notificationKey(task) else { return nil }
-        if let last = lastNotified[task.id], last.key == key,
+        if dedupe, let last = lastNotified[task.id], last.key == key,
            current.timeIntervalSince(last.at) < Self.notifyDedupeInterval {
             return nil
         }
         let label = notificationLabel(for: task)
-        let notify: Notify
+        var notify: Notify
         switch task.status {
         case .waitingApproval:
             guard let request = task.pendingRequest else { return nil }
             notify = .approval(taskId: task.id, requestId: request.id, title: "\(label) 等待审批", body: request.summary)
+            notify.kind = .approval
+            notify.bodyPhrase = Self.bodyPhrase(request.summaryPhrase)
         case .waitingInput:
             // agent 停下来等人，而电脑上此刻正好有个密码框聚焦着——这基本就是「它自己填不了，
             // 要人来输」。这时顺手把远程操作开起来，并在通知里说明可以直接在手机上处理。
             // 判据刻意取 Secure Input 而不是猜消息内容：它由应用自己打开，不会误判，也不分语言。
             let needsHands = remoteControlProbe?() ?? false
+            let question = task.pendingRequest?.question
             notify = .input(taskId: task.id, title: "\(label) 在等你回答",
                             body: needsHands
                                 ? "电脑上有个密码框在等着填，可以直接在手机上操作电脑"
-                                : (task.pendingRequest?.question ?? task.pendingRequest?.summary ?? task.title))
+                                : (question ?? task.pendingRequest?.summary ?? task.title))
+            notify.kind = needsHands ? .secureInput : .input
+            // 正文是请求摘要时带上它的短语（协议 3.11），手机按自己的语言写；问题原文与任务标题不带。
+            if !needsHands, question == nil { notify.bodyPhrase = Self.bodyPhrase(task.pendingRequest?.summaryPhrase) }
             if needsHands { onRemoteControlNeeded?(task.id) }
         case .completed:
             notify = .done(taskId: task.id, title: "\(label) 任务完成", body: task.lastMessage ?? task.title)
+            notify.kind = .done
         case .failed:
-            notify = .failed(taskId: task.id, title: "\(label) 任务失败", body: task.lastMessage ?? task.title)
+            let body = failureBody.map { SessionFormatting.truncate($0, SessionFormatting.lastMessageLimit) }
+            notify = .failed(taskId: task.id, title: "\(label) 任务失败", body: body ?? task.lastMessage ?? task.title)
+            notify.kind = .failed
         case .running, .interrupted, .idle:
             return nil
         }
+        notify.connectorName = label
         lastNotified[task.id] = (key, current)
         return notify
+    }
+
+    /// 推送正文的短语编码后最多多少字节。推送密文要塞进 APNs / FCM 的 4 KB，短语超了就不带，手机照旧显示中文的 `body`；
+    /// 连接器经 `RequestPhrase` 的构造器建的摘要短语（一行、列表有总长上限）远小于它，这只是兜底。
+    static let bodyPhraseBudget = 1024
+
+    private static func bodyPhrase(_ phrase: RequestPhrase?) -> RequestPhrase? {
+        guard let phrase, let data = try? ProtocolJSON.encoder().encode(phrase), data.count <= bodyPhraseBudget else {
+            return nil
+        }
+        return phrase
     }
 
     /// 推送标题里的来源名。ACP agent（协议 2.13）共用一个来源，名字各不相同：用注册表里它的显示名，

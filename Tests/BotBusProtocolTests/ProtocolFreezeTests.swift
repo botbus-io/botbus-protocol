@@ -83,6 +83,6 @@ final class ProtocolFreezeTests: XCTestCase {
     }
 
     func testProtocolVersionMatchesTheFrozenContract() {
-        XCTAssertEqual(ProtocolVersion.current, "3.9")
+        XCTAssertEqual(ProtocolVersion.current, "3.11")
     }
 }

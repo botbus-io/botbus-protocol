@@ -1,6 +1,6 @@
 # BotBus 协议
 
-版本 **3.9**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
+版本 **3.11**（逐版本沿革见附录 A）。所有 JSON 字段 camelCase；时间为 ISO 8601 UTC 字符串，固定格式 `YYYY-MM-DDTHH:MM:SSZ`（秒精度，不带小数）；Relay 依赖该格式做字典序时间比较，Relay 自己生成的时间也遵守此格式。Swift 用 `ProtocolJSON.timestamp()`，TypeScript 用 `nowIso()`；枚举为字符串；可选字段缺省时整个键省略，不写 `null`。
 
 Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，Kotlin 实现（Android）是 `Protocol.kt`，密封层在同目录的 `Sealing.kt` / `SealedTypes.kt`。在 app 仓库里它们分别位于 `Packages/BotBusProtocol`、`relay/src/protocol.ts` 与 `android/core/src/main/kotlin/io/botbus/core/`；公开仓库 `botbus-io/botbus-protocol` 由 app 仓库自动同步，前两者在那里是 `Sources/BotBusProtocol` 与 `src/protocol.ts`。三端都必须通过 `protocol-fixtures/` 下全部样本的往返测试，且拒绝 `invalid/` 下的样本：顶层是线上的密封形状，`plain/` 是密文里的明文结构（见文末「Fixture 与类型对应」）。Swift 中 `Task` 命名为 `TaskRecord`。
 
@@ -11,7 +11,7 @@ Swift 实现是 `BotBusProtocol` 包，TypeScript 实现是 Relay 的 schema，K
 | 总则 | Snapshot / Event / Command 三种载体、端到端加密、WebSocket 帧、版本握手、Relay HTTP 一览 |
 | 一、电脑与连接器 | AgentInfo、ConnectorInfo、ModelOption、Project、`setConnectorEnabled`、`restartConnector` |
 | 二、任务与状态 | Task、TaskStatus、`startTask` / `followUp` / `interrupt` |
-| 三、审批与提问 | PendingRequest、PendingQuestion、`approve`、SystemPermissionNotice |
+| 三、审批与提问 | PendingRequest、PendingQuestion、RequestPhrase（3.11）、`approve`、SystemPermissionNotice |
 | 四、对话与附件 | Message、MessageAttachment、MessageFileRef、TaskMessages、`fetchMessages` / `fetchFile` |
 | 五、产物与文件 | Artifact、产物字节的加密、WorkingChanges、`fetchChanges` |
 | 六、屏幕共享与远程操作 | `remoteControl`、远程操作的加密、「操作电脑」工作区（3.7）、预览主机与隧道 |
@@ -164,25 +164,25 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 
 | 方法 | 路径 | 鉴权 | 请求 | 响应 |
 |---|---|---|---|---|
-| POST | /agent/register | 无，按 IP 每分钟 10 次 | 空 | 201 `{agentId, agentToken, code, expiresAt}`；429 限速 |
-| POST | /agent/invite | agent，按 IP 每分钟 10 次 | 空 | 201 `{code, expiresAt}`；409 本 Agent 尚未被认领；429 限速 |
+| POST | /agent/register | 无，按 IP 每分钟 10 次；与 `/agent/invite` 合计每来源每小时 30 张码、全局每分钟 300 张 | 空 | 201 `{agentId, agentToken, code, expiresAt}`；429 限速 |
+| POST | /agent/invite | agent，按 IP 每分钟 10 次；发码上限同 `/agent/register` | 空 | 201 `{code, expiresAt}`；409 本 Agent 尚未被认领；429 限速 |
 | POST | /pair/claim | 无，按 IP 每分钟 10 次 | `{code, sealedName?, keyEnvelope?}`（3.0：注册码建新组时 `keyEnvelope` 必填，邀请码时省略；`sealedName` 是手机名的密文） | 201 `{pairId, clientToken, agents:[SealedAgent]}`；400 格式错，或注册码缺 `keyEnvelope`（码已消费）；404 码不存在或过期；409 该组已有 10 台手机；429 限速，或该来源猜错太多次被锁（见「配对码」） |
 | POST | /pair/agents | client | `{code, keyEnvelope}`（3.0 起信封必填，缺了 400 且码不消费） | 201 `{agent: SealedAgent}`；400 这是手机邀请码（码不消费）；404 码无效；409 已有 10 台电脑；429 该来源猜错太多次被锁 |
 | DELETE | /pair/agents/:agentId | client | | 204；404 不属于本 Pair |
 | GET | /pair/clients | client | | 200 `{clients:[{id, sealedName?, addedAt, current}]}`（3.0：名字是各手机自己封的密文，v2 时代的记录没有） |
 | DELETE | /pair/clients/:id | client 或 agent（agent 2.15 起） | | 204，这份凭据的推送连接以 4001 关闭，它（与同步了它的手表）注册的推送设备一并删除；404 不属于本 Pair；409 这是最后一份凭据 |
-| GET | /agent/ws | agent（Bearer + `X-Agent-Id`） | `Upgrade: websocket` | 101；409 尚未被认领 |
+| GET | /agent/ws | agent（Bearer + `X-Agent-Id`） | `Upgrade: websocket` | 101；409 尚未被认领。每台电脑的上行帧按令牌桶限速（突发 600、每秒 10 帧），超了以 1008 关闭，Agent 按普通断线退避重连；`notify` 另有每分钟 10 条（突发 20）的上限，超了只丢推送 |
 | GET | /agent/devices | agent | | 200 `{devices:[{sealedName, platform, lastSeenAt, clientId?}], clients:[{id, sealedName?, addedAt}]}`（3.0：两处名字都是手机自己封的密文，AAD `client`；`clients` 与 `clientId` 2.15 起；所属手机已不在组里的注册不列出） |
 | GET | /client/snapshot?since=N | client | | 200 SealedSnapshot；304 无变化（最多挂 25 秒）；401 |
 | GET | /client/ws?since=N | client | `Upgrade: websocket` | 101，之后推送 ClientFrame（见「WebSocket 帧」）；401；403 角色不符；426 缺 `Upgrade: websocket` |
 | POST | /client/commands | client | SealedCommand | 202 `{commandId, delivered}`；400 格式错（含 2.x 的明文命令）；404 `agentId` 不属于本 Pair；413 单条超过 16 KiB；503 该 Agent 的离线队列已满（50 条） |
 | POST | /client/devices | client | `{token, platform: ios\|watchos\|android, environment: sandbox\|production, sealedName}`（3.0：设备名是密文，AAD `client`；Android 固定传 `production`，FCM 不使用该字段） | 204；iOS / Android 登记时将名称密文同步到所属手机凭据，供 `/pair/clients` 与 `/agent/devices` 显示改名；手表不覆盖手机名。400 格式错或 token 超过 4096 字符；409 已有 10 台设备 |
 | DELETE | /client/devices/:token | client | | 204；400 token 百分号编码非法 |
-| PUT | /agent/artifacts/:artifactId | agent，按 agentId 每小时 120 次 | 密封字节，`Content-Type: application/octet-stream`（3.0） | 201 ArtifactUploadResponse `{id, size, expiresAt}`；400 id 格式错或缺 `Content-Type`；415 不是 octet-stream（明文不落 Relay）；409 该 id 已被别的 Agent 占用（本 Agent 尚未被认领也是 409）；413 超过 10 MiB；429 限速。同一 Agent 重传同一 id 即覆盖并重新计 TTL |
+| PUT | /agent/artifacts/:artifactId | agent，按 agentId 每小时 120 次 | 密封字节，`Content-Type: application/octet-stream`（3.0） | 201 ArtifactUploadResponse `{id, size, expiresAt}`；400 id 格式错或缺 `Content-Type`；415 不是 octet-stream（明文不落 Relay）；409 该 id 已被别的 Agent 占用（本 Agent 尚未被认领也是 409）；413 超过 10 MiB；429 限速，或本组存活的产物超过配额（2000 件或 2 GiB，与手机上传合计）。同一 Agent 重传同一 id 即覆盖并重新计 TTL |
 | GET | /client/artifacts/:agentId/:artifactId | client（该电脑须属于本 Pair） | | 200 存下的（密封）字节 + 原 `Content-Type`（3.0 起总是 octet-stream）+ `Cache-Control: private, max-age=86400`（另带 `X-Content-Type-Options: nosniff`、`Content-Security-Policy: sandbox`）；404 不存在、已过期或不属于该电脑 |
-| PUT | /client/uploads/:agentId/:artifactId | client（该电脑须属于本 Pair），按组每小时 60 次 | 密封字节，`Content-Type` 必须是 `application/octet-stream`（3.0；真实类型在命令的 attachments 里） | 201 ArtifactUploadResponse `{id, size, expiresAt}`；400 id 格式错或缺 `Content-Type`；401/403/404 鉴权与归属同 `GET /client/artifacts`；409 该 id 已被占用（同组手机重传同一 id 直接覆盖并重新计 TTL）；413 超过 10 MiB；415 不是 octet-stream；429 限速 |
+| PUT | /client/uploads/:agentId/:artifactId | client（该电脑须属于本 Pair），按组每小时 60 次 | 密封字节，`Content-Type` 必须是 `application/octet-stream`（3.0；真实类型在命令的 attachments 里） | 201 ArtifactUploadResponse `{id, size, expiresAt}`；400 id 格式错或缺 `Content-Type`；401/403/404 鉴权与归属同 `GET /client/artifacts`；409 该 id 已被占用（同组手机重传同一 id 直接覆盖并重新计 TTL）；413 超过 10 MiB；415 不是 octet-stream；429 限速，或本组产物配额已满 |
 | GET | /agent/uploads/:artifactId | agent | | 200 原始字节 + 原 `Content-Type`（响应头同 `GET /client/artifacts`）；404 不存在、已过期，或不是手机传给这台电脑的 |
-| POST | /agent/previews | agent，按 agentId 每小时 60 次 | PreviewCreateRequest `{title?}`，可为空 | 201 PreviewCreateResponse `{previewId, expiresAt}`；400 不是合法 JSON；413 超过 4 KiB；429 限速 |
+| POST | /agent/previews | agent，按 agentId 每小时 60 次 | PreviewCreateRequest `{title?}`，可为空 | 201 PreviewCreateResponse `{previewId, expiresAt}`；400 不是合法 JSON；413 超过 4 KiB；429 限速，或本组同时存活的预览已满 30 个（停止分享即释放） |
 | DELETE | /agent/previews/:previewId | agent（须是创建者） | | 204，隧道以 4001 关闭、浏览器 WebSocket 以 1001 关闭并删除预览状态；404 不存在、已过期或不是创建者 |
 | GET | /agent/previews/:previewId/tunnel | agent（须是创建者） | `Upgrade: websocket` | 101；同一预览的新连接以 4000 顶掉旧连接；404 不存在、已过期或不是创建者；426 缺 `Upgrade: websocket` |
 | POST | /client/previews/:previewId/session | client（预览须属于本 Pair） | 空 | 201 PreviewSessionResponse `{url, expiresAt}`：`url` 是带一次性 ticket 的预览入口，`expiresAt` 是 ticket 的失效时间（签发后 60 秒）；404 不存在、已过期或不属于本 Pair |
@@ -337,11 +337,41 @@ TaskStatus：`running` 有轮次进行中；`waitingApproval` 有 pendingRequest
 
 ### PendingRequest 与 PendingQuestion
 
-PendingRequest：`id` string，`kind` `command` \| `fileChange` \| `permission` \| `input`，`summary` string（一行），`detail` string?（截断 2000 字），`question` string?（kind = input 时 agent 的提问），`questions` [PendingQuestion]?（2.14 起，1–8 道：kind = input 时是要用户回答的问题；挂在审批上时是「允许」的几种范围，见下）。
+PendingRequest：`id` string，`kind` `command` \| `fileChange` \| `permission` \| `input`，`summary` string（一行），`detail` string?（截断 2000 字），`question` string?（kind = input 时 agent 的提问），`questions` [PendingQuestion]?（2.14 起，1–8 道：kind = input 时是要用户回答的问题；挂在审批上时是「允许」的几种范围，见下），`summaryPhrase` RequestPhrase?、`detailPhrases` [RequestPhrase]?（3.11 起，见下「审批摘要的短语」）。
 
 PendingQuestion（2.14）：`id` string（同一请求内唯一，作 `approve.answers` 的键；Claude 是问题下标 `"0"`、`"1"`…，Codex 是它自己的问题 id），`question` string，`header` string?（短标签），`multiSelect` `true`?（单选时整个键省略），`options` [{`label` string, `description` string?}]（最多 16 个，可以为空——只能打字答的问题）。有 `questions` 时 `question` 仍是写好选项的纯文字，给不认新字段的旧客户端看。客户端在**每道题都有选项**时画点选，选好后发 `approve {decision: allow, answers}`，`deny` 表示跳过不答；也可以照旧 `followUp` 一段文字，Agent 把它当作所有问题的回答（带图的 `followUp` 此时被拒，免得图被丢掉）。Claude 的 AskUserQuestion 经 `PermissionRequest` hook 到达，Agent 把它记为 `waitingInput`（不再是要批准的 `permission`），回答写进 hook 的 `updatedInput.answers`（问题原文 → label，多选用 `, ` 连接），与电脑上的提问框先答者生效；`allow` 却没带任何认得的答案时回 `ok: false`，请求继续挂着。
 
 审批（kind = `command` / `fileChange` / `permission`）也可以带 `questions`：那是「允许」的几种范围，不是要回答的问题——OpenClaw 的 exec 审批带一道单选 `scope`（「只这一次」/「以后都允许」，后者写进它的白名单）；ACP 的 `session/request_permission` 把 agent 的 `allow_once` / `allow_always` 选项按这个顺序列出（拒绝类的不列，那是「拒绝」按钮；agent 一个允许选项都没给时不带 `questions`）。客户端照旧显示命令与「拒绝」/「批准」，选项默认选第一个（第一个总是最保守的一次性允许），「批准」带 `answers`，「拒绝」不带；`answers` 缺失或认不出时 Agent 按第一个选项处理，所以旧客户端点「批准」的效果和 2.13 之前完全一样。
+
+### 审批摘要的短语（3.11）
+
+`summary` / `detail` 由连接器生成，里面有电脑写的简体中文（「执行命令：<命令>」「修改 2 个文件：…」「工作目录：…」）。3.11 起电脑另报拼这些话用的**短语**，手机按自己的界面语言重写；中文原文照写，留给 3.10 及更早的手机：
+
+- `summaryPhrase` RequestPhrase?：`summary` 是由哪一句话拼的。摘要是 agent 的原话（Claude 的工具名 `Bash`、Codex 与 DeepSeek Harness 给的理由、提问的短标签、ACP 工具调用的标题或 kind、OpenClaw 的命令原文）时省略。
+- `detailPhrases` [RequestPhrase]?（1–8 句）：`detail` 逐行由哪些话拼的，按行的顺序、`\n` 连接；agent 的原话是 `text` 一句。只在详情里有电脑写的话时才带——详情是补丁、工具参数这类原文时省略。
+
+RequestPhrase：`kind` string（开集），`text` string?，`items` [string]?（1–20 个），`count` integer?（≥ 0）。参数是 agent 或电脑上的原文（命令、路径、文件名、agent 名），手机不翻译它们。生产方负责截断（Swift 的构造器已经做了）：命令、路径、工具名、agent 名这类单段原文最多 1000 字；`items` 按顺序留到 20 个、连起来（每个之间算一个分隔字）不超过 200 字为止，至少留一个（太长就截断）。`items` 丢过时 `count` 记总数，两端写句子都在列表末尾加「…」——审批的范围不能被悄悄藏起来。
+
+| kind | 参数 | 简体中文（电脑写进 `summary` / `detail` 的原文，也是手机词条的 key） | 谁在用 |
+|---|---|---|---|
+| `text` | `text` | 原样 | 详情里 agent 的原话（Codex 的理由） |
+| `runCommand` | `text`：命令（一行） | 执行命令：<命令> | Codex、DeepSeek Harness |
+| `requestCommand` | — | 请求执行命令 | Codex、OpenClaw 没给命令时 |
+| `editFiles` | `items`：文件名（最后一段）；`count`：总数，省略 = `items` 的个数 | 修改 <n> 个文件：<a>、<b>（`count` 大于 `items` 的个数时列表末尾加「…」，下面几种列表同样） | Codex |
+| `requestFileChange` | — | 请求修改文件 | Codex 没说改哪些文件时 |
+| `requestPermission` | `text`?：工具名 | <工具> 请求授权；没有工具名时「请求权限」 | DeepSeek Harness、Claude 没有工具名时 |
+| `requestExtraPermissions` | — | 请求额外权限 | Codex 的 permissions 请求 |
+| `toolCall` | — | 工具调用 | ACP 工具调用没有标题时 |
+| `awaitingAnswer` | `text`：agent 名 | <agent> 在等你回答 | 提问没有标签也没有问题文字时 |
+| `workingDirectory` | `text`：路径 | 工作目录：<路径> | Codex、OpenClaw 的详情 |
+| `networkAccess` / `networkPolicy` | — | 网络访问 / 网络策略调整 | Codex permissions 的详情 |
+| `readPaths` / `writePaths` | `items`：路径；`count`：总数 | 读取：<a>、<b> / 写入：<a>、<b> | 同上 |
+| `options` | `items`：选项名；`count`：总数 | 可选项：<a>、<b> | Codex 提问的详情 |
+| `moreQuestions` | `count` ≥ 1 | 还有 <n> 个问题 | 同上 |
+
+- 手机写摘要：`summaryPhrase` 认得、参数齐全（`text` 非空、`items` 非空、`count` ≥ 1，各按上表）时按本机语言写，否则显示 `summary`。写详情：`detailPhrases` **每一句**都写得出时逐行写，有一句写不出就整段显示 `detail`，不拼半段。规则在 ClientCore 的 `RequestPhraseText` 与 Android 的同名文件里，审批卡、手表、推送正文（见「七、通知」的 `bodyPhrase`）共用。
+- 电脑先建短语，再用 ConnectorKit 的 `RequestPhrase.chineseText` 拼出中文，两份说的是同一件事；手机 zh-Hans 的词条 key 就是这份原文，中文手机看到的与电脑写的一字不差。
+- 还没覆盖的电脑写的中文：审批「允许范围」的选项名（OpenClaw 的「只这一次」「以后都允许」，手机以 `approve.answers` 原样回传这个名字，要改得先给选项加 id），以及只给不认 `questions` 的旧手机看的 `question` 纯文字（「（可多选）」）。
 
 ### 项目级自动批准（3.3）
 
@@ -355,7 +385,7 @@ PendingQuestion（2.14）：`id` string（同一请求内唯一，作 `approve.a
 
 ### SystemPermissionNotice
 
-2.10 起，Agent 在任务或命令执行失败后检测到系统授权弹窗时，随 `Task.systemPermission` 或 `CommandResult.systemPermission` 返回一次检测证据，并发一条提醒手机回电脑处理的 `TASK_FAILED` 通知；同一弹窗的额外通知按 id 去重。任务尚未创建（没有 `taskId`）时也可通过命令结果返回，通知的 `taskId` 为 `""`，点开只进入 App 首页。它不证明弹窗导致了失败，也不表示弹窗当前仍在等待处理；不能据此生成 `pendingRequest`、改成 `waitingApproval` 或提供远程批准操作。客户端提供本地化说明，提示用户回电脑确认；`dialogText` 保留电脑系统弹窗原文。
+2.10 起，Agent 在任务或命令执行失败后检测到系统授权弹窗时，随 `Task.systemPermission` 或 `CommandResult.systemPermission` 返回一次检测证据，并发一条提醒手机回电脑处理的 `TASK_FAILED` 通知（3.10 起种类是 `systemPermission`，手机用本机语言写标题正文）；同一弹窗的额外通知按 id 去重。任务尚未创建（没有 `taskId`）时也可通过命令结果返回，通知的 `taskId` 为 `""`，点开只进入 App 首页。它不证明弹窗导致了失败，也不表示弹窗当前仍在等待处理；不能据此生成 `pendingRequest`、改成 `waitingApproval` 或提供远程批准操作。客户端提供本地化说明，提示用户回电脑确认；`dialogText` 保留电脑系统弹窗原文。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -461,7 +491,7 @@ ChangedFile：`path` string（相对 `directory`）；`oldPath` string?（改名
 
 输入默认锁着，要在手机上显式解锁，闲置 10 分钟自动锁回；能看是无害的，能打字不是。注入走 `CGEvent` 的 `.cghidEventTap`，网页登录框、1Password 原生弹窗、`sudo` 提示都收得到——**Chrome 的密码框会打开 macOS 的 Secure Input，但它挡的是监听不是注入**，远程输密码因此成立。**TCC 授权弹窗按不动**（macOS 不允许合成事件点权限授权框），只能读出来给人看，必须本人回电脑处理，这也是 `SystemPermissionNotice` 一直只做提示的原因。
 
-Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时，Mac 会自动开一份挂在那条任务上的远程操作预览，`TASK_INPUT` 通知的正文随之改成「电脑上有个密码框在等着填，可以直接在手机上操作电脑」。判据取 Secure Input 而不是猜消息内容：由应用自己打开，不会误判，也不分语言。没有辅助功能权限时不自动开。
+Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时，Mac 会自动开一份挂在那条任务上的远程操作预览，`TASK_INPUT` 通知的正文随之改成「电脑上有个密码框在等着填，可以直接在手机上操作电脑」（3.10 起通知种类是 `secureInput`，手机用本机语言写这句，见「七、通知」）。判据取 Secure Input 而不是猜消息内容：由应用自己打开，不会误判，也不分语言。没有辅助功能权限时不自动开。
 
 ### 远程操作
 
@@ -687,13 +717,30 @@ WebSocket（三期）的细节：
 
 ### Notify
 
-Notify：`taskId` string，`category` `TASK_APPROVAL` \| `TASK_INPUT` \| `TASK_DONE` \| `TASK_FAILED`，`title` string，`body` string，`requestId` string?（TASK_APPROVAL 必填，Relay 收到时校验信封外面那一份），`agentName` string?（3.0 起：发通知的电脑名，由 Mac 在密封前填上，Relay 读不到）。
+Notify：`taskId` string，`category` `TASK_APPROVAL` \| `TASK_INPUT` \| `TASK_DONE` \| `TASK_FAILED`，`title` string，`body` string，`requestId` string?（TASK_APPROVAL 必填，Relay 收到时校验信封外面那一份），`agentName` string?（3.0 起：发通知的电脑名，由 Mac 在密封前填上，Relay 读不到），`kind` string?、`connectorName` string?、`hasScreenshot` boolean?（3.10 起，见下），`bodyPhrase` RequestPhrase?（3.11 起，见下）。
+
+`title` / `body` 是电脑写好的简体中文。3.10 起电脑另报通知**种类** `kind`，手机按自己的界面语言拼标题与固定说明（iPhone 的通知扩展与 Android 用同一套规则）；`title` / `body` 照写，留给旧手机。`kind` 是开集，每种只配一个类别：
+
+| `kind` | `category` | 手机写的标题 | 手机写的正文 |
+|---|---|---|---|
+| `approval` | TASK_APPROVAL | 「<connectorName> 等待审批」 | 请求摘要：有 `bodyPhrase` 时按它写（3.11），否则 `body` 原样 |
+| `input` | TASK_INPUT | 「<connectorName> 在等你回答」 | 问题（`body` 原样）；没有问题文字、正文是请求摘要时同 `approval` |
+| `secureInput` | TASK_INPUT | 同 `input` | 固定说明：电脑上有个密码框在等着填，可以直接在手机上操作电脑（见「远程操作」的 Secure Input） |
+| `done` | TASK_DONE | 「<connectorName> 任务完成」 | `body`（最后一条消息，原样） |
+| `failed` | TASK_FAILED | 「<connectorName> 任务失败」 | `body`（最后一条消息，原样） |
+| `systemPermission` | TASK_FAILED | 固定说明：电脑需要系统授权 | 固定说明：任务失败后检测到系统授权弹窗……；`hasScreenshot: true` 时多一句「可在 App 中查看截图」 |
+
+- `connectorName`：标题里的 agent 名（`Codex`、`Claude`、ACP agent 在注册表里的显示名），品牌名不翻译；随 `systemPermission` 以外的种类。缺了或是空白时手机标题退回 `title`。
+- `hasScreenshot`：只随 `systemPermission`，电脑截到了弹窗（截图在 `Task` / `CommandResult.systemPermission` 里）；只写 true 或省略。
+- 手机不认得的 `kind`、`kind` 与 `category` 对不上、或没有 `kind`（3.9 及更早的电脑）时，照旧显示 `title` / `body`。
+- `bodyPhrase`（3.11）：只随 `approval` / `input`，且 `body` 就是那条请求的 `summary` 时，带上它的 `summaryPhrase`（见「审批摘要的短语」）；手机照审批卡的规则写正文，写不出时显示 `body`。正文是问题原文、最后一条消息时不带。推送密文要塞进 APNs / FCM 的 4 KB，短语编码后超过 1 KB 时电脑不带它（按上面的截断规则建的摘要短语远小于这个数）。
+- 除上面这些，`body` 一律原样显示：提问与最后一条消息是 agent 的原话。3.10 的电脑不带 `bodyPhrase`，审批摘要照旧是电脑写的中文。
 
 ### 推送
 
-Relay 发给 APNs 的只有 `aps.alert.loc-key`（按类别选一句固定文案，key 是简体中文原文：`有任务在等你审批`、`有任务在等你回复`、`任务完成了`、`任务失败了`，app 的词条表里有各语言译文）、`mutable-content: 1`、`category`、`thread-id`，以及顶层的 `taskId`、`requestId?`、`agentId`、`sealed`。iPhone 的通知服务扩展用 `K_notify` 解开 `sealed`，换上电脑发来的标题、正文与电脑名（`Notify.agentName`）；解不开或没有扩展（手表）时停在固定文案。
+Relay 发给 APNs 的只有 `aps.alert.loc-key`（按类别选一句固定文案，key 是简体中文原文：`有任务在等你审批`、`有任务在等你回复`、`任务完成了`、`任务失败了`，app 的词条表里有各语言译文）、`mutable-content: 1`、`category`、`thread-id`，以及顶层的 `taskId`、`requestId?`、`agentId`、`sealed`。iPhone 的通知服务扩展用 `K_notify` 解开 `sealed`，换上标题、正文（3.10 起按 `Notify.kind` 用手机的语言写，见上）与电脑名（`Notify.agentName`）；解不开或没有扩展（手表）时停在固定文案。
 
-Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先级 data message，保留 600 秒。`message.data` 只有字符串 `agentId`、`taskId`、`category`、可选 `requestId` 和 `sealed`；标题、正文和电脑名仍在 `K_notify` 密文里，Relay 和 Firebase 都读不到。Android 在本机核对信封外字段与解密结果后才显示系统通知；解不开时不显示。收到第一条有效 FCM 消息之前，Android 每 15 分钟查一次快照作为后备提醒；Relay 没配 FCM 凭据时也能提醒。
+Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先级 data message，保留 600 秒。`message.data` 只有字符串 `agentId`、`taskId`、`category`、可选 `requestId` 和 `sealed`；标题、正文和电脑名仍在 `K_notify` 密文里，Relay 和 Firebase 都读不到。Android 在本机核对信封外字段与解密结果后才显示系统通知，标题与正文的规则同 iPhone；解不开时不显示。收到第一条有效 FCM 消息之前，Android 每 15 分钟查一次快照作为后备提醒；Relay 没配 FCM 凭据时也能提醒。
 
 ## 八、配对、凭据与设备
 
@@ -762,6 +809,8 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - 版本 3.9 加入**手机上的 Agent 管理**与**新建项目选位置**：`restartConnector` 命令与 `AgentInfo.canRestartConnectors`（手机的「停止 / 启动」沿用 2.x 起就有的 `setConnectorEnabled`）；`startTask.newProjectParent` 与 `AgentInfo.canChooseProjectParent`。都在密文里，新命令与新字段只发给声明支持的电脑，旧端忽略能力字段；Relay 只改版本号，三条最低线不动。
 - 终端（「操作电脑」第二期，2026-10）**不改版本号**：管理端点与 `/term/attach` 都在 3.7 的工作区加密预览里，Relay 不变；手机按 `/status.features` 里的 `terminal` 判断，旧手机不认它、照常只有文件与屏幕。
 - 「操作电脑」第三期（不改版本号）：Linux / Windows 宿主也报 `AgentInfo.workspace`（文件与终端，没有屏幕；`capabilities` 不变）；工作区补上 Windows 的路径写法与「此电脑」（空串）、失败码 `noTrash`（开集，旧手机按 `failed`）、目录项的 `undecodable`（可选，旧手机忽略）。三条最低线与宿主的 `minClientProtocol` 都不动；3.7–3.8 的手机连 Windows 宿主时路径的面包屑与「上一级」不完整（见计划 `docs/superpowers/plans/2026-10-04-remote-workspace-3-hosts.md` 关键决定 1）。
+- 版本 3.10 让**推送按手机的语言显示**：`Notify` 加 `kind`（开集：`approval` / `input` / `secureInput` / `done` / `failed` / `systemPermission`）、`connectorName` 与 `hasScreenshot`，手机按种类用本机语言拼标题与固定说明，电脑照旧写中文的 `title` / `body` 给旧手机（见「七、通知」）。都在推送密文里，Relay 只改版本号，三条最低线不动；新电脑配旧手机、旧电脑配新手机都显示原来的中文。
+- 版本 3.11 让**审批摘要按手机的语言显示**：`PendingRequest` 加 `summaryPhrase` / `detailPhrases`、`Notify` 加 `bodyPhrase`（类型 `RequestPhrase`，`kind` 开集），连接器写的「执行命令：…」「工作目录：…」等由手机用本机语言重写，agent 的原话照旧（见「审批摘要的短语」）。电脑照旧写中文的 `summary` / `detail` / `body` 给旧手机；短语里不认得或缺参数的，手机整段退回中文原文。都在密文里，Relay 只改版本号，三条最低线不动。
 
 ## 附录 B：Fixture 与类型对应
 
@@ -790,6 +839,11 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | event-notify-done.json | Event |
 | event-notify-input.json | Event |
 | event-notify-failed.json | Event |
+| event-notify-approval-kind.json | Event notify（3.10 带 `kind: approval` 与 `connectorName`） |
+| event-notify-secure-input.json | Event notify（3.10 `secureInput`，ACP agent 的显示名） |
+| event-notify-system-permission.json | Event notify（3.10 `systemPermission`，`taskId` 为空、带 `hasScreenshot`） |
+| event-notify-approval-phrase.json | Event notify（3.11 审批推送带 `bodyPhrase: runCommand`） |
+| snapshot-request-phrases.json | Snapshot（3.11 审批摘要的短语：Codex 的命令带理由与工作目录、改 23 个文件只列 2 个、额外权限、提问的选项与其余问题数，DeepSeek Harness 的「bash 请求授权」） |
 | frame-agent-event.json | AgentFrame |
 | frame-agent-ready.json | AgentReadyFrame（Mac 的 ready 帧，不带 `minClientProtocol`） |
 | frame-agent-ready-min-client.json | AgentReadyFrame（3.6 带 `minClientProtocol: "3.5"`，Linux 宿主） |
@@ -855,6 +909,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 | invalid/command-missing-agent-id.json | 必须被拒绝：Command 缺少必填的 agentId |
 | invalid/event-payload-mismatch.json | 必须被拒绝：Event 的 kind 与配套字段不匹配 |
 | invalid/pending-request-bad-kind.json | 必须被拒绝 |
+| invalid/pending-request-phrase-missing-kind.json | 必须被拒绝：`summaryPhrase` 缺 `kind`（3.11） |
 | invalid/agent-info-bad-connector-kind.json | 必须被拒绝：未知 connector kind |
 | invalid/artifact-bad-kind.json | 必须被拒绝：未知 artifact kind |
 | invalid/client-frame-payload-mismatch.json | 必须被拒绝：ClientFrame 的 type 与配套字段不匹配 |

@@ -70,6 +70,10 @@ const SCHEMA: Record<string, ZodType> = {
   "event-notify-failed.json": P.SealedEvent,
   "event-notify-input.json": P.SealedEvent,
   "event-notify.json": P.SealedEvent,
+  "event-notify-approval-kind.json": P.SealedEvent,
+  "event-notify-secure-input.json": P.SealedEvent,
+  "event-notify-system-permission.json": P.SealedEvent,
+  "event-notify-approval-phrase.json": P.SealedEvent,
   "event-snapshot.json": P.SealedEvent,
   "event-task-messages-with-attachments.json": P.SealedEvent,
   "event-task-messages.json": P.SealedEvent,
@@ -104,6 +108,7 @@ const SCHEMA: Record<string, ZodType> = {
   "snapshot-dsh.json": P.SealedSnapshot,
   "snapshot-linux-host.json": P.SealedSnapshot,
   "snapshot-auto-approve.json": P.SealedSnapshot,
+  "snapshot-request-phrases.json": P.SealedSnapshot,
   "snapshot-hermes-pi-openclaw.json": P.SealedSnapshot,
   "snapshot-multi-agent.json": P.SealedSnapshot,
   "snapshot.json": P.SealedSnapshot,
@@ -145,6 +150,7 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "snapshot-dsh.json": P.Snapshot,
   "snapshot-linux-host.json": P.Snapshot,
   "snapshot-auto-approve.json": P.Snapshot,
+  "snapshot-request-phrases.json": P.Snapshot,
   "task-waiting-approval.json": P.Task,
   "task-waiting-approval-choices.json": P.Task,
   "task-waiting-input.json": P.Task,
@@ -196,6 +202,10 @@ const PLAIN_SCHEMA: Record<string, ZodType> = {
   "event-notify-done.json": P.Event,
   "event-notify-input.json": P.Event,
   "event-notify-failed.json": P.Event,
+  "event-notify-approval-kind.json": P.Event,
+  "event-notify-secure-input.json": P.Event,
+  "event-notify-system-permission.json": P.Event,
+  "event-notify-approval-phrase.json": P.Event,
   "event-task-messages.json": P.Event,
   "event-task-messages-with-attachments.json": P.Event,
   "frame-agent-event.json": PlainAgentFrame,
@@ -236,6 +246,7 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
   "event-system-permission-missing-dialog-text.json": P.Event,
   "pending-question-missing-options.json": P.Task,
   "pending-request-bad-kind.json": P.Task,
+  "pending-request-phrase-missing-kind.json": P.Task,
   "task-acp-missing-connector-id.json": P.Task,
   "task-bad-status.json": P.Task,
 };
@@ -243,15 +254,15 @@ const PLAIN_MUST_REJECT: Record<string, ZodType> = {
 describe("fixture 目录与对照表一一对应", () => {
   it("每个 valid fixture 都在 SCHEMA / PLAIN_SCHEMA 表里，且表里没有已删除的文件", () => {
     expect([...validFixtures.keys()].sort()).toEqual(Object.keys(SCHEMA).sort());
-    expect(validFixtures.size).toBe(83);
+    expect(validFixtures.size).toBe(88);
     expect([...plainFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_SCHEMA).sort());
-    expect(plainFixtures.size).toBe(76);
+    expect(plainFixtures.size).toBe(81);
   });
   it("每个 invalid fixture 都在 MUST_REJECT / PLAIN_MUST_REJECT 表里", () => {
     expect([...invalidFixtures.keys()].sort()).toEqual(Object.keys(MUST_REJECT).sort());
     expect(invalidFixtures.size).toBe(4);
     expect([...plainInvalidFixtures.keys()].sort()).toEqual(Object.keys(PLAIN_MUST_REJECT).sort());
-    expect(plainInvalidFixtures.size).toBe(24);
+    expect(plainInvalidFixtures.size).toBe(25);
   });
 });
 
@@ -508,6 +519,20 @@ describe("protocol schemas reject bad input", () => {
     const { requestId: _omitted, ...withoutRequestId } = eventNotify.notify!;
     expect(P.Notify.safeParse(withoutRequestId).success).toBe(false);
     expect(P.Notify.safeParse(eventNotifyDone.notify).success).toBe(true);
+  });
+  it("3.11 的 RequestPhrase.kind 是开集：不认得的种类原样透传，参数类型照样校验", () => {
+    const future = { kind: "diskFull", text: "/Volumes/Data", count: 2 };
+    expect(P.RequestPhrase.parse(future)).toEqual(future);
+    expect(P.RequestPhrase.safeParse({ kind: "editFiles", items: [] }).success).toBe(false);
+    expect(P.RequestPhrase.safeParse({ kind: "moreQuestions", count: -1 }).success).toBe(false);
+    expect(P.RequestPhrase.safeParse({ kind: "moreQuestions", count: 1.5 }).success).toBe(false);
+    const tooMany = { kind: "editFiles", items: Array.from({ length: P.MAX_PHRASE_ITEMS + 1 }, (_, i) => `f${i}`) };
+    expect(P.RequestPhrase.safeParse(tooMany).success).toBe(false);
+  });
+  it("3.10 的 Notify.kind 是开集：不认得的种类原样透传", () => {
+    const future = { ...eventNotifyDone.notify!, kind: "diskFull", connectorName: "Codex" };
+    expect(P.Notify.parse(future)).toEqual(future);
+    expect(P.Notify.safeParse({ ...eventNotifyDone.notify!, hasScreenshot: "yes" }).success).toBe(false);
   });
   it("command whose payload does not match kind", () => {
     expect(P.Command.safeParse({ ...commandApprove, kind: "interrupt" }).success).toBe(false);

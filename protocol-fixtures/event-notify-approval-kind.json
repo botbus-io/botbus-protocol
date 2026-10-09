@@ -1,0 +1,10 @@
+{
+  "kind": "notify",
+  "notify": {
+    "taskId": "codex:01a0b000-0000-7000-8000-000000000002",
+    "agentId": "hV3nQ7pLxK2mR8sTfW4bZQ",
+    "category": "TASK_APPROVAL",
+    "requestId": "req-8c4b",
+    "sealed": "AdwLBlBd3mGAAChDSgG6zE0wMb25tw7wyh2woj4o1FTykXxmWBfmDVzLZTj1NPEyxpSu0PErm6hdIBVggay5chvN-Od_coSQMXYmD3pJM3QKbES7ncgZlKQkDx-haKuGD2-VM2UUS0f_y7TWovQE34VIywCRx1_thIB99Il2Rr5o4ie1EqWzohSgEdeSVTHDgRukQW1HNu_nN80-sAh2dzCPF5IT0pFedL8qktfHLUAiBV_7bFKJVq-950Vw1sudVIv1IfLRd5w3UNeJCHv0bT-ipcgXb4UhEtF4bD7YtczqZtMP7lckFjMEn0PB2urVspWVXAo6Xu4EArdmcKuPgb961xCK4U6t9S3UGg"
+  }
+}

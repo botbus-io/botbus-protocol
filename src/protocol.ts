@@ -53,6 +53,26 @@ export const PendingQuestion = z.object({
   options: z.array(PendingOption).max(MAX_QUESTION_OPTIONS),
 });
 
+/** 协议 3.11：`RequestPhrase.items` 与 `PendingRequest.detailPhrases` 的上限，生产方负责截断。 */
+export const MAX_PHRASE_ITEMS = 20;
+export const MAX_DETAIL_PHRASES = 8;
+
+/**
+ * 协议 3.11：审批摘要与详情里的一句话，手机据此用自己的语言重写（中文原文照旧在 summary / detail / body 里）。
+ * text / runCommand / requestCommand / editFiles / requestFileChange / requestPermission / requestExtraPermissions /
+ * toolCall / awaitingAnswer / workingDirectory / networkAccess / networkPolicy / readPaths / writePaths / options /
+ * moreQuestions；开集：任何字符串都透传（与 Swift / Kotlin 一致），手机不认得或缺参数时整段退回原文。
+ */
+export const RequestPhrase = z.object({
+  kind: z.string(),
+  /** 一段原文：命令、路径、agent 名、工具名，或 `text` 的整句。 */
+  text: z.string().optional(),
+  /** 一组原文：文件名、路径、选项名。 */
+  items: z.array(z.string()).min(1).max(MAX_PHRASE_ITEMS).optional(),
+  /** 带 items 的种类的总个数（省略 = items 的个数；items 截断过时大于它），moreQuestions 的其余问题数。 */
+  count: z.number().int().nonnegative().optional(),
+});
+
 export const PendingRequest = z.object({
   id: z.string(),
   kind: z.enum(["command", "fileChange", "permission", "input"]),
@@ -61,6 +81,10 @@ export const PendingRequest = z.object({
   question: z.string().optional(),
   /** 协议 2.14：只随 kind = input 出现。 */
   questions: z.array(PendingQuestion).min(1).max(MAX_PENDING_QUESTIONS).optional(),
+  /** 协议 3.11：summary 是由哪一句话拼的；摘要是 agent 原话时省略。 */
+  summaryPhrase: RequestPhrase.optional(),
+  /** 协议 3.11：detail 逐行由哪些话拼的（`\n` 连接）；详情里没有电脑写的中文时省略。 */
+  detailPhrases: z.array(RequestPhrase).min(1).max(MAX_DETAIL_PHRASES).optional(),
 });
 
 // ---- Artifact（协议 2.3，2.9 加 video） ----
@@ -547,6 +571,18 @@ export const Notify = z
     requestId: z.string().optional(),
     /** 协议 3.0：发通知的电脑名。整条 Notify 在密文里，由 Mac 自己填，给 iPhone 的通知扩展显示。 */
     agentName: z.string().optional(),
+    /**
+     * 协议 3.10：通知种类，手机据此按自己的语言拼标题与固定说明（`title` / `body` 是给旧手机的中文原文）。
+     * approval / input / secureInput / done / failed / systemPermission；开集：任何字符串都透传（与 Swift / Kotlin 一致），
+     * 手机不认得、或与 category 对不上时照旧显示 title / body。
+     */
+    kind: z.string().optional(),
+    /** 协议 3.10：标题里的 agent 名（Codex、Claude、ACP agent 的显示名），随 systemPermission 以外的种类。 */
+    connectorName: z.string().optional(),
+    /** 协议 3.10：只随 systemPermission：电脑截到了弹窗，App 里能看。只写 true 或省略。 */
+    hasScreenshot: z.boolean().optional(),
+    /** 协议 3.11：只随 approval / input，且 body 就是请求摘要时：摘要那一句（同 PendingRequest.summaryPhrase）。 */
+    bodyPhrase: RequestPhrase.optional(),
   })
   .superRefine((n, ctx) => {
     if (n.category === "TASK_APPROVAL" && n.requestId === undefined) {
@@ -856,6 +892,7 @@ export type PreviewCreateRequest = z.infer<typeof PreviewCreateRequest>;
 export type PreviewCreateResponse = z.infer<typeof PreviewCreateResponse>;
 export type PreviewSessionResponse = z.infer<typeof PreviewSessionResponse>;
 export type PendingRequest = z.infer<typeof PendingRequest>;
+export type RequestPhrase = z.infer<typeof RequestPhrase>;
 export type Project = z.infer<typeof Project>;
 export type ConnectorKind = z.infer<typeof ConnectorKind>;
 export type ConnectorInfo = z.infer<typeof ConnectorInfo>;

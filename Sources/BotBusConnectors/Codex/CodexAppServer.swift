@@ -52,8 +52,12 @@ public typealias CodexSleeper = @Sendable (TimeInterval) async -> Void
 ///   这个项目被二次 resume 的 `CheckedContinuation` 打死过一次，不再来第二回。
 /// - **日志只记种类、方法名、id 与字节数**，绝不记 params / result 本体——那里面是用户的会话内容。
 public actor CodexAppServer {
-    /// 子进程退出后隔多久重启（spec 6.1）。
+    /// 子进程退出后隔多久重启（spec 6.1）：第一次的间隔，之后每次连着崩溃翻倍，见 `maxRestartDelay`。
     public static let restartDelay: TimeInterval = 3
+    /// 连着崩溃时重启间隔的上限。
+    public static let maxRestartDelay: TimeInterval = 5 * 60
+    /// 一代进程活够这么久再退出，才把重启间隔打回 `restartDelay`。
+    public static let stableRunInterval: TimeInterval = 60
     /// 单条请求的硬超时。
     public static let defaultRequestTimeout: TimeInterval = 60
     /// 单行上限。正常的一行可以很大（整个补丁），但不能无上限地攒下去。
@@ -79,17 +83,23 @@ public actor CodexAppServer {
         public var clientVersion: String
         public var requestTimeout: TimeInterval
         public var restartDelay: TimeInterval
+        public var maxRestartDelay: TimeInterval
+        public var stableRunInterval: TimeInterval
         public var maxLineBytes: Int
 
         public init(clientName: String = "BotBus",
                     clientVersion: String = AgentIdentity.bundleVersion(),
                     requestTimeout: TimeInterval = CodexAppServer.defaultRequestTimeout,
                     restartDelay: TimeInterval = CodexAppServer.restartDelay,
+                    maxRestartDelay: TimeInterval = CodexAppServer.maxRestartDelay,
+                    stableRunInterval: TimeInterval = CodexAppServer.stableRunInterval,
                     maxLineBytes: Int = CodexAppServer.maxLineBytes) {
             self.clientName = clientName
             self.clientVersion = clientVersion
             self.requestTimeout = requestTimeout
             self.restartDelay = restartDelay
+            self.maxRestartDelay = maxRestartDelay
+            self.stableRunInterval = stableRunInterval
             self.maxLineBytes = maxLineBytes
         }
     }
@@ -124,12 +134,17 @@ public actor CodexAppServer {
     private let launcher: any CodexProcessLauncher
     private let configuration: Configuration
     private nonisolated let sleeper: CodexSleeper
+    private let now: @Sendable () -> Date
 
     /// `start()` 过且没 `stop()` 过。决定进程死了要不要重启。
     private var active = false
     private var generation = 0
     private var live: Live?
     private var restartTask: Task<Void, Never>?
+    /// 下一次重启要等多久：连着崩溃从 `restartDelay` 起翻倍到 `maxRestartDelay`，活够 `stableRunInterval` 再退出打回初始值。
+    private var nextRestartDelay: TimeInterval
+    /// 当前这一代子进程起来的时间（`now()`）。
+    private var launchedAt: Date?
     /// 协议 3.7：最近一次起子进程失败时错误带的原因（找不到 codex → `agentNotInstalled`），起成功就清掉。
     /// 起不来时 `launchProcess` 只排重启，请求要到 `notRunning` 才失败，原因得挂在那上面才到得了手机。
     private var launchFailureDiagnosis: FailureDiagnosis?
@@ -156,10 +171,13 @@ public actor CodexAppServer {
                 configuration: Configuration = Configuration(),
                 sleeper: @escaping CodexSleeper = { seconds in
                     try? await Task.sleep(for: .seconds(seconds))
-                }) {
+                },
+                now: @escaping @Sendable () -> Date = { Date() }) {
         self.launcher = launcher
         self.configuration = configuration
         self.sleeper = sleeper
+        self.now = now
+        self.nextRestartDelay = configuration.restartDelay
     }
 
     // MARK: - 事件流
@@ -197,6 +215,7 @@ public actor CodexAppServer {
     public func start() {
         guard !active else { return }
         active = true
+        nextRestartDelay = configuration.restartDelay
         launchProcess()
     }
 
@@ -233,12 +252,15 @@ public actor CodexAppServer {
         do {
             handle = try launcher.launch()
             launchFailureDiagnosis = nil
+            launchedAt = now()
         } catch {
             launchFailureDiagnosis = (error as? any FailureDiagnosing)?.diagnosis
+            launchedAt = nil
             Self.log.error("起 codex app-server 失败（第 \(mine, privacy: .public) 代）：\(String(describing: error), privacy: .public)")
+            let delay = takeRestartDelay()
             publish(.exited(CodexProcessExit(status: -1, reason: "无法启动 codex app-server"),
-                            restartingIn: configuration.restartDelay))
-            scheduleRestart(after: mine)
+                            restartingIn: delay))
+            scheduleRestart(after: mine, delay: delay)
             return
         }
         let live = Live(generation: mine, handle: handle)
@@ -264,10 +286,16 @@ public actor CodexAppServer {
         broken.handle.terminate()
     }
 
-    private func scheduleRestart(after generation: Int) {
+    /// 取这一次的重启间隔，并把下一次的翻倍（不超过上限）。
+    private func takeRestartDelay() -> TimeInterval {
+        let delay = nextRestartDelay
+        nextRestartDelay = min(delay * 2, configuration.maxRestartDelay)
+        return delay
+    }
+
+    private func scheduleRestart(after generation: Int, delay: TimeInterval) {
         guard active else { return }
         restartTask?.cancel()
-        let delay = configuration.restartDelay
         let sleeper = self.sleeper
         restartTask = Task { [weak self] in
             await sleeper(delay)
@@ -663,13 +691,20 @@ public actor CodexAppServer {
         fileChangeCache.removeAll()
         fileChangeOrder.removeAll()
 
-        Self.log.error("codex app-server 退出（第 \(dead.generation, privacy: .public) 代，status=\(exit.status, privacy: .public)），\(self.active ? "准备重启" : "不重启", privacy: .public)")
-        publish(.exited(exit, restartingIn: active ? configuration.restartDelay : nil))
-        guard active else {
+        // 活够了才算恢复过；起来就崩的照样翻倍，免得每 3 秒拉起一次、没完没了。
+        if let launchedAt, now().timeIntervalSince(launchedAt) >= configuration.stableRunInterval {
+            nextRestartDelay = configuration.restartDelay
+        }
+        launchedAt = nil
+        let delay: TimeInterval? = active ? takeRestartDelay() : nil
+        let plan = delay.map { "\(Int($0)) 秒后重启" } ?? "不重启"
+        Self.log.error("codex app-server 退出（第 \(dead.generation, privacy: .public) 代，status=\(exit.status, privacy: .public)），\(plan, privacy: .public)")
+        publish(.exited(exit, restartingIn: delay))
+        guard let delay else {
             pendingResumes.removeAll()
             return
         }
-        scheduleRestart(after: dead.generation)
+        scheduleRestart(after: dead.generation, delay: delay)
     }
 
     private static func describe(_ error: Error) -> String {

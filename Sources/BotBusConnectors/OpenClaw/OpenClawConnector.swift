@@ -40,10 +40,13 @@ public actor OpenClawConnector: TaskConnector {
         public var requestTimeout: TimeInterval
         public var challengeTimeout: TimeInterval
         public var pingInterval: TimeInterval
+        /// 首屏之后连接活够这么久再断，才把退避打回初始值。连上就断若每次都从 1 秒重来，健康状态每秒翻一次，
+        /// 每次都是一份全量快照发到 Relay。
+        public var stableConnectionInterval: TimeInterval
 
         public init(initialBackoff: TimeInterval = 1, maxBackoff: TimeInterval = 60, refreshDelay: TimeInterval = 0.5,
                     requestTimeout: TimeInterval = 15, challengeTimeout: TimeInterval = 2, pingInterval: TimeInterval = 30,
-                    refreshRetryDelay: TimeInterval = 10) {
+                    refreshRetryDelay: TimeInterval = 10, stableConnectionInterval: TimeInterval = 30) {
             self.initialBackoff = initialBackoff
             self.maxBackoff = maxBackoff
             self.refreshDelay = refreshDelay
@@ -51,6 +54,7 @@ public actor OpenClawConnector: TaskConnector {
             self.requestTimeout = requestTimeout
             self.challengeTimeout = challengeTimeout
             self.pingInterval = pingInterval
+            self.stableConnectionInterval = stableConnectionInterval
         }
     }
 
@@ -69,7 +73,8 @@ public actor OpenClawConnector: TaskConnector {
     struct Approval: Sendable, Equatable {
         var id: String
         var sessionKey: String
-        var command: String
+        /// 要执行的命令原文；Gateway 没给时为 nil（卡片上写「请求执行命令」）。
+        var command: String?
         var cwd: String?
         var createdAt: Date
         var expiresAt: Date?
@@ -162,13 +167,14 @@ public actor OpenClawConnector: TaskConnector {
             let gateway = OpenClawGateway(transport: transport, configuration: configuration)
 
             var failure = "连不上 OpenClaw Gateway（\(address)）"
+            var connectedAt: ContinuousClock.Instant?
             do {
                 try await gateway.connect()
                 guard !Task.isCancelled else { await gateway.close(); return }
                 self.gateway = gateway
                 try await bootstrap(gateway)
                 await report(.ok, nil)
-                backoff = timing.initialBackoff
+                connectedAt = .now
                 // 首屏是基线：7 天内的完成 / 失败会话都在里面，逐条推送等于把一串私聊预览一次性发到手机上。
                 await publish(silently: true)
                 // 握手与首屏期间到达的事件都攒在流里，这里按序补上，再接着实时消费。
@@ -190,6 +196,9 @@ public actor OpenClawConnector: TaskConnector {
             await gateway.close()
             if self.gateway === gateway { self.gateway = nil }
             if Task.isCancelled { return }
+            if let connectedAt, ContinuousClock.now - connectedAt >= .seconds(timing.stableConnectionInterval) {
+                backoff = timing.initialBackoff
+            }
             await report(.degraded, failure)
             await publish(silently: true)
             await sleep(backoff)
@@ -399,7 +408,7 @@ public actor OpenClawConnector: TaskConnector {
             .lazy.compactMap({ $0?.stringValue }).first(where: { !$0.isEmpty }) else { return nil }
         let argv = request["commandArgv"]?.arrayValue?.compactMap(\.stringValue).joined(separator: " ")
         let command = [request["command"]?.stringValue, plan?["commandText"]?.stringValue, argv]
-            .lazy.compactMap { $0?.trimmed }.first { !$0.isEmpty } ?? "执行命令"
+            .lazy.compactMap { $0?.trimmed }.first { !$0.isEmpty }
         let cwd = [request["cwd"]?.stringValue, plan?["cwd"]?.stringValue].lazy.compactMap { $0 }.first { !$0.isEmpty }
         let expiresAt = date(payload["expiresAtMs"])
         if let expiresAt, expiresAt <= now { return nil }
@@ -420,11 +429,17 @@ public actor OpenClawConnector: TaskConnector {
         } else if status == .completed, current.timeIntervalSince(session.updatedAt) > SessionFormatting.idleAfter {
             status = .idle
         }
-        let pending = approval.map {
-            PendingRequest(id: $0.id, kind: .command,
-                           summary: SessionFormatting.truncate($0.command, Self.pendingSummaryLimit),
-                           detail: $0.cwd.map { SessionFormatting.truncate("目录：\($0)", SessionFormatting.detailLimit) },
-                           questions: [Self.scopeQuestion])
+        // 摘要是命令原文；Gateway 没给命令时是电脑写的「请求执行命令」，详情「工作目录：…」也是电脑写的（协议 3.11 带短语）。
+        let pending = approval.map { approval in
+            let summaryPhrase = approval.command == nil ? RequestPhrase.requestCommand : nil
+            let directory = approval.cwd.map { RequestPhrase.workingDirectory(SessionFormatting.truncate($0, SessionFormatting.detailLimit)) }
+            return PendingRequest(id: approval.id, kind: .command,
+                                  summary: SessionFormatting.truncate(approval.command ?? summaryPhrase?.chineseText ?? "",
+                                                                      Self.pendingSummaryLimit),
+                                  detail: directory.map { SessionFormatting.truncate($0.chineseText, SessionFormatting.detailLimit) },
+                                  questions: [Self.scopeQuestion],
+                                  summaryPhrase: summaryPhrase,
+                                  detailPhrases: directory.map { [$0] })
         }
         return TaskRecord(id: taskId(for: session.key),
                           agentId: "",

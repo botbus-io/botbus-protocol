@@ -50,15 +50,20 @@ public struct HermesStateReader: Sendable {
     /// 库不存在抛 `SessionSourceUnavailable`（观察者据此不对账，一条都不摘）；缺表、忙锁照常抛错，
     /// 由观察者按连续失败次数报警。
     public func readSnapshot(agentId: String) throws -> (tasks: [TaskRecord], projects: [Project]) {
+        let snapshot = try readObservedSnapshot(agentId: agentId)
+        return (snapshot.tasks, snapshot.projects)
+    }
+
+    /// 本机通知上下文不进协议；任务列表和通知分组来自同一轮读库。
+    public func readObservedSnapshot(agentId: String) throws -> ObservedSessionSnapshot {
         guard FileManager.default.fileExists(atPath: databasePath) else {
             throw SessionSourceUnavailable("未找到 Hermes 数据库：\(databasePath)")
         }
         let database = try SQLiteDatabase(path: databasePath)
-        let tasks = try readTasks(database: database, agentId: agentId)
-        return (tasks, SessionFormatting.projects(from: tasks, agentId: agentId))
+        return try readTasks(database: database, agentId: agentId)
     }
 
-    func readTasks(database: SQLiteDatabase, agentId: String) throws -> [TaskRecord] {
+    func readTasks(database: SQLiteDatabase, agentId: String) throws -> ObservedSessionSnapshot {
         let sessionColumns = try HermesSQL.columns(of: "sessions", in: database)
         guard !sessionColumns.isEmpty else { throw HermesSchemaError("state.db 里没有 sessions 表") }
         guard sessionColumns.contains("id") else { throw HermesSchemaError("sessions 表缺 id 列") }
@@ -72,7 +77,7 @@ public struct HermesStateReader: Sendable {
         // 压缩会以 end_reason='compression' 结束旧会话、新开一行接着聊：只显示链条末端。
         if sessionColumns.contains("end_reason") { filters.append("(end_reason IS NULL OR end_reason != 'compression')") }
 
-        let wanted = ["id", "cwd", "title", "started_at", "ended_at", "last_activity_at", "end_reason"]
+        let wanted = ["id", "source", "cwd", "title", "started_at", "ended_at", "last_activity_at", "end_reason"]
         let selected = wanted.filter(sessionColumns.contains).joined(separator: ", ")
         let current = now()
         let since = current.timeIntervalSince1970 - SessionFormatting.recentWindow
@@ -85,6 +90,7 @@ public struct HermesStateReader: Sendable {
 
         let messages = try HermesMessageQueries(database: database)
         var tasks: [TaskRecord] = []
+        var notifications: [String: ObservedTaskNotification] = [:]
         for row in rows {
             guard let id = HermesSQL.text(row["id"]), !id.isEmpty,
                   let activitySeconds = HermesSQL.seconds(row["activity_at"]) else { continue }
@@ -96,17 +102,19 @@ public struct HermesStateReader: Sendable {
             let endReason = HermesSQL.text(row["end_reason"])
             let projectName = SessionFormatting.projectName(cwd)
 
-            // 只有"看上去还在跑"的才去问最后一条消息：它决定 running 与 completed 的分界，其余状态用不上。
-            let looksRunning = endedAt == nil && current.timeIntervalSince(activityAt) <= Self.runningWindow
-            let turnFinished = looksRunning ? try messages.lastTurnFinished(sessionID: id) : false
+            // 会话结束不等于这一轮成功：cron 即使失败也可能以 cron_complete 收尾。
+            // 只看最新 active 消息，避免重试的新 user 或成功回答沿用上一轮的 failed_turn。
+            let turn = try messages.lastTurnState(sessionID: id)
             let status = Self.status(endReason: endReason, ended: endedAt != nil, activityAt: activityAt,
-                                     now: current, turnFinished: turnFinished)
+                                     now: current, turnFinished: turn.finished, turnFailed: turn.failed)
+            let assistantText = try messages.lastAssistantText(sessionID: id)
+            let lastMessage = (status == .failed ? turn.error : nil) ?? assistantText
 
             var title = HermesSQL.text(row["title"]).map(Self.singleLine) ?? ""
             if title.isEmpty, let first = try messages.firstUserText(sessionID: id) { title = Self.singleLine(first) }
             if title.isEmpty { title = ownCwd == nil || projectName.isEmpty ? "Hermes 会话" : projectName }
 
-            tasks.append(TaskRecord(
+            let task = TaskRecord(
                 id: "hermes:\(id)",
                 agentId: agentId,
                 source: .hermes,
@@ -114,21 +122,55 @@ public struct HermesStateReader: Sendable {
                 projectPath: cwd,
                 projectName: projectName,
                 status: status,
-                lastMessage: try messages.lastAssistantText(sessionID: id)
-                    .map { SessionFormatting.truncate($0, SessionFormatting.lastMessageLimit) },
+                lastMessage: lastMessage.map { SessionFormatting.truncate($0, SessionFormatting.lastMessageLimit) },
                 pendingRequest: nil,
                 origin: .desktop,
                 // 桌面上正在跑的会话我们没有它的进程：续聊会和它抢同一个会话，中断也发不了信号。
                 controllable: status != .running,
                 startedAt: ProtocolJSON.timestamp(startedAt),
-                updatedAt: ProtocolJSON.timestamp(activityAt)))
+                updatedAt: ProtocolJSON.timestamp(activityAt))
+            tasks.append(task)
+            if HermesSQL.text(row["source"]) == "cron", let jobID = Self.cronJobID(sessionID: id) {
+                let failed = status == .failed
+                // content 可能只是 failed_turn 的统一占位回复，没有真实诊断时不能合并不同运行的故障。
+                let fingerprint = failed ? turn.failureFingerprint : nil
+                let body = failed ? SessionFormatting.truncate([task.title, lastMessage].compactMap { $0 }.joined(separator: "\n"),
+                                                               SessionFormatting.lastMessageLimit) : nil
+                notifications[task.id] = ObservedTaskNotification(groupID: databasePath + "\u{0}" + jobID,
+                                                                  failureFingerprint: fingerprint, failureBody: body)
+            }
         }
-        return tasks
+        return ObservedSessionSnapshot(tasks: tasks, projects: SessionFormatting.projects(from: tasks, agentId: agentId),
+                                       notifications: notifications)
+    }
+
+    /// Hermes cron 的每次执行都有新会话：cron_<jobID>_<YYYYMMDD>_<HHMMSS>。从尾部拆，jobID 可以含下划线。
+    static func cronJobID(sessionID: String) -> String? {
+        guard sessionID.hasPrefix("cron_") else { return nil }
+        let parts = sessionID.dropFirst(5).split(separator: "_", omittingEmptySubsequences: false)
+        guard parts.count >= 3 else { return nil }
+        let date = parts[parts.count - 2], time = parts[parts.count - 1]
+        guard date.count == 8, time.count == 6,
+              date.allSatisfy({ $0 >= "0" && $0 <= "9" }), time.allSatisfy({ $0 >= "0" && $0 <= "9" }) else { return nil }
+        let jobID = parts.dropLast(2).joined(separator: "_")
+        guard !jobID.isEmpty else { return nil }
+        let dateDigits = Array(date), timeDigits = Array(time)
+        let year = Int(String(dateDigits[0..<4]))!, month = Int(String(dateDigits[4..<6]))!, day = Int(String(dateDigits[6..<8]))!
+        let hour = Int(String(timeDigits[0..<2]))!, minute = Int(String(timeDigits[2..<4]))!, second = Int(String(timeDigits[4..<6]))!
+        guard year > 0, (1...12).contains(month), (1...31).contains(day), hour < 24, minute < 60, second < 60 else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let components = DateComponents(year: year, month: month, day: day, hour: hour, minute: minute, second: second)
+        guard let parsed = calendar.date(from: components) else { return nil }
+        let parsedComponents = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: parsed)
+        guard parsedComponents.year == year, parsedComponents.month == month, parsedComponents.day == day,
+              parsedComponents.hour == hour, parsedComponents.minute == minute, parsedComponents.second == second else { return nil }
+        return jobID
     }
 
     /// 状态映射。顺序有讲究：
     /// 1. 超过 24 小时没动一律 idle（含 failed，让旧的红色状态自然淡出，与 Codex 一致）；
-    /// 2. `end_reason` 是出错类 → failed；
+    /// 2. `end_reason` 是出错类，或最新 active assistant 标成 `failed_turn` → failed；
     /// 3. 没结束、2 分钟内有动静、且最后一条不是"已收尾的回答" → running；
     /// 4. 其余 completed（包括没写 `ended_at` 但早就不动了的——进程多半已经没了）。
     ///
@@ -136,9 +178,10 @@ public struct HermesStateReader: Sendable {
     /// `-q` 跑完也未必写 `ended_at`；只看时间的话，每答完一句都会在手机上"正在运行"两分钟。
     /// 老库没有 `finish_reason` 列时 `turnFinished` 恒为 false，退回纯时间判断。
     public static func status(endReason: String?, ended: Bool, activityAt: Date, now: Date,
-                              turnFinished: Bool = false) -> TaskStatus {
+                              turnFinished: Bool = false, turnFailed: Bool = false) -> TaskStatus {
         if now.timeIntervalSince(activityAt) > SessionFormatting.idleAfter { return .idle }
         if let endReason, failedEndReasons.contains(endReason) { return .failed }
+        if turnFailed { return .failed }
         if !ended, now.timeIntervalSince(activityAt) <= runningWindow, !turnFinished { return .running }
         return .completed
     }
@@ -176,6 +219,10 @@ public struct HermesStateSource: SessionSnapshotSource {
 
     public func readSnapshot(agentId: String) throws -> (tasks: [TaskRecord], projects: [Project]) {
         try HermesStateReader(paths: paths, now: now).readSnapshot(agentId: agentId)
+    }
+
+    public func readObservedSnapshot(agentId: String) throws -> ObservedSessionSnapshot {
+        try HermesStateReader(paths: paths, now: now).readObservedSnapshot(agentId: agentId)
     }
 }
 
@@ -271,7 +318,7 @@ enum HermesSQL {
     }
 }
 
-/// 观察者对 `messages` 表的三个小查询。列同样先探测：老库没有 `active` / `timestamp` / `finish_reason` 时照样能读。
+/// 观察者对 `messages` 表的小查询。列同样先探测：老库没有 `active` / `timestamp` / `finish_reason` / `display_kind` 时照样能读。
 struct HermesMessageQueries {
     private let database: SQLiteDatabase
     private let columns: Set<String>
@@ -309,20 +356,57 @@ struct HermesMessageQueries {
         return firstNonEmpty(rows)
     }
 
-    /// 最后一条消息是不是"这一轮已经答完"：assistant、`finish_reason` 是收尾类、没有挂着工具调用。
-    func lastTurnFinished(sessionID: String) throws -> Bool {
-        guard usable, columns.contains("finish_reason") else { return false }
-        let toolCalls = columns.contains("tool_calls") ? ", tool_calls" : ""
+    struct TurnState {
+        var finished = false
+        var failed = false
+        var error: String?
+        var failureFingerprint: String?
+    }
+
+    /// 最新 active 消息代表的轮次状态；只取结构化收尾字段，不从 assistant 正文猜测失败。
+    func lastTurnState(sessionID: String) throws -> TurnState {
+        guard usable, columns.contains("finish_reason") || columns.contains("display_kind") else { return TurnState() }
+        let optional = ["finish_reason", "tool_calls", "display_kind"].filter(columns.contains).map { ", \($0)" }.joined()
+        let metadata = columns.contains("display_metadata") ? ", CAST(display_metadata AS BLOB) AS display_metadata" : ""
         guard let row = try database.query("""
-            SELECT role, finish_reason\(toolCalls) FROM messages
+            SELECT role\(optional)\(metadata) FROM messages
             WHERE session_id = ?\(activeFilter)
             ORDER BY \(newestFirst) LIMIT 1
-            """, [.text(sessionID)]).first else { return false }
-        guard HermesSQL.text(row["role"]) == "assistant",
-              let reason = HermesSQL.text(row["finish_reason"]),
-              HermesStateReader.finishedReasons.contains(reason) else { return false }
+            """, [.text(sessionID)]).first,
+              HermesSQL.text(row["role"]) == "assistant" else { return TurnState() }
+        if HermesSQL.text(row["display_kind"]) == "failed_turn" {
+            let metadata = Self.failureMetadata(row["display_metadata"])
+            return TurnState(finished: true, failed: true, error: metadata.error, failureFingerprint: metadata.fingerprint)
+        }
+        guard let reason = HermesSQL.text(row["finish_reason"]),
+              HermesStateReader.finishedReasons.contains(reason) else { return TurnState() }
         let pendingTools = HermesSQL.text(row["tool_calls"]).map { !HermesToolCalls.parse($0).isEmpty } ?? false
-        return !pendingTools
+        return TurnState(finished: !pendingTools)
+    }
+
+    private static func failureMetadata(_ value: SQLiteValue?) -> (error: String?, fingerprint: String?) {
+        guard let text = HermesSQL.text(value),
+              let object = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] else { return (nil, nil) }
+        let rawError = (object["error"] as? String)?.trimmed
+        let error = rawError?.isEmpty == false ? rawError : nil
+        var stable: [String: Any] = [:]
+        if let surface = object["error_surface"] as? [String: Any] {
+            for key in ["layer", "code", "provider", "model"] {
+                if let value = (surface[key] as? String)?.trimmed, !value.isEmpty {
+                    stable[key] = SessionFormatting.truncate(value, 200)
+                }
+                else if let value = surface[key] as? NSNumber { stable[key] = value }
+            }
+        }
+        // 只有 provider / model 或 unknown 分类的 surface 没说明故障种类，仍须按真实原错误区分。
+        let knownCode = (stable["code"] as? String).map {
+            !["unknown", "unknown_error", "unknown-error"].contains($0.lowercased())
+        } ?? (stable["code"] != nil)
+        if knownCode,
+           let data = try? JSONSerialization.data(withJSONObject: stable, options: [.sortedKeys, .withoutEscapingSlashes]) {
+            return (error, "surface:\(String(decoding: data, as: UTF8.self))")
+        }
+        return (error, error.map { "error:\(SessionFormatting.truncate($0, SessionFormatting.detailLimit))" })
     }
 
     private func firstNonEmpty(_ rows: [[String: SQLiteValue]]) -> String? {
