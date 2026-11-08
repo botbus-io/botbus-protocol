@@ -326,6 +326,19 @@ final class WorkspaceWireTests: XCTestCase {
         XCTAssertEqual(produced, try canonicalBytes(JSONSerialization.jsonObject(with: fixture("request-term-create.json"))))
     }
 
+    /// 团队看板（电脑报了 `team` 才有）：`/team/api` 的请求明文与回复。
+    func testTeamApiEnvelopeAndReplyMatchFixtures() throws {
+        let body = WorkspaceRequest.TeamApi(method: "POST", url: "/api/projects/9ea8ea5fef48d353/group",
+                                            body: #"{"content":"@dev 首页改一下"}"#)
+        let produced = try WorkspaceEnvelope.plaintext(body, path: WorkspacePath.teamApi, stamp: 1_790_000_000_700,
+                                                       channel: "AAECAwQFBgcICQoLDA0ODw")
+        XCTAssertEqual(produced, try canonicalBytes(JSONSerialization.jsonObject(with: fixture("request-team-api.json"))))
+        try assertRoundTrips(WorkspaceTeamReply.self, "team-reply.json")
+        let reply = try JSONDecoder().decode(WorkspaceTeamReply.self, from: fixture("team-reply.json"))
+        XCTAssertEqual(reply.status, 200)
+        XCTAssertEqual(reply.body, #"{"ok":true,"taskIds":[3]}"#)
+    }
+
     /// 每次封之前把下一条要用的 nonce 放进去：样本里每条的 nonce 就是密文的第 1…12 字节。
     private final class NonceSlot: @unchecked Sendable {
         var next = Data()
@@ -393,6 +406,7 @@ final class WorkspaceWireTests: XCTestCase {
             "failure-conflict.json", "failure-unknown-code.json", "request-write.json", "sealed.json",
             "terminal.json", "term-list.json", "request-term-create.json",
             "status-windows.json", "listing-drives.json", "listing-undecodable.json", "failure-no-trash.json",
+            "request-team-api.json", "team-reply.json",
         ]
         XCTAssertEqual(onDisk.subtracting(used).sorted(), [], "这些样本没有被任何用例使用")
         XCTAssertEqual(used.subtracting(onDisk).sorted(), [], "用例引用了不存在的样本")

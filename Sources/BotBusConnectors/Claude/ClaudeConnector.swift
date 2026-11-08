@@ -1,3 +1,10 @@
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 import Foundation
 #if canImport(os)
 import os
@@ -113,6 +120,9 @@ public actor ClaudeConnector: TaskConnector {
         /// 协议 3.7：这一次 failed 的原因，在失败处由错误原文得出（StopFailure 的类别与详情、报错的 `result` 行、
         /// 起不了进程的错误），不由 `lastMessage` 推——那可能是 agent 自己说的最后一段话。
         var failureDiagnosis: FailureDiagnosis?
+        /// 最近一次 BotBus 起的这一轮是无人值守的（`AgentRunContext.unattended`，宿主自己派的活）：
+        /// 审批直接放行、提问直接拒绝。手机续聊（不带这个上下文）起的轮次把它清掉。
+        var unattended = false
 
         /// 一轮正跑着：没有 hook 能保证把它收尾（中断不发 Stop），得盯着。
         var isMidTurn: Bool { status == .running || status == .waitingApproval }
@@ -524,6 +534,15 @@ public actor ClaudeConnector: TaskConnector {
             let object = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any]
             let asked = ClaudeAskedQuestions(toolName: toolName, input: object)
             let cwd = sessions[sessionID]?.projectPath ?? workingDirectory
+            if sessions[sessionID]?.unattended == true {
+                // 宿主自己派的无人值守轮次：没有人看着，审批放行；提问没人答，直接拒掉让 agent 自己拿主意。
+                let decision: ClaudePermissionDecision = asked == nil
+                    ? .allow(updatedInput: nil)
+                    : .deny(message: AgentRunContext.unattendedQuestionRefusal)
+                Self.log.info("无人值守的轮次，\(asked == nil ? "放行" : "拒绝提问", privacy: .public) \(toolName, privacy: .public)")
+                stdin.send(ClaudeControlOutput.response(requestID: requestID, decision: decision, originalInput: input))
+                return
+            }
             if asked == nil, await store.autoApproves(taskId: taskId(for: sessionID), workingDirectory: cwd) {
                 Self.log.info("项目已开自动批准，放行 \(toolName, privacy: .public)")
                 stdin.send(ClaudeControlOutput.response(requestID: requestID, decision: .allow(updatedInput: nil),
@@ -1076,9 +1095,11 @@ public actor ClaudeConnector: TaskConnector {
         let injection = await AgentToolsInjection.make(tools(), registry: registry)
         let executable = binary().map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
         let name = executable != nil && executable == binaryWithoutName ? nil : Self.sessionName(for: prompt)
+        let unattended = AgentRunContext.current?.unattended ?? false
         let launch = { (name: String?) in
             try await self.run(arguments: Self.arguments(resuming: nil, injection: injection,
-                                                         model: chosen.model, effort: chosen.effort, name: name),
+                                                         model: chosen.model, effort: chosen.effort, name: name,
+                                                         bypassPermissions: Self.bypassesPermissions(unattended: unattended)),
                                workingDirectory: projectPath, environment: injection?.environment ?? [:], stdin: input)
         }
         let launched: Launch
@@ -1096,6 +1117,7 @@ public actor ClaudeConnector: TaskConnector {
         var session = makeSession(id: sessionID, projectPath: projectPath, origin: .watch)
         session.chosenModel = chosen.model
         session.chosenEffort = chosen.effort
+        session.unattended = unattended
         Self.applyPromptTitle(&session, prompt: prompt, hasImages: !images.isEmpty)
         if let existing = sessions[sessionID], existing.pendingRequest != nil {
             session.status = existing.status
@@ -1162,9 +1184,12 @@ public actor ClaudeConnector: TaskConnector {
         // 续聊沿用这条任务之前的 token（agent 若把它记在了别处也照样有效）；分支出新 session 时改绑到新 id。
         launching.insert(sessionID)
         defer { launching.remove(sessionID) }
+        // 这一轮是不是无人值守：手机续聊与排队的轮次读不到上下文，一律清掉。
+        let unattended = AgentRunContext.current?.unattended ?? false
         let injection = await AgentToolsInjection.make(tools(), registry: registry, reusing: self.taskId(for: sessionID))
         let launched = try await run(arguments: Self.arguments(resuming: sessionID, injection: injection,
-                                                               model: turn.model, effort: turn.effort),
+                                                               model: turn.model, effort: turn.effort,
+                                                               bypassPermissions: Self.bypassesPermissions(unattended: unattended)),
                                      workingDirectory: workingDirectory, environment: injection?.environment ?? [:],
                                      stdin: turn.input)
         let newID = launched.sessionID
@@ -1180,12 +1205,14 @@ public actor ClaudeConnector: TaskConnector {
             branched.model = existing?.model
             branched.chosenModel = existing?.chosenModel
             branched.chosenEffort = existing?.chosenEffort
+            branched.unattended = unattended
             sessions[newID] = branched
             // 旧会话被分支取代：从列表中移除，之后的桌面 hook 事件也不再接收。
             // 手机上只看到分支那一条，不会出现"一个会话变成两个"。
             if let old = sessions.removeValue(forKey: sessionID) { releaseHold(for: old) }
             superseded.insert(sessionID)
         } else {
+            sessions[sessionID]?.unattended = unattended
             // 这一轮的审批若已经早到（挂在新进程的 stdin 上），别被"开始跑了"盖掉。
             let earlyCard = sessions[sessionID]?.pendingRequest.flatMap { holds[$0.id] }
                 .map { hold in controls[sessionID].map(hold.isOn) ?? false } ?? false
@@ -1363,17 +1390,22 @@ public actor ClaudeConnector: TaskConnector {
     /// 否则后面的参数会被当成 MCP 配置文件或工具名吞掉。
     ///
     /// prompt 不是位置参数：一律经 stdin 写一行 stream-json（见 `stdinPayload`，发图时图也在里面），
-    /// stdin 开着等控制协议的回答（`--permission-prompt-tool stdio`，见 `ClaudeControlRequest`），这一轮 `result` 后关掉。
+    /// stdin 开着等控制协议的回答（`--permission-prompt-tool stdio`，见 `ClaudeControlRequest`），
+    /// claude 连后台的子代理 / 命令都做完了才关（`StreamJSONReader.onIdle`）。
     /// `model` / `effort`（协议 3.2）的值已由 `resolve` 限定在 `ClaudeModels` 里，不会以 `-` 开头。
     /// `name`（只在新建时给，见 `sessionName`）写成一个 `--name=…`：名字来自用户的话，可能以 `-` 开头，
     /// 分成两个参数会被当成别的选项。
+    /// `bypassPermissions`（见 `bypassesPermissions(unattended:)`）：`--permission-mode bypassPermissions`，
+    /// 团队看板的员工以最高权限干活，命令、改文件、联网都不发 `can_use_tool`；只有提问还经控制协议到（无人值守时拒掉）。
     static func arguments(resuming sessionID: String?, injection: AgentToolsInjection?,
-                          model: String? = nil, effort: String? = nil, name: String? = nil) -> [String] {
+                          model: String? = nil, effort: String? = nil, name: String? = nil,
+                          bypassPermissions: Bool = false) -> [String] {
         var arguments = ["-p"]
         if let sessionID { arguments += ["--resume", sessionID] }
         if let model { arguments += ["--model", model] }
         if let effort { arguments += ["--effort", effort] }
         if let name { arguments.append("--name=\(name)") }
+        if bypassPermissions { arguments += ["--permission-mode", "bypassPermissions"] }
         if let injection { arguments += injection.claudeArguments() }
         arguments += ["--input-format", "stream-json", "--permission-prompt-tool", "stdio",
                       "--output-format", "stream-json", "--verbose"]
@@ -1425,6 +1457,26 @@ public actor ClaudeConnector: TaskConnector {
         base.merging(extra) { _, injected in injected }
     }
 
+    /// 宿主派的无人值守轮次（团队看板的员工）以 bypassPermissions 跑，同 Codex 员工的
+    /// `--dangerously-bypass-approvals-and-sandbox`。以 root 跑时 claude 拒绝这个模式、直接退出
+    /// （"cannot be used with root/sudo privileges"，Linux 宿主可能以 root 跑），这时不带，审批照旧由 `handleControl` 一律放行。
+    /// 手机续聊、排队的轮次不是无人值守，照常审批。
+    static func bypassesPermissions(unattended: Bool, isRoot: Bool = runsAsRoot) -> Bool {
+        unattended && !isRoot
+    }
+
+    static var runsAsRoot: Bool {
+        #if os(Windows)
+        false
+        #else
+        geteuid() == 0
+        #endif
+    }
+
+    /// 每次 `claude -p` 都加的变量：让它在 stdout 报 `session_state_changed`（idle 要等后台子代理跑完才来），
+    /// `StreamJSONReader` 据此判断什么时候能关 stdin。不认得它的旧版本照旧，退回到读到 `result` 就关。
+    static let streamEnvironment = ["CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"]
+
     /// `run` 起好的一轮。调用方把会话记好（新建、分支或标成在跑）之后调 `registered()`，这一轮的 `finish` 才会跑：
     /// claude 早早退出（没登录……）时，读端收尾的 `Task` 可能比 `run` 的返回先抢到 actor，找不到会话就把结果丢了，
     /// 任务一直挂在「运行中」。
@@ -1441,7 +1493,9 @@ public actor ClaudeConnector: TaskConnector {
     /// 一轮可能跑几分钟，不能让客户端的请求挂在那里。
     ///
     /// stdin 是一根管道：起来后先写 `stdin`（这一轮的 user 消息），之后留着写控制协议的回答，
-    /// 读到 `result`（或进程退出）时关掉。
+    /// claude 报空闲且没有后台任务（`StreamJSONReader.onIdle`）或进程退出时关掉。只看 `result` 会关早：
+    /// 这一轮在后台开了子代理 / 命令时 `result` 先出来，它们与跑完后 claude 自己接着起的那一轮要审批时，
+    /// stdin 已经关了，全报 "Stream closed"，无人值守的员工因此跑不了命令、改不了文件。
     private func run(arguments: [String], workingDirectory: String,
                      environment extra: [String: String] = [:], stdin: Data) async throws -> Launch {
         guard let executable = binary() else {
@@ -1454,7 +1508,7 @@ public actor ClaudeConnector: TaskConnector {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        process.environment = Self.environment(adding: extra)
+        process.environment = Self.environment(adding: Self.streamEnvironment.merging(extra) { _, injected in injected })
         process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
         let output = Pipe()
         process.standardOutput = output
@@ -1470,8 +1524,8 @@ public actor ClaudeConnector: TaskConnector {
         reader.onControl = { [weak self] line, id in
             Task { await self?.handleControl(line, sessionID: id, stdin: channel, workingDirectory: workingDirectory) }
         }
-        // 一轮结束：关 stdin（EOF），claude 才会退出。
-        reader.onResult = { channel.close() }
+        // 这一轮连同后台的事都做完了：关 stdin（EOF），claude 才会退出。
+        reader.onIdle = { channel.close() }
         let launched = OneShotContinuation<Void>()
         reader.onFinished = { [weak self] result in
             // 一行 init 都没读到就结束了：别让调用方一直等到超时。

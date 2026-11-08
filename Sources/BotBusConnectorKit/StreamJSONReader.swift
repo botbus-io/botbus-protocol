@@ -10,6 +10,19 @@ import Foundation
 /// 另外 `--permission-prompt-tool stdio` 时 claude 经 stdout 发 `control_request`（要不要放行一个工具）
 /// 与 `control_cancel_request`，原样交给 `onControl`，回答由调用方写进 stdin。
 ///
+/// 什么时候能关 stdin（`onIdle`）：`result` 不等于 claude 没事做了。这一轮在后台开了子代理或命令
+/// （`Agent` / `Bash` 的 `run_in_background`）时，`result` 照常先出来，后台跑完 claude 自己再起一轮接着做；
+/// 这时 stdin 已经关了的话，子代理与接下来那一轮要审批的工具全报 "Tool permission request failed: Stream closed"
+/// （无人值守的员工因此跑不了命令、改不了文件）。所以以 claude 自己报的状态为准：
+/// - `{"type":"system","subtype":"session_state_changed","state":"idle"}`（子进程环境带
+///   `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` 才发）—— 后台子代理跑完、留着的 `result` 发完才到；
+/// - `{"type":"system","subtype":"background_tasks_changed","tasks":[…]}` —— 当前还活着的全部后台任务（整体替换），
+///   `ambient` 的不算活动。后台命令（`local_bash`）不拦 `idle`，得靠它。
+///
+/// 见过 `result`、claude 报空闲、没有后台任务三者同时成立才报；后台任务是在空闲时清空的，claude 多半紧接着
+/// 起一轮处理完成通知，先等 `idleGrace` 秒，期间读到任何一行都重新算。不发 `session_state_changed` 的旧版本
+/// 退回到读到 `result` 就报（老行为）。
+///
 /// 其余类型（工具调用、增量）一律忽略：任务的状态由 hooks 说了算，这里只补 hooks 给不了的
 /// session id 与结尾文本。**解析全程容错**——多一种没见过的行不该让整轮白跑。
 public final class StreamJSONReader: @unchecked Sendable {
@@ -32,14 +45,27 @@ public final class StreamJSONReader: @unchecked Sendable {
     private var sawResult = false
     private var failed = false
     private var finished = false
+    /// claude 发过 `session_state_changed`：以它的 idle 为准，不再只看 `result`。
+    private var reportsSessionState = false
+    private var sessionIdle = false
+    /// 不发状态的旧版本：上一行 `result` 之后还没有新的活动。
+    private var resultIsLatest = false
+    /// 还活着的后台任务（`background_tasks_changed`，不含 `ambient`）。
+    private var backgroundTasks: Set<String> = []
+    private var idleSignalled = false
+    /// 每读一行加一：宽限期到点时没变才算真的安静。
+    private var generation = 0
+    private let idleGrace: TimeInterval
 
     private var sessionIDCallback: (@Sendable (String) -> Void)?
     private var finishedCallback: (@Sendable (Result) -> Void)?
     private var controlCallback: (@Sendable (_ line: Data, _ sessionID: String?) -> Void)?
-    private var resultCallback: (@Sendable () -> Void)?
+    private var idleCallback: (@Sendable () -> Void)?
 
-    public init(handle: FileHandle) {
+    /// `idleGrace`：后台任务在空闲时清空后，等多久没有新的一轮才报 `onIdle`（测试里调短）。
+    public init(handle: FileHandle, idleGrace: TimeInterval = 3) {
         self.handle = handle
+        self.idleGrace = idleGrace
     }
 
     /// 必须在 `start()` 之前设好。
@@ -60,11 +86,11 @@ public final class StreamJSONReader: @unchecked Sendable {
         set { lock.withLock { controlCallback = newValue } }
     }
 
-    /// 读到 `result` 行：这一轮结束了。stream-json 输入时 claude 读到 stdin 的 EOF 才退出，
-    /// 调用方在这里关 stdin。必须在 `start()` 之前设好。
-    public var onResult: (@Sendable () -> Void)? {
-        get { lock.withLock { resultCallback } }
-        set { lock.withLock { resultCallback = newValue } }
+    /// claude 这一轮连同后台的事都做完了（规则见类型说明），最多报一次。stream-json 输入时 claude 读到 stdin 的 EOF
+    /// 才退出，调用方在这里关 stdin；关早了，之后的审批都送不到。必须在 `start()` 之前设好。
+    public var onIdle: (@Sendable () -> Void)? {
+        get { lock.withLock { idleCallback } }
+        set { lock.withLock { idleCallback = newValue } }
     }
 
     public func start() {
@@ -106,7 +132,8 @@ public final class StreamJSONReader: @unchecked Sendable {
         var newSessionID: String?
         var sessionIDCallback: (@Sendable (String) -> Void)?
         var controls: [(line: Data, sessionID: String?)] = []
-        var sawResultLine = false
+        // 这一块里有让「安静」成立的那一行（idle，或旧版本的 result）：条件满足就立刻报，不用宽限。
+        var settledHere = false
 
         lock.lock()
         buffer.append(chunk)
@@ -118,16 +145,32 @@ public final class StreamJSONReader: @unchecked Sendable {
         if buffer.count > 1 << 20 { buffer.removeAll(keepingCapacity: false) }
         for line in lines {
             guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { continue }
+            generation += 1
             switch object["type"] as? String {
             case "system":
-                // 只认 `init`：`--resume` 时 SessionStart hook 的 `hook_started` / `hook_response` 行排在它前面，
-                // 带的是一个临时 session id，拿它当会话 id 会让续聊被误判成分支。
-                guard sessionID == nil, object["subtype"] as? String == "init",
-                      let id = object["session_id"] as? String, !id.isEmpty else { break }
-                sessionID = id
-                newSessionID = id
-                sessionIDCallback = self.sessionIDCallback
+                switch object["subtype"] as? String {
+                case "session_state_changed":
+                    reportsSessionState = true
+                    sessionIdle = object["state"] as? String == "idle"
+                    if sessionIdle { settledHere = true }
+                case "background_tasks_changed":
+                    let tasks = object["tasks"] as? [[String: Any]] ?? []
+                    backgroundTasks = Set(tasks.compactMap { task in
+                        task["ambient"] as? Bool == true ? nil : task["task_id"] as? String
+                    })
+                case "init":
+                    // 只认 `init`：`--resume` 时 SessionStart hook 的 `hook_started` / `hook_response` 行排在它前面，
+                    // 带的是一个临时 session id，拿它当会话 id 会让续聊被误判成分支。
+                    // 后台任务跑完 claude 再起一轮时会再发一次 init，同一个 id，不理。
+                    guard sessionID == nil, let id = object["session_id"] as? String, !id.isEmpty else { break }
+                    sessionID = id
+                    newSessionID = id
+                    sessionIDCallback = self.sessionIDCallback
+                default:
+                    break
+                }
             case "assistant":
+                resultIsLatest = false
                 if let text = Self.text(in: object), !text.isEmpty { lastText = text }
             case "result":
                 sawResult = true
@@ -139,21 +182,55 @@ public final class StreamJSONReader: @unchecked Sendable {
                     lastText = text
                     if isError { errorText = text }
                 }
-                sawResultLine = true
+                resultIsLatest = true
+                if !reportsSessionState { settledHere = true }
             case "control_request", "control_cancel_request":
+                resultIsLatest = false
                 controls.append((Data(line), sessionID))
             default:
                 break
             }
         }
         let controlCallback = controls.isEmpty ? nil : self.controlCallback
-        let resultCallback = sawResultLine ? self.resultCallback : nil
+        var idleCallback: (@Sendable () -> Void)?
+        if isQuiet {
+            if settledHere {
+                idleSignalled = true
+                idleCallback = self.idleCallback
+            } else {
+                scheduleIdle(after: generation)
+            }
+        }
         lock.unlock()
 
         // 回调都在锁外：调用方可能回头读属性。顺序与行序一致：先有 id，再有审批，最后收尾。
         if let newSessionID { sessionIDCallback?(newSessionID) }
         for control in controls { controlCallback?(control.line, control.sessionID) }
-        resultCallback?()
+        idleCallback?()
+    }
+
+    /// 持锁调用。还没报过，见过 `result`，claude 不在跑（报状态的看 idle，旧版本看最后一行 `result` 之后没有新活动），也没有后台任务。
+    private var isQuiet: Bool {
+        guard !idleSignalled, !finished, sawResult, backgroundTasks.isEmpty else { return false }
+        return reportsSessionState ? sessionIdle : resultIsLatest
+    }
+
+    /// 持锁调用。后台任务在空闲时清空：claude 多半马上起一轮处理完成通知（那一行可能还在管道里），
+    /// 等一会儿；到点时又读过别的行就作废，由那一块重新判断。
+    private func scheduleIdle(after generation: Int) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + idleGrace) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let callback: (@Sendable () -> Void)?
+            if self.generation == generation, self.isQuiet {
+                self.idleSignalled = true
+                callback = self.idleCallback
+            } else {
+                callback = nil
+            }
+            self.lock.unlock()
+            callback?()
+        }
     }
 
     /// `{"message":{"content":[{"type":"text","text":…}]}}` 里的文本，拼起来。

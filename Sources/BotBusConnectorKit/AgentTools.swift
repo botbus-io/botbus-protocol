@@ -46,6 +46,39 @@ public enum AgentToolsInstructions {
     }
 }
 
+/// 不经手机、由宿主自己发起的一轮（例如电脑端按计划派给 agent 的活）的附加要求。
+///
+/// 调用方在发起 `startTask` / `followUp` 的那个任务里 `AgentRunContext.$current.withValue(…)`，再交给
+/// `CommandDispatcher.handle(_:)`：分发器与连接器在同一条调用链上（含分发器为去重开的子任务），task-local 一路传下去。
+/// 只作用于这一次调用，连接器自己之后起的轮次（排队的续聊、重启后自动 resume）读不到它。
+public struct AgentRunContext: Sendable, Hashable {
+    /// 预先签发的 token（`TaskContextRegistry.issue()`），注入时用它代替新签发的；调用方据此把工具请求对回自己的记录。
+    /// nil = 照常签发。
+    public var token: String?
+    /// 替换注入给 agent 的说明文字（默认那段说的是「任务来自用户手机」）。nil = 默认说明。
+    public var instructions: String?
+    /// 无人值守：这一轮的审批由连接器直接放行，向用户提问的工具直接拒绝——没有人会来回答。
+    /// 目前 Claude 与 Codex 连接器认它；别的连接器照常把审批交给手机。
+    public var unattended: Bool
+    /// 追加给 agent 进程与 `botbus` MCP server 的环境变量（与 `BOTBUS_*` 三个变量一起注入，同名时它们优先）。
+    public var environment: [String: String]
+
+    public init(token: String? = nil, instructions: String? = nil, unattended: Bool = false,
+                environment: [String: String] = [:]) {
+        self.token = token
+        self.instructions = instructions
+        self.unattended = unattended
+        self.environment = environment
+    }
+
+    @TaskLocal public static var current: AgentRunContext?
+
+    /// 拒绝提问时回给 agent 的话（无人值守的轮次）。
+    public static let unattendedQuestionRefusal =
+        "Nobody is watching this run, so questions cannot be answered. Decide on your own, or leave a message "
+        + "for the person through the tools described in your instructions, then finish."
+}
+
 /// 一次注入的全部内容：配置 + 这条任务的 token。连接器据此拼 Claude 的命令行或 Codex 的线程参数。
 public struct AgentToolsInjection: Sendable, Hashable {
     public static let mcpServerName = "botbus"
@@ -55,17 +88,38 @@ public struct AgentToolsInjection: Sendable, Hashable {
 
     public var configuration: AgentToolsConfiguration
     public var token: String
+    /// 替换默认说明文字（`AgentRunContext.instructions`）；nil = 默认那段。
+    public var customInstructions: String?
+    /// 追加的环境变量（`AgentRunContext.environment`）。
+    public var extraEnvironment: [String: String]
 
-    public init(configuration: AgentToolsConfiguration, token: String) {
+    public init(configuration: AgentToolsConfiguration, token: String, customInstructions: String? = nil,
+                extraEnvironment: [String: String] = [:]) {
         self.configuration = configuration
         self.token = token
+        self.customInstructions = customInstructions
+        self.extraEnvironment = extraEnvironment
     }
 
     /// 配置可用时签发（或续聊时复用）一个 token，否则 nil = 不注入。
+    /// 当前任务带着 `AgentRunContext` 时用它预签的 token 与说明文字。
     /// - Parameter reusing: 续聊的任务 id；它之前签过 token 就沿用，agent 手里那份一直有效。
     public static func make(_ configuration: AgentToolsConfiguration?, registry: TaskContextRegistry,
                             reusing taskId: String? = nil) async -> AgentToolsInjection? {
         guard let configuration, configuration.isUsable else { return nil }
+        if let context = AgentRunContext.current,
+           context.token != nil || context.instructions != nil || !context.environment.isEmpty {
+            var token: String
+            if let preset = context.token {
+                token = preset
+            } else if let taskId, let existing = await registry.token(for: taskId) {
+                token = existing
+            } else {
+                token = await registry.issue()
+            }
+            return AgentToolsInjection(configuration: configuration, token: token,
+                                       customInstructions: context.instructions, extraEnvironment: context.environment)
+        }
         if let taskId, let existing = await registry.token(for: taskId) {
             return AgentToolsInjection(configuration: configuration, token: existing)
         }
@@ -74,14 +128,18 @@ public struct AgentToolsInjection: Sendable, Hashable {
 
     /// 三个环境变量：子进程（Claude 的 shell、Codex 的 shell 与 MCP server）都靠它们找到工具服务器。
     public var environment: [String: String] {
-        [Self.toolsURLVariable: configuration.toolsURL,
-         Self.taskTokenVariable: token,
-         Self.cliVariable: configuration.cliPath]
+        extraEnvironment.merging([Self.toolsURLVariable: configuration.toolsURL,
+                                  Self.taskTokenVariable: token,
+                                  Self.cliVariable: configuration.cliPath]) { _, injected in injected }
     }
 
-    public var instructions: String { AgentToolsInstructions.text(cliPath: configuration.cliPath) }
-    /// 只有 shell、没有 MCP 的 agent（Pi、Hermes 的 `-q`）用这一份。
-    public var cliOnlyInstructions: String { AgentToolsInstructions.text(cliPath: configuration.cliPath, mcp: false) }
+    public var instructions: String {
+        customInstructions ?? AgentToolsInstructions.text(cliPath: configuration.cliPath)
+    }
+    /// 只有 shell、没有 MCP 的 agent（Pi、Hermes 的 `-q`）用这一份。替换过的说明原样给（调用方自己要写清 CLI 的用法）。
+    public var cliOnlyInstructions: String {
+        customInstructions ?? AgentToolsInstructions.text(cliPath: configuration.cliPath, mcp: false)
+    }
 
     /// `claude -p` 的追加参数。**必须放在 prompt 位置参数之后**：`--mcp-config` / `--allowedTools`
     /// 是可变参数，会把后面的位置参数当成自己的值吞掉；调用方随后再接 `--output-format` 等 `--flag` 来收尾。

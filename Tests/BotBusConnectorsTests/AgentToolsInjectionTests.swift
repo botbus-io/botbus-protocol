@@ -73,6 +73,31 @@ final class AgentToolsInjectionTests: XCTestCase {
         XCTAssertEqual(reused?.token, fresh.token)
     }
 
+    /// 宿主自己派的活（团队看板）：预签的 token、换掉的说明文字、追加的环境变量都只作用于带着上下文的这次调用。
+    func testRunContextOverridesTokenInstructionsAndEnvironment() async throws {
+        let registry = TaskContextRegistry()
+        let usable = AgentToolsConfiguration(cliPath: anyExecutablePath, toolsURL: "http://127.0.0.1:1")
+        let preset = await registry.issue()
+        let context = AgentRunContext(token: preset, instructions: "你是团队的开发", unattended: true,
+                                      environment: ["BOTBUS_TEAM_MEMBER": "dev", "BOTBUS_TASK_TOKEN": "spoofed"])
+        let made = await AgentRunContext.$current.withValue(context) {
+            await AgentToolsInjection.make(usable, registry: registry)
+        }
+        let injection = try XCTUnwrap(made)
+        XCTAssertEqual(injection.token, preset)
+        XCTAssertEqual(injection.instructions, "你是团队的开发")
+        XCTAssertEqual(injection.cliOnlyInstructions, "你是团队的开发")
+        XCTAssertEqual(injection.environment["BOTBUS_TEAM_MEMBER"], "dev")
+        XCTAssertEqual(injection.environment["BOTBUS_TASK_TOKEN"], preset, "注入的三个变量优先")
+        XCTAssertTrue(injection.mcpConfigJSON().contains("BOTBUS_TEAM_MEMBER"))
+        XCTAssertTrue(injection.claudeArguments().contains("你是团队的开发"))
+
+        let plain = await AgentToolsInjection.make(usable, registry: registry)
+        XCTAssertNotEqual(plain?.token, preset, "上下文之外照常签发")
+        XCTAssertNil(plain?.environment["BOTBUS_TEAM_MEMBER"])
+        XCTAssertTrue(plain?.instructions.hasPrefix("This task was sent from the user's phone") == true)
+    }
+
     // MARK: - Claude 命令行
 
     func testClaudeArgumentsWithoutInjection() {
@@ -193,6 +218,52 @@ final class AgentToolsInjectionTests: XCTestCase {
         let rebound = await registry.resolve(token, wait: 0)
         XCTAssertEqual(rebound, "claude:fork-1")
         await connector.stop()
+    }
+
+    /// 团队看板的员工（无人值守）以最高权限跑：`--permission-mode bypassPermissions` 排在可变参数之前，不会被 `--allowedTools` 吞掉。
+    func testClaudeBypassModeComesBeforeTheVariadicFlags() throws {
+        let value = injection()
+        let arguments = ClaudeConnector.arguments(resuming: nil, injection: value, name: "员工", bypassPermissions: true)
+        XCTAssertEqual(Array(arguments.prefix(4)), ["-p", "--name=员工", "--permission-mode", "bypassPermissions"])
+        XCTAssertEqual(Array(arguments[4..<(4 + value.claudeArguments().count)]), value.claudeArguments())
+        XCTAssertFalse(ClaudeConnector.arguments(resuming: nil, injection: value).contains("--permission-mode"))
+    }
+
+    /// 只有无人值守的轮次用 bypass；以 root 跑时 claude 拒绝这个模式（直接退出），不带，审批照旧由连接器放行。
+    func testClaudeBypassesPermissionsOnlyForUnattendedTurnsAndNotAsRoot() {
+        XCTAssertTrue(ClaudeConnector.bypassesPermissions(unattended: true, isRoot: false))
+        XCTAssertFalse(ClaudeConnector.bypassesPermissions(unattended: true, isRoot: true))
+        XCTAssertFalse(ClaudeConnector.bypassesPermissions(unattended: false, isRoot: false))
+    }
+
+    /// 员工（`AgentRunContext.unattended`）新建与续聊都带 bypass；手机起的一轮不带，照常审批。
+    func testUnattendedClaudeTurnsRunInBypassModeButPhoneTurnsDoNot() async throws {
+        let directory = try tempDirectory()
+        let claude = try fakeClaude(in: directory)
+        let store = makeClaudeStore()
+        let connector = ClaudeConnector(store: store,
+                                        paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                        binary: { claude.path })
+        let expected = !ClaudeConnector.runsAsRoot
+        _ = try await AgentRunContext.$current.withValue(AgentRunContext(unattended: true)) {
+            try await connector.start(projectPath: directory.path, prompt: "员工干活")
+        }
+        XCTAssertEqual(try recorded(directory, "sess-1").arguments.contains("bypassPermissions"), expected)
+        await assertEventually(timeout: 5) { await store.task(id: "claude:sess-1")?.status == .completed }
+        _ = try await AgentRunContext.$current.withValue(AgentRunContext(unattended: true)) {
+            try await connector.followUp(taskId: "claude:sess-1", prompt: "接着干")
+        }
+        XCTAssertEqual(try recorded(directory, "fork-1").arguments.contains("bypassPermissions"), expected)
+        await connector.stop()
+
+        let phone = try tempDirectory()
+        let phoneClaude = try fakeClaude(in: phone)
+        let phoneConnector = ClaudeConnector(store: makeClaudeStore(),
+                                             paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                             binary: { phoneClaude.path })
+        _ = try await phoneConnector.start(projectPath: phone.path, prompt: "手机上新建")
+        XCTAssertFalse(try recorded(phone, "sess-1").arguments.contains("--permission-mode"))
+        await phoneConnector.stop()
     }
 
     func testClaudeWithoutToolsInheritsEnvironmentUntouched() async throws {

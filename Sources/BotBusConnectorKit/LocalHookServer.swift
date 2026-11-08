@@ -64,11 +64,15 @@ public actor LocalHookServer {
         public var status: Int
         public var contentType: String?
         public var body: Data
+        /// 额外的响应头（`Cache-Control`、`Set-Cookie`……）。按名字排序写出；名字或值里的 CR / LF 会被去掉。
+        /// `Content-Type`、`Content-Length`、`Connection` 由服务器自己写，这里给了也不会重复写。
+        public var headers: [String: String]
 
-        public init(status: Int, contentType: String? = nil, body: Data = Data()) {
+        public init(status: Int, contentType: String? = nil, body: Data = Data(), headers: [String: String] = [:]) {
             self.status = status
             self.contentType = contentType
             self.body = body
+            self.headers = headers
         }
 
         public static func json(_ body: Data) -> Response {
@@ -168,6 +172,8 @@ public actor LocalHookServer {
     let portFileName: String?
     let requestedPort: UInt16?
     let maxBodyBytes: Int
+    /// 收哪些方法（大写）。hook 与工具服务器只收 POST；本机网页（例如团队看板）还要 GET 等。
+    let allowedMethods: Set<String>
     let errorResponder: ErrorResponder
     let sharedSecret: SharedSecret?
     /// 当前这一轮 `start()` 的密钥。只在内存与 0600 的密钥文件里，不进日志。
@@ -193,12 +199,14 @@ public actor LocalHookServer {
                 maxBodyBytes: Int = LocalHookServer.defaultMaxBodyBytes,
                 requestedPort: UInt16? = nil,
                 sharedSecret: SharedSecret? = nil,
+                allowedMethods: Set<String> = ["POST"],
                 errorResponder: @escaping ErrorResponder = { Response.text(status: $0, $1) },
                 handler: @escaping Handler) {
         self.supportDirectory = supportDirectory
         self.sharedSecret = sharedSecret
         self.portFileName = portFileName
         self.maxBodyBytes = maxBodyBytes
+        self.allowedMethods = Set(allowedMethods.map { $0.uppercased() })
         self.requestedPort = requestedPort
         self.errorResponder = errorResponder
         self.handler = handler
@@ -305,11 +313,20 @@ public actor LocalHookServer {
         }
 
         // hook 与工具调用都只 POST；别的方法明确回 405，省得将来有人以为这是个通用服务器。
-        guard method == "POST" else {
-            throw BadRequest(status: 405, message: "只支持 POST")
+        guard allowedMethods.contains(method) else {
+            throw BadRequest(status: 405, message: allowedMethods == ["POST"] ? "只支持 POST" : "不支持 \(method)")
         }
-        guard let text = headers["content-length"], let length = Int(text), length >= 0 else {
+        // 带 body 的方法必须给 Content-Length（不认 chunked）；GET / DELETE 之类没给就是空 body。
+        let length: Int
+        if let text = headers["content-length"] {
+            guard let parsed = Int(text), parsed >= 0 else {
+                throw BadRequest(status: 400, message: "缺少或非法的 Content-Length")
+            }
+            length = parsed
+        } else if ["POST", "PUT", "PATCH"].contains(method) {
             throw BadRequest(status: 400, message: "缺少或非法的 Content-Length")
+        } else {
+            length = 0
         }
         guard length <= maxBodyBytes else {
             throw BadRequest(status: 413, message: "请求体过大")
@@ -337,6 +354,16 @@ public actor LocalHookServer {
         if let contentType = response.contentType, response.status != 204 {
             head += "Content-Type: \(contentType)\r\n"
         }
+        let reserved: Set<String> = ["content-type", "content-length", "connection"]
+        for (name, value) in response.headers.sorted(by: { $0.key < $1.key }) {
+            // 按 Unicode 标量过滤：Swift 把 "\r\n" 当成一个字符，按字符比 "\r" / "\n" 会漏掉它。
+            let cleanName = String(String.UnicodeScalarView(name.unicodeScalars.filter {
+                $0 != "\r" && $0 != "\n" && $0 != ":" && $0 != " "
+            }))
+            let cleanValue = String(String.UnicodeScalarView(value.unicodeScalars.filter { $0 != "\r" && $0 != "\n" }))
+            guard !cleanName.isEmpty, !reserved.contains(cleanName.lowercased()) else { continue }
+            head += "\(cleanName): \(cleanValue)\r\n"
+        }
         // 204 按规范不带 body，也不带 Content-Length。
         if response.status != 204 { head += "Content-Length: \(response.body.count)\r\n" }
         head += "Connection: close\r\n\r\n"
@@ -353,11 +380,15 @@ public actor LocalHookServer {
         case 200: "OK"
         case 202: "Accepted"
         case 204: "No Content"
+        case 302: "Found"
+        case 303: "See Other"
+        case 304: "Not Modified"
         case 400: "Bad Request"
         case 401: "Unauthorized"
         case 403: "Forbidden"
         case 404: "Not Found"
         case 405: "Method Not Allowed"
+        case 409: "Conflict"
         case 408: "Request Timeout"
         case 413: "Payload Too Large"
         case 431: "Request Header Fields Too Large"

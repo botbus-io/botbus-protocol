@@ -42,12 +42,12 @@ public struct CodexSubprocessLauncher: CodexProcessLauncher {
     }
 }
 
-/// 一个真实的 `codex app-server` 子进程：stdout 走 `AsyncStream`，stdin 走串行队列（整行原子写），
+/// 一个真实的 `codex app-server`（或 `codex exec`）子进程：stdout 走 `AsyncStream`，stdin 走串行队列（整行原子写），
 /// stderr 只留最后一小段用于界面提示——**不进日志**，那里面可能有用户的内容。
 ///
 /// `@unchecked Sendable`：内部状态全部由 `lock` 或串行队列保护；`readStdout()` 按协议约定
 /// 只被单个读循环串行调用。
-final class CodexSubprocess: CodexProcessHandle, @unchecked Sendable {
+final class CodexSubprocess: CodexExecProcess, @unchecked Sendable {
     /// stderr 只留这么多字节（取末尾）。
     private static let stderrTailLimit = 4096
     private static let exitReasonLimit = 200
@@ -141,7 +141,7 @@ final class CodexSubprocess: CodexProcessHandle, @unchecked Sendable {
             if !FileManager.default.isExecutableFile(atPath: executablePath) { failure.diagnosis = .agentNotInstalled }
             throw failure
         }
-        Self.log.info("codex app-server pid=\(self.process.processIdentifier, privacy: .public)")
+        Self.log.info("codex \(arguments.first ?? "", privacy: .public) pid=\(self.process.processIdentifier, privacy: .public)")
     }
 
     func readStdout() async throws -> Data? {
@@ -171,6 +171,20 @@ final class CodexSubprocess: CodexProcessHandle, @unchecked Sendable {
         guard process.isRunning else { return }
         closeStdin()
         process.terminate()
+    }
+
+    // MARK: CodexExecProcess
+
+    func closeInput() { closeStdin() }
+
+    /// SIGINT：`codex exec` 收到后像终端里按 Ctrl-C 一样中止这一轮再退出。Windows 没有 SIGINT，直接结束。
+    func interrupt() {
+        guard process.isRunning else { return }
+        #if os(Windows)
+        terminate()
+        #else
+        process.interrupt()
+        #endif
     }
 
     /// 幂等。排在已经在队里的写之后关，不会撞上一次正在进行的写。

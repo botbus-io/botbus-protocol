@@ -16,19 +16,29 @@ final class ClaudePhoneApprovalTests: XCTestCase {
     }
 
     /// 假 `claude`：读一行 user 消息（记进 `prompts.log`），吐 init，再吐 `request.json` 里的那行控制请求，读一行回答存进 `answer`，
-    /// 然后吐 result，像真 claude 一样等 stdin 关了才退出（连接器读到 result 就关）。
-    private func fakeClaude(in directory: URL) throws -> URL {
+    /// 然后吐 result，像真 claude 一样等 stdin 关了才退出（不报状态时连接器读到 result 就关）。
+    ///
+    /// `background`：像这一轮在后台开了子代理——主轮的 `result` 先出来，子代理的审批在它**之后**才到，跑完再吐
+    /// 第二个 `result`。环境里有 `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` 才报 `session_state_changed`（同真 claude），
+    /// idle 等子代理跑完才报。连接器要是读到第一个 `result` 就关了 stdin，`read` 读到 EOF，回答是空的。
+    private func fakeClaude(in directory: URL, background: Bool = false) throws -> URL {
         try skipPOSIXScriptOnWindows()
         let url = directory.appendingPathComponent("claude")
         let dir = directory.path
-        let script = """
-        #!/bin/sh
-        if [ "$1" = "--help" ]; then
-          echo '  --effort <level>  Effort level (low, medium, high, max)'
-          exit 0
-        fi
-        read -r first
-        printf '%s\\n' "$first" >> "\(dir)/prompts.log"
+        let turn = background ? """
+        state running
+        echo '{"type":"system","subtype":"init","session_id":"sess-auto"}'
+        echo '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent","description":"sub"}]}'
+        echo '{"type":"result","subtype":"success","result":"started"}'
+        sleep 0.3
+        cat "\(dir)/request.json"
+        echo
+        read -r answer
+        printf '%s\\n' "$answer" > "\(dir)/answer.tmp" && mv "\(dir)/answer.tmp" "\(dir)/answer"
+        echo '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+        echo '{"type":"result","subtype":"success","result":"done"}'
+        state idle
+        """ : """
         echo '{"type":"system","subtype":"init","session_id":"sess-auto"}'
         sleep 0.2
         cat "\(dir)/request.json"
@@ -36,6 +46,21 @@ final class ClaudePhoneApprovalTests: XCTestCase {
         read -r answer
         printf '%s\\n' "$answer" > "\(dir)/answer.tmp" && mv "\(dir)/answer.tmp" "\(dir)/answer"
         echo '{"type":"result","subtype":"success","result":"done"}'
+        """
+        let script = """
+        #!/bin/sh
+        if [ "$1" = "--help" ]; then
+          echo '  --effort <level>  Effort level (low, medium, high, max)'
+          exit 0
+        fi
+        state() {
+          [ "$CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS" = "1" ] &&
+            echo '{"type":"system","subtype":"session_state_changed","state":"'"$1"'"}'
+          true
+        }
+        read -r first
+        printf '%s\\n' "$first" >> "\(dir)/prompts.log"
+        \(turn)
         cat > /dev/null
         """
         try Data(script.utf8).write(to: url)
@@ -51,7 +76,7 @@ final class ClaudePhoneApprovalTests: XCTestCase {
     }
 
     private func makeRig(tool: String = "Bash", input: [String: Any] = ["command": "sw_vers"],
-                         approvalTimeout: TimeInterval? = nil) throws -> Rig {
+                         approvalTimeout: TimeInterval? = nil, background: Bool = false) throws -> Rig {
         let directory = try tempDirectory()
         let project = directory.appendingPathComponent("app", isDirectory: true)
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
@@ -61,7 +86,7 @@ final class ClaudePhoneApprovalTests: XCTestCase {
                         "decision_reason": "This command requires approval"] as [String: Any],
         ]
         try JSONSerialization.data(withJSONObject: request).write(to: directory.appendingPathComponent("request.json"))
-        let claude = try fakeClaude(in: directory)
+        let claude = try fakeClaude(in: directory, background: background)
         let store = TaskStore(identity: AgentIdentity(agentId: "agent-1"),
                               connectors: ConnectorRegistry(descriptors: [
                                   ConnectorDescriptor(kind: .claude, displayName: "Claude Code", defaultEnabled: true) {
@@ -288,6 +313,62 @@ final class ClaudePhoneApprovalTests: XCTestCase {
         XCTAssertEqual(record?.autoApprove, true)
         XCTAssertFalse(pending.current, "放行的审批不建 pendingRequest")
         XCTAssertFalse(notified.current.contains { $0.category == .taskApproval }, "放行的审批不推通知")
+        await rig.connector.stop()
+    }
+
+    // MARK: - 宿主派的无人值守轮次（AgentRunContext.unattended，团队看板的员工）
+
+    func testUnattendedTurnAllowsWithoutCardOrNotificationEvenWithoutProjectAutoApprove() async throws {
+        let rig = try makeRig()
+        let events = await rig.store.events()
+        let notified = Locked<[Notify]>([])
+        let pending = Locked(false)
+        let collector = Task {
+            for await event in events {
+                if let notify = event.notify { notified.withLock { $0.append(notify) } }
+                if event.task?.pendingRequest != nil { pending.withLock { $0 = true } }
+            }
+        }
+        defer { collector.cancel() }
+
+        _ = try await AgentRunContext.$current.withValue(AgentRunContext(unattended: true)) {
+            try await rig.connector.start(projectPath: rig.project.path, prompt: "员工干活", images: [])
+        }
+        let response = try await answer(rig)
+        XCTAssertEqual(response["behavior"] as? String, "allow")
+        await assertEventually(timeout: 5) { await rig.store.task(id: "claude:sess-auto")?.status == .completed }
+        XCTAssertFalse(pending.current, "无人值守的轮次不建 pendingRequest")
+        XCTAssertFalse(notified.current.contains { $0.category == .taskApproval }, "也不推审批通知")
+        let record = await rig.store.task(id: "claude:sess-auto")
+        XCTAssertNil(record?.autoApprove, "不碰项目级的自动批准开关")
+        await rig.connector.stop()
+    }
+
+    /// 员工在后台开了子代理（`Agent` 的 `run_in_background`）：主轮的 `result` 先出来，子代理要审批时 stdin 得还开着，
+    /// 否则 claude 报 "Tool permission request failed: Stream closed"，员工跑不了命令、改不了文件。
+    func testUnattendedBackgroundWorkAfterTheResultStillGetsApproved() async throws {
+        let rig = try makeRig(background: true)
+        _ = try await AgentRunContext.$current.withValue(AgentRunContext(unattended: true)) {
+            try await rig.connector.start(projectPath: rig.project.path, prompt: "员工干活", images: [])
+        }
+        let response = try await answer(rig)
+        XCTAssertEqual(response["behavior"] as? String, "allow")
+        await assertEventually(timeout: 5) { await rig.store.task(id: "claude:sess-auto")?.status == .completed }
+        let record = await rig.store.task(id: "claude:sess-auto")
+        XCTAssertEqual(record?.lastMessage, "done", "跑完后台那一轮才收尾")
+        await rig.connector.stop()
+    }
+
+    func testUnattendedTurnRefusesQuestions() async throws {
+        let rig = try makeRig(tool: "AskUserQuestion", input: ["questions": [
+            ["question": "选哪个？", "header": "方案", "multiSelect": false, "options": [["label": "A"]]],
+        ]])
+        _ = try await AgentRunContext.$current.withValue(AgentRunContext(unattended: true)) {
+            try await rig.connector.start(projectPath: rig.project.path, prompt: "员工干活", images: [])
+        }
+        let response = try await answer(rig)
+        XCTAssertEqual(response["behavior"] as? String, "deny")
+        XCTAssertEqual(response["message"] as? String, AgentRunContext.unattendedQuestionRefusal)
         await rig.connector.stop()
     }
 

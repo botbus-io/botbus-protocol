@@ -123,7 +123,7 @@ final class StreamJSONReaderTests: XCTestCase {
         XCTAssertEqual(result.value?.sessionID, "resumed-session")
     }
 
-    /// `--permission-prompt-tool stdio`：审批请求整行交出并带上会话 id，`result` 行另报一声（调用方据此关 stdin）。
+    /// `--permission-prompt-tool stdio`：审批请求整行交出并带上会话 id。不报状态的旧版本读到 `result` 就报空闲（调用方据此关 stdin）。
     func testControlRequestsAreHandedOverWithTheSessionAndResultIsSignalled() throws {
         let pipe = Pipe()
         let finished = expectation(description: "stream finished")
@@ -131,7 +131,7 @@ final class StreamJSONReaderTests: XCTestCase {
         let controls = LockedControls()
         let reader = StreamJSONReader(handle: pipe.fileHandleForReading)
         reader.onControl = { line, sessionID in controls.append(line, sessionID) }
-        reader.onResult = { resulted.fulfill() }
+        reader.onIdle = { resulted.fulfill() }
         reader.onFinished = { _ in finished.fulfill() }
         reader.start()
         let lines = [
@@ -149,6 +149,143 @@ final class StreamJSONReaderTests: XCTestCase {
         XCTAssertEqual(second["request_id"] as? String, "r-1")
         XCTAssertEqual(try JSONSerialization.jsonObject(with: controls.lines[2]) as? [String: String],
                        ["type": "control_cancel_request", "request_id": "r-1"])
+    }
+
+    // MARK: - 什么时候关 stdin
+
+    /// 后台子代理：`result` 先出来，claude 的 idle 要等子代理跑完才来。中间子代理要审批，stdin 得还开着。
+    func testBackgroundAgentKeepsStdinOpenUntilClaudeReportsIdle() throws {
+        let stream = try IdleStream()
+        stream.write([
+            #"{"type":"system","subtype":"session_state_changed","state":"running"}"#,
+            #"{"type":"system","subtype":"init","session_id":"s-1"}"#,
+            #"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent","description":"x"}]}"#,
+            #"{"type":"result","subtype":"success","result":"started"}"#,
+        ])
+        stream.expectNoIdle(for: 0.3)
+        stream.write([
+            #"{"type":"control_request","request_id":"r-1","request":{"subtype":"can_use_tool","tool_name":"Bash"}}"#,
+            #"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#,
+        ])
+        stream.expectNoIdle(for: 0.3)
+        stream.write([
+            #"{"type":"result","subtype":"success","result":"done"}"#,
+            #"{"type":"system","subtype":"session_state_changed","state":"idle"}"#,
+        ])
+        stream.expectIdle()
+    }
+
+    /// 后台命令（`local_bash`）不拦 idle：idle 时还有后台任务就不报；命令跑完 claude 紧接着起一轮，
+    /// 那一轮的审批也得送得到，它的 `result` + idle 之后才报。
+    func testBackgroundCommandWaitsForTheFollowUpTurn() throws {
+        let stream = try IdleStream(grace: 0.2)
+        stream.write([
+            #"{"type":"system","subtype":"session_state_changed","state":"running"}"#,
+            #"{"type":"system","subtype":"init","session_id":"s-1"}"#,
+            #"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash","description":"sleep"}]}"#,
+            #"{"type":"result","subtype":"success","result":"started"}"#,
+            #"{"type":"system","subtype":"session_state_changed","state":"idle"}"#,
+        ])
+        stream.expectNoIdle(for: 0.4)
+        // 命令跑完：后台清空，claude 马上为完成通知起新的一轮（同一块里，或宽限期内的下一块）。
+        stream.write([
+            #"{"type":"system","subtype":"task_notification","task_id":"b1","status":"completed"}"#,
+            #"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#,
+        ])
+        stream.write([
+            #"{"type":"system","subtype":"session_state_changed","state":"running"}"#,
+            #"{"type":"system","subtype":"init","session_id":"s-1"}"#,
+        ])
+        stream.expectNoIdle(for: 0.5)
+        stream.write([
+            #"{"type":"control_request","request_id":"r-2","request":{"subtype":"can_use_tool","tool_name":"Bash"}}"#,
+            #"{"type":"result","subtype":"success","result":"done"}"#,
+            #"{"type":"system","subtype":"session_state_changed","state":"idle"}"#,
+        ])
+        stream.expectIdle()
+        XCTAssertEqual(stream.sessionID, "s-1", "后面那一轮的 init 不改会话 id")
+    }
+
+    /// 空闲时后台清空、之后什么也没来（比如任务被结束、不起新的一轮）：宽限期过了照样报，进程不会一直挂着。
+    func testBackgroundClearedWhileIdleSignalsAfterTheGrace() throws {
+        let stream = try IdleStream(grace: 0.2)
+        stream.write([
+            #"{"type":"system","subtype":"session_state_changed","state":"running"}"#,
+            #"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash","description":"x"}]}"#,
+            #"{"type":"result","subtype":"success","result":"started"}"#,
+            #"{"type":"system","subtype":"session_state_changed","state":"idle"}"#,
+        ])
+        stream.expectNoIdle(for: 0.4)
+        stream.write([#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#])
+        stream.expectIdle()
+    }
+
+    /// `ambient` 的后台任务（监视器之类）不算活动，不拦着关 stdin。
+    func testAmbientBackgroundTasksDoNotHoldStdinOpen() throws {
+        let stream = try IdleStream()
+        stream.write([
+            #"{"type":"system","subtype":"session_state_changed","state":"running"}"#,
+            #"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"m1","task_type":"monitor","description":"x","ambient":true}]}"#,
+            #"{"type":"result","subtype":"success","result":"ok"}"#,
+            #"{"type":"system","subtype":"session_state_changed","state":"idle"}"#,
+        ])
+        stream.expectIdle()
+    }
+
+    /// 报状态的版本只认 idle：`result` 后还没 idle（留着的结果、后台子代理）不报；一行 `result` 都没有的 idle 也不报
+    /// （刚起来还没读 stdin 时的状态，这时关 stdin 会把这一轮的审批全掐掉）。
+    func testIdleCountsOnlyAfterAResult() throws {
+        let stream = try IdleStream()
+        stream.write([
+            #"{"type":"system","subtype":"session_state_changed","state":"idle"}"#,
+            #"{"type":"system","subtype":"session_state_changed","state":"running"}"#,
+            #"{"type":"system","subtype":"init","session_id":"s-1"}"#,
+            #"{"type":"result","subtype":"success","result":"ok"}"#,
+        ])
+        stream.expectNoIdle(for: 0.3)
+        stream.write([#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#])
+        stream.expectIdle()
+    }
+}
+
+/// 一根开着的管道喂给 reader，按块写、看 `onIdle` 报没报。
+private final class IdleStream: @unchecked Sendable {
+    private let pipe = Pipe()
+    private let reader: StreamJSONReader
+    private let lock = NSLock()
+    private var idleCount = 0
+    private var storedSessionID: String?
+
+    init(grace: TimeInterval = 0.2) throws {
+        reader = StreamJSONReader(handle: pipe.fileHandleForReading, idleGrace: grace)
+        reader.onIdle = { [weak self] in self?.lock.withLock { self?.idleCount += 1 } }
+        reader.onSessionID = { [weak self] id in self?.lock.withLock { self?.storedSessionID = id } }
+        reader.start()
+    }
+
+    deinit {
+        try? pipe.fileHandleForWriting.close()
+        reader.finish()
+    }
+
+    var sessionID: String? { lock.withLock { storedSessionID } }
+    private var count: Int { lock.withLock { idleCount } }
+
+    func write(_ lines: [String]) {
+        try? pipe.fileHandleForWriting.write(contentsOf: Data((lines.joined(separator: "\n") + "\n").utf8))
+        // 一次 write 一块：等 reader 读完这块再写下一块，免得两块并成一块。
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+
+    func expectNoIdle(for seconds: TimeInterval, file: StaticString = #filePath, line: UInt = #line) {
+        Thread.sleep(forTimeInterval: seconds)
+        XCTAssertEqual(count, 0, "不该这么早关 stdin", file: file, line: line)
+    }
+
+    func expectIdle(file: StaticString = #filePath, line: UInt = #line) {
+        let deadline = Date().addingTimeInterval(2)
+        while count == 0, Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+        XCTAssertEqual(count, 1, "应当报一次空闲", file: file, line: line)
     }
 }
 
