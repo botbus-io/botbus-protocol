@@ -11,7 +11,7 @@ import os
 public struct CodexSubprocessLauncher: CodexProcessLauncher {
     public var executablePath: String
     public var arguments: [String]
-    /// nil = 继承当前进程的环境（codex 要靠它找 `CODEX_HOME` 与登录态）。
+    /// nil = 继承当前进程的环境（codex 要靠它找 `CODEX_HOME` 与登录态；继承来的 `BOTBUS_*` 工具变量会剔掉）。
     public var environment: [String: String]?
     public var currentDirectory: URL?
     /// Desktop helper uses the desktop's stderr directly; ordinary Agent mode keeps a tail.
@@ -78,7 +78,10 @@ final class CodexSubprocess: CodexExecProcess, @unchecked Sendable {
 
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = arguments
-        if let environment { process.environment = environment }
+        // nil = 继承本进程，但剔掉继承来的 `BOTBUS_*` 工具变量（`AgentToolsInjection.inheritedVariables`）：
+        // 这一轮要用的由 `shell_environment_policy` / MCP 的 env 重新注入。
+        process.environment = environment
+            ?? AgentToolsInjection.strippingInherited(ProcessInfo.processInfo.environment)
         if let currentDirectory { process.currentDirectoryURL = currentDirectory }
         let stderrPipe = forwardStderr ? nil : Pipe()
         self.stderrPipe = stderrPipe
@@ -124,7 +127,7 @@ final class CodexSubprocess: CodexExecProcess, @unchecked Sendable {
         }
 
         do {
-            try process.run()
+            try PlatformProcess.run(process)
         } catch {
             // 没起来：四根管子端全关（Linux 上没人替我们关）。
             stdoutPipe.fileHandleForReading.finishPortableReading()

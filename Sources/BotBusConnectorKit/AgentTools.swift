@@ -85,6 +85,18 @@ public struct AgentToolsInjection: Sendable, Hashable {
     public static let toolsURLVariable = "BOTBUS_TOOLS_URL"
     public static let taskTokenVariable = "BOTBUS_TASK_TOKEN"
     public static let cliVariable = "BOTBUS_CLI"
+    /// 团队调度派的活才有（`TeamRunDriver` 经 `AgentRunContext.environment` 注入），`botbus mcp` 据此列出 `team_*` 工具。
+    public static let teamMemberVariable = "BOTBUS_TEAM_MEMBER"
+
+    /// 宿主进程自己从环境里继承来、但不属于这一轮的工具变量：宿主若是从某个 agent 会话（手机任务、AI 员工）的
+    /// shell 里起来的，环境里会带着**那条**任务的 token。原样传给子 agent 等于把别人的 token 借出去，
+    /// 还会让「没配工具」的一轮也能调工具服务器。起子进程前一律剔掉，需要时由 `environment` 重新注入。
+    public static let inheritedVariables = [toolsURLVariable, taskTokenVariable, cliVariable, teamMemberVariable]
+
+    /// `base` 去掉 `inheritedVariables` 后的一份，连接器起子进程的环境都从它开始。
+    public static func strippingInherited(_ base: [String: String]) -> [String: String] {
+        base.filter { !inheritedVariables.contains($0.key) }
+    }
 
     public var configuration: AgentToolsConfiguration
     public var token: String

@@ -266,7 +266,7 @@ final class AgentToolsInjectionTests: XCTestCase {
         await phoneConnector.stop()
     }
 
-    func testClaudeWithoutToolsInheritsEnvironmentUntouched() async throws {
+    func testClaudeWithoutToolsInheritsEnvironmentButNotToolVariables() async throws {
         let directory = try tempDirectory()
         let claude = try fakeClaude(in: directory)
         let connector = ClaudeConnector(store: makeClaudeStore(),
@@ -276,7 +276,7 @@ final class AgentToolsInjectionTests: XCTestCase {
         let recorded = try recorded(directory, "sess-1")
         XCTAssertEqual(recorded.arguments, ["-p", "--name=hi", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--output-format", "stream-json", "--verbose"])
         XCTAssertEqual(try stdinText(directory, "sess-1"), "hi")
-        XCTAssertEqual(recorded.environment[1], ProcessInfo.processInfo.environment["BOTBUS_TASK_TOKEN"] ?? "")
+        XCTAssertEqual(recorded.environment[1], "", "没配工具：宿主从别的会话继承来的 token 也不能漏给 claude")
         // 空环境的 claude 找不到 HOME 下的登录态，只会回 "Not logged in"。
         let home = try String(contentsOf: directory.appendingPathComponent("sess-1.home"), encoding: .utf8)
         XCTAssertEqual(home, ProcessInfo.processInfo.environment["HOME"])
@@ -436,5 +436,37 @@ final class AgentToolsInjectionTests: XCTestCase {
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("fork-1.args").path))
         await connector.stop()
+    }
+
+    // MARK: - 继承来的工具变量（宿主从某个 agent 会话里起来时）
+
+    private let inherited = ["BOTBUS_TOOLS_URL": "http://127.0.0.1:9", "BOTBUS_TASK_TOKEN": "parent-token",
+                             "BOTBUS_CLI": "/parent/botbus", "BOTBUS_TEAM_MEMBER": "dev",
+                             "HOME": "/Users/me", "BOTBUS_LOG_PRIVATE": "1"]
+
+    func testInheritedToolVariablesAreStrippedFromAgentEnvironment() {
+        let environment = AgentBinary.environment(for: "/opt/fake/bin/pi", base: inherited)
+        for name in AgentToolsInjection.inheritedVariables {
+            XCTAssertNil(environment[name], "\(name) 是父会话的，不能漏给子 agent")
+        }
+        XCTAssertEqual(environment["HOME"], "/Users/me")
+        XCTAssertEqual(environment["BOTBUS_LOG_PRIVATE"], "1", "只剔工具变量，别的 BOTBUS_* 照常继承")
+
+        let claude = ClaudeConnector.environment(adding: [:], to: inherited)
+        XCTAssertNil(claude[AgentToolsInjection.taskTokenVariable])
+        XCTAssertNil(claude[AgentToolsInjection.teamMemberVariable])
+        XCTAssertEqual(claude["HOME"], "/Users/me")
+    }
+
+    func testInjectedToolVariablesReplaceInheritedOnes() {
+        let injected = injection(token: "own-token").environment
+        let environment = AgentBinary.environment(for: "/opt/fake/bin/pi", adding: injected, base: inherited)
+        XCTAssertEqual(environment[AgentToolsInjection.taskTokenVariable], "own-token")
+        XCTAssertEqual(environment[AgentToolsInjection.cliVariable], cliPath)
+        XCTAssertNil(environment[AgentToolsInjection.teamMemberVariable], "手机任务不是员工，不能看到 team_* 工具")
+
+        let claude = ClaudeConnector.environment(adding: injected, to: inherited)
+        XCTAssertEqual(claude[AgentToolsInjection.taskTokenVariable], "own-token")
+        XCTAssertEqual(claude[AgentToolsInjection.toolsURLVariable], "http://127.0.0.1:4567")
     }
 }

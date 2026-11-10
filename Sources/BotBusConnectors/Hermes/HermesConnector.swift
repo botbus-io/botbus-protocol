@@ -431,7 +431,7 @@ public struct HermesSubprocessLauncher: HermesProcessLauncher {
             }
         }
         do {
-            try process.run()
+            try PlatformProcess.run(process)
         } catch {
             handle.finishPortableReading()
             try? stdout.fileHandleForWriting.close()

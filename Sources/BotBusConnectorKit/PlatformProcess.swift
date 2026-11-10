@@ -51,6 +51,23 @@ public enum PlatformProcess {
         #endif
     }
 
+    /// 启动子进程，并让它带着空的信号屏蔽字起来。
+    ///
+    /// Linux 上 Foundation 的 `Process.run()` 用 `posix_spawn` 起进程却不设 `POSIX_SPAWN_SETSIGMASK`，
+    /// 子进程照搬发起线程的屏蔽字；而 GCD / Swift 并发的工作线程屏蔽了 SIGINT、SIGTERM 等异步信号，
+    /// 从这些线程起的子进程（sh、Rust 写的 agent）就再也收不到 `interrupt` / `terminate`，取消后一直残留。
+    /// 所以在 `run()` 前后临时清空本线程的屏蔽字（macOS 的工作线程不屏蔽这些信号，照样清一遍无妨）；Windows 没有信号，直接 `run()`。
+    public static func run(_ process: Process) throws {
+        #if !os(Windows)
+        var empty = sigset_t()
+        sigemptyset(&empty)
+        var previous = sigset_t()
+        pthread_sigmask(SIG_SETMASK, &empty, &previous)
+        defer { pthread_sigmask(SIG_SETMASK, &previous, nil) }
+        #endif
+        try process.run()
+    }
+
     /// 让子进程停下：POSIX 发 SIGINT（agent 自己收尾、写完 transcript 再退），Windows 结束它和它的子孙。
     public static func interrupt(_ pid: Int32) {
         guard pid > 0 else { return }

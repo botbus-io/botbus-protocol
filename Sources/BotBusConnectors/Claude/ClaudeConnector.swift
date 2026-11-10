@@ -1448,13 +1448,13 @@ public actor ClaudeConnector: TaskConnector {
         }
     }
 
-    /// 子进程环境：继承本进程，再叠上注入的变量（同名以注入为准）。
+    /// 子进程环境：继承本进程（剔掉继承来的 `BOTBUS_*` 工具变量），再叠上注入的变量（同名以注入为准）。
     ///
     /// 总是给出完整的一份：`Process.environment = nil` 在 macOS 26 上起出来的是**空**环境而不是继承，
     /// 没有 HOME 的 claude 读不到登录态，只会回 "Not logged in"。
     static func environment(adding extra: [String: String],
                             to base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
-        base.merging(extra) { _, injected in injected }
+        AgentToolsInjection.strippingInherited(base).merging(extra) { _, injected in injected }
     }
 
     /// 宿主派的无人值守轮次（团队看板的员工）以 bypassPermissions 跑，同 Codex 员工的
@@ -1543,7 +1543,7 @@ public actor ClaudeConnector: TaskConnector {
         }
 
         do {
-            try process.run()
+            try PlatformProcess.run(process)
         } catch {
             // 没起来：两根管子剩下的三端也关掉（stdin 的写端由 channel 关），Linux 上不会有人替我们关。
             channel.close()

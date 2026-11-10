@@ -74,13 +74,13 @@ public enum AgentBinary {
     }
     #endif
 
-    /// 子进程环境：继承本进程，把可执行文件所在目录（以及它软链接指向的目录）放到 PATH 最前，再叠上 `extra`。
+    /// 子进程环境：继承本进程（剔掉继承来的 `BOTBUS_*` 工具变量，见 `AgentToolsInjection.inheritedVariables`），把可执行文件所在目录（以及它软链接指向的目录）放到 PATH 最前，再叠上 `extra`。
     ///
     /// Pi 与 OpenClaw 是 `#!/usr/bin/env node` 脚本：GUI 进程的 PATH 只有 `/usr/bin:/bin:…`，
     /// 找不到 Homebrew 或 nvm 装的 node，进程一起来就退出。npm 全局装的 node 几乎总和这个脚本在同一个 bin 目录里。
     public static func environment(for executable: String, adding extra: [String: String] = [:],
                                    base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
-        var environment = base
+        var environment = AgentToolsInjection.strippingInherited(base)
         let directories = pathDirectories(for: executable)
         #if os(Windows)
         let existing = PlatformPath.splitSearchPath(PlatformPath.searchPath(in: base) ?? "")
