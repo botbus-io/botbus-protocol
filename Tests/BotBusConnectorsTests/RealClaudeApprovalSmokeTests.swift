@@ -7,6 +7,22 @@ import BotBusProtocol
 /// 默认跳过；运行：`BOTBUS_REAL_CLAUDE=<claude 可执行文件> swift test --filter RealClaudeApprovalSmokeTests`。
 /// 包一层 `--setting-sources project,local`：不读 `~/.claude/settings.json`，免得本机装的 BotBus hook 把这次审批也报给正在跑的 app。
 final class RealClaudeApprovalSmokeTests: XCTestCase {
+    /// 问本机真实的 `claude` 它有哪些模型（`ClaudeModels.list`）。不发消息、不花额度，同样默认跳过：
+    /// `BOTBUS_REAL_CLAUDE=<claude 可执行文件> swift test --filter RealClaudeApprovalSmokeTests/testModelListWithRealClaude`。
+    func testModelListWithRealClaude() async throws {
+        let real = ProcessInfo.processInfo.environment["BOTBUS_REAL_CLAUDE"] ?? ""
+        try XCTSkipIf(real.isEmpty, "set BOTBUS_REAL_CLAUDE=<path to claude>")
+        let fetched = await ClaudeModels.list(binary: real)
+        let listed = try XCTUnwrap(fetched, "claude 没有报模型列表（没登录，或版本太老）")
+        for model in listed {
+            print("real claude model: \(model.option.id) | \(model.option.displayName) | "
+                  + "\(model.option.efforts?.joined(separator: ",") ?? "-") | \(model.resolved ?? "-")")
+        }
+        XCTAssertFalse(listed.isEmpty)
+        XCTAssertFalse(listed.contains { $0.option.id == "default" })
+        XCTAssertEqual(ConnectorRegistry.sanitized(listed.map(\.option)), listed.map(\.option), "报出去的列表过得了注册表的清洗")
+    }
+
     func testPhoneTurnApprovalWithRealClaude() async throws {
         let real = ProcessInfo.processInfo.environment["BOTBUS_REAL_CLAUDE"] ?? ""
         try XCTSkipIf(real.isEmpty, "set BOTBUS_REAL_CLAUDE=<path to claude>")

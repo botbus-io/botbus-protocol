@@ -172,6 +172,7 @@ final class CodexExecTests: XCTestCase {
         let overrides = zip(arguments, arguments.dropFirst()).filter { $0.0 == "-c" }.map(\.1)
         XCTAssertTrue(overrides.contains(#"model_reasoning_effort="high""#))
         XCTAssertTrue(overrides.contains(#"developer_instructions="你是团队的开发。\n用 \"botbus team\" 改看板。""#))
+        // cliPath 要真实存在且可执行，注入才生效（Windows 上是 cmd.exe，反斜杠在 TOML 里转义，与 JSON 相同）。
         XCTAssertTrue(overrides.contains("mcp_servers.botbus.command=\"\(anyExecutableJSON)\""))
         XCTAssertTrue(overrides.contains(#"mcp_servers.botbus.args=["mcp"]"#))
         XCTAssertTrue(overrides.contains(#"shell_environment_policy.set.BOTBUS_TEAM_MEMBER="dev""#))
