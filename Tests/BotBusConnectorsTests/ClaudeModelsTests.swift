@@ -259,16 +259,16 @@ final class ClaudeModelsTests: XCTestCase {
         XCTAssertNil(none)
         // 一直不答：到点放弃，进程被终止。
         let silent = try fakeClaudeAnsweringInitialize("#!/bin/sh\nexec sleep 30\n")
-        let started = Date()
+        let started = ContinuousClock.now
         let timedOut = await ClaudeModels.list(binary: silent.path, timeout: 0.3)
         XCTAssertNil(timedOut)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 10)
+        XCTAssertLessThan((started.duration(to: .now) / .seconds(1)), 10)
         // 连 SIGTERM 都不理：`list` 等它退出才返回，所以到点得强制结束它。
         let stubborn = try fakeClaudeAnsweringInitialize("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 0.1; done\n")
-        let stubbornStarted = Date()
+        let stubbornStarted = ContinuousClock.now
         let killed = await ClaudeModels.list(binary: stubborn.path, timeout: 0.3, exitGrace: 0.3)
         XCTAssertNil(killed)
-        XCTAssertLessThan(Date().timeIntervalSince(stubbornStarted), 10)
+        XCTAssertLessThan((stubbornStarted.duration(to: .now) / .seconds(1)), 10)
         // 起不来。
         let missing = await ClaudeModels.list(binary: "/nonexistent/claude", timeout: 1)
         XCTAssertNil(missing)

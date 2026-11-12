@@ -245,9 +245,9 @@ final class LocalHookServerTests: XCTestCase {
             return .hold(hold)
         }
 
-        let begin = Date()
+        let begin = ContinuousClock.now
         let response = try await rawRequest(post(path: "/hooks/claude", body: "{}"), port: started.port)
-        XCTAssertLessThan(Date().timeIntervalSince(begin), 3, "超时必须真的把响应放出来")
+        XCTAssertLessThan((begin.duration(to: .now) / .seconds(1)), 3, "超时必须真的把响应放出来")
         XCTAssertTrue(response.hasSuffix(#"{"decision":"ask"}"#), response)
 
         let hold = try XCTUnwrap(held.current)
@@ -385,10 +385,10 @@ final class LocalHookServerTests: XCTestCase {
             try await rawRequest(post(path: "/hooks/claude", body: "{}"), port: started.port, readTimeout: 10)
         }
         await assertEventually { held.current != nil }
-        let begin = Date()
+        let begin = ContinuousClock.now
         await started.server.stop()
         let text = try await pending.value
-        XCTAssertLessThan(Date().timeIntervalSince(begin), 3)
+        XCTAssertLessThan((begin.duration(to: .now) / .seconds(1)), 3)
         XCTAssertFalse(text.hasPrefix("HTTP/1.1 200 "), text)
         XCTAssertFalse(try XCTUnwrap(held.current).answer(.json("{}")))
     }

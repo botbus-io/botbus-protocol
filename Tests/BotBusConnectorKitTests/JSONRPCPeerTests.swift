@@ -217,14 +217,14 @@ final class JSONRPCPeerTests: XCTestCase {
         let line = #"{"jsonrpc":"2.0","method":"big","params":{"data":""# + payload + #""}}"# + "\n"
         let bytes = Array(line.utf8)
         let chunkSize = 64 * 1024
-        let start = Date()
+        let start = ContinuousClock.now
         var offset = 0
         while offset < bytes.count {
             let end = min(offset + chunkSize, bytes.count)
             await peer.receive(Data(bytes[offset..<end]))
             offset = end
         }
-        let elapsed = Date().timeIntervalSince(start)
+        let elapsed = (start.duration(to: .now) / .seconds(1))
         XCTAssertEqual(seen.withLock { $0 }, ["big"])
         XCTAssertLessThan(elapsed, 6, "一行大消息按小 chunk 喂入不该是二次方开销（用了 \(elapsed) 秒）")
     }
