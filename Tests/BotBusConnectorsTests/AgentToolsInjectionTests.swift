@@ -266,6 +266,61 @@ final class AgentToolsInjectionTests: XCTestCase {
         await phoneConnector.stop()
     }
 
+    /// 账号池：BotBus 起的这一轮带账号环境（只给 claude 进程，空串 = 去掉继承来的），自定义接口的模型不对 Claude 的列表；
+    /// 之后手机的续聊（没有上下文）沿用同一份环境和模型，不会换回本机登录的账号。
+    func testProcessEnvironmentAndAnyModelStickToTheSession() async throws {
+        let directory = try tempDirectory()
+        let record = directory.path
+        let claude = try executable("claude", in: directory, script: """
+        #!/bin/sh
+        sid="sess-1"
+        for a in "$@"; do [ "$a" = "--resume" ] && sid="fork-1"; done
+        for a in "$@"; do printf '%s\\0' "$a"; done > "\(record)/$sid.args"
+        printf '%s|%s|%s' "$ANTHROPIC_BASE_URL" "$ANTHROPIC_AUTH_TOKEN" "${PROFILE_PROBE-unset}" > "\(record)/$sid.env"
+        head -n 1 > /dev/null
+        echo '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
+        echo '{"type":"result","subtype":"success","result":"done"}'
+        sleep 0.5
+        """)
+        setenv("PROFILE_PROBE", "inherited", 1)
+        defer { unsetenv("PROFILE_PROBE") }
+        let store = makeClaudeStore()
+        let connector = ClaudeConnector(store: store,
+                                        paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                        binary: { claude.path })
+        let context = AgentRunContext(unattended: true,
+                                      processEnvironment: ["ANTHROPIC_BASE_URL": "https://api.example.com",
+                                                           "ANTHROPIC_AUTH_TOKEN": "sk-1", "PROFILE_PROBE": ""],
+                                      acceptsAnyModel: true)
+        _ = try await AgentRunContext.$current.withValue(context) {
+            try await connector.start(projectPath: directory.path, prompt: "员工干活", images: [],
+                                      selection: ModelSelection(model: "my-model"))
+        }
+        let env = { (sid: String) in try String(contentsOf: directory.appendingPathComponent("\(sid).env"), encoding: .utf8) }
+        let args = { (sid: String) -> [String] in
+            let data = try Data(contentsOf: directory.appendingPathComponent("\(sid).args"))
+            return data.split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+        }
+        XCTAssertEqual(try env("sess-1"), "https://api.example.com|sk-1|unset", "空串的变量从继承的环境里去掉")
+        XCTAssertTrue(try args("sess-1").contains("my-model"))
+        await assertEventually(timeout: 5) { await store.task(id: "claude:sess-1")?.status == .completed }
+        _ = try await connector.followUp(taskId: "claude:sess-1", prompt: "手机上接着问")
+        XCTAssertEqual(try env("fork-1"), "https://api.example.com|sk-1|unset", "手机续聊沿用这条会话的账号")
+        XCTAssertTrue(try args("fork-1").contains("my-model"))
+        await connector.stop()
+
+        // 没有担保时，列表里没有的模型照旧不收。
+        let plain = ClaudeConnector(store: makeClaudeStore(),
+                                    paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                    binary: { claude.path })
+        do {
+            _ = try await plain.start(projectPath: directory.path, prompt: "x", images: [], selection: ModelSelection(model: "my-model"))
+            XCTFail("不认识的模型应该报错")
+        } catch {}
+        XCTAssertThrowsError(try ClaudeConnector.resolve(ModelSelection(model: "-x"), current: nil, acceptsAnyModel: true))
+        await plain.stop()
+    }
+
     func testClaudeWithoutToolsInheritsEnvironmentButNotToolVariables() async throws {
         let directory = try tempDirectory()
         let claude = try fakeClaude(in: directory)

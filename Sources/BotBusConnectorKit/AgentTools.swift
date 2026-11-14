@@ -62,13 +62,32 @@ public struct AgentRunContext: Sendable, Hashable {
     public var unattended: Bool
     /// 追加给 agent 进程与 `botbus` MCP server 的环境变量（与 `BOTBUS_*` 三个变量一起注入，同名时它们优先）。
     public var environment: [String: String]
+    /// 只给 agent 进程本身的环境变量（不进 MCP 配置、不给 `botbus` MCP server）：这一轮用哪个账号或接口，
+    /// 比如 `CLAUDE_CODE_OAUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`CODEX_HOME`。值为空串 = 从继承来的环境里去掉这个变量
+    ///（免得宿主环境里的 `ANTHROPIC_API_KEY` 盖过这一轮的令牌）。Claude 连接器把它记在会话上，之后这条会话的续聊
+    ///（手机发的也算）沿用，直到连接器重启；Codex 只用于 `codex exec` 起的这一轮（续聊走 app-server，用本机登录）。
+    public var processEnvironment: [String: String]
+    /// 模型名由调用方担保（自定义接口的模型不在连接器报的列表里）：连接器只查写法（`ModelOption.isValidId`），不对列表。
+    public var acceptsAnyModel: Bool
 
     public init(token: String? = nil, instructions: String? = nil, unattended: Bool = false,
-                environment: [String: String] = [:]) {
+                environment: [String: String] = [:], processEnvironment: [String: String] = [:],
+                acceptsAnyModel: Bool = false) {
         self.token = token
         self.instructions = instructions
         self.unattended = unattended
         self.environment = environment
+        self.processEnvironment = processEnvironment
+        self.acceptsAnyModel = acceptsAnyModel
+    }
+
+    /// 把 `processEnvironment` 叠到一份完整的子进程环境上：非空的设上，空串的去掉。
+    public static func applying(_ overrides: [String: String], to base: [String: String]) -> [String: String] {
+        var result = base
+        for (key, value) in overrides {
+            if value.isEmpty { result.removeValue(forKey: key) } else { result[key] = value }
+        }
+        return result
     }
 
     @TaskLocal public static var current: AgentRunContext?

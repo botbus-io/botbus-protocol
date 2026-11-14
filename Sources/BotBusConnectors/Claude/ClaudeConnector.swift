@@ -126,6 +126,12 @@ public actor ClaudeConnector: TaskConnector {
         /// 最近一次 BotBus 起的这一轮是无人值守的（`AgentRunContext.unattended`，宿主自己派的活）：
         /// 审批直接放行、提问直接拒绝。手机续聊（不带这个上下文）起的轮次把它清掉。
         var unattended = false
+        /// 这条会话用的账号 / 接口（`AgentRunContext.processEnvironment`）：BotBus 起它时给的，之后每次 `--resume`
+        ///（手机续聊、排队的轮次）照样带上，免得续聊换回本机登录的账号、而 `chosenModel` 是只有那个接口认得的模型。
+        /// 只在内存里：连接器重启后续聊用本机登录的账号。
+        var processEnvironment: [String: String] = [:]
+        /// `chosenModel` 由起它的调用方担保（`AgentRunContext.acceptsAnyModel`，自定义接口的模型）。
+        var acceptsAnyModel = false
 
         /// 一轮正跑着：没有 hook 能保证把它收尾（中断不发 Stop），得盯着。
         var isMidTurn: Bool { status == .running || status == .waitingApproval }
@@ -1193,7 +1199,10 @@ public actor ClaudeConnector: TaskConnector {
                       selection: ModelSelection) async throws -> ConnectorOutcome {
         // 先查模型、再读图：不对就别起进程，也别签 token。
         await refreshModels(for: selection)
-        let chosen = try Self.resolve(selection, current: nil, options: modelOptions ?? [])
+        let context = AgentRunContext.current
+        let anyModel = context?.acceptsAnyModel ?? false
+        let processEnvironment = context?.processEnvironment ?? [:]
+        let chosen = try Self.resolve(selection, current: nil, options: modelOptions ?? [], acceptsAnyModel: anyModel)
         let input = try Self.stdinMessage(prompt: prompt, images: images)
         let injection = await AgentToolsInjection.make(tools(), registry: registry)
         let executable = binary().map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
@@ -1203,7 +1212,8 @@ public actor ClaudeConnector: TaskConnector {
             try await self.run(arguments: Self.arguments(resuming: nil, injection: injection,
                                                          model: chosen.model, effort: chosen.effort, name: name,
                                                          bypassPermissions: Self.bypassesPermissions(unattended: unattended)),
-                               workingDirectory: projectPath, environment: injection?.environment ?? [:], stdin: input)
+                               workingDirectory: projectPath, environment: injection?.environment ?? [:],
+                               processEnvironment: processEnvironment, stdin: input)
         }
         let launched: Launch
         do {
@@ -1221,6 +1231,8 @@ public actor ClaudeConnector: TaskConnector {
         session.chosenModel = chosen.model
         session.chosenEffort = chosen.effort
         session.unattended = unattended
+        session.processEnvironment = processEnvironment
+        session.acceptsAnyModel = anyModel
         Self.applyPromptTitle(&session, prompt: prompt, hasImages: !images.isEmpty)
         if let existing = sessions[sessionID], existing.pendingRequest != nil {
             session.status = existing.status
@@ -1246,7 +1258,8 @@ public actor ClaudeConnector: TaskConnector {
         await refreshModels(for: selection)
         var chosen = (model: sessions[sessionID]?.chosenModel, effort: sessions[sessionID]?.chosenEffort)
         if !selection.isEmpty {
-            chosen = try Self.resolve(selection, current: sessions[sessionID], options: modelOptions ?? [])
+            chosen = try Self.resolve(selection, current: sessions[sessionID], options: modelOptions ?? [],
+                                      acceptsAnyModel: sessions[sessionID]?.acceptsAnyModel ?? false)
             sessions[sessionID]?.chosenModel = chosen.model
             sessions[sessionID]?.chosenEffort = chosen.effort
         }
@@ -1288,13 +1301,16 @@ public actor ClaudeConnector: TaskConnector {
         launching.insert(sessionID)
         defer { launching.remove(sessionID) }
         // 这一轮是不是无人值守：手机续聊与排队的轮次读不到上下文，一律清掉。
-        let unattended = AgentRunContext.current?.unattended ?? false
+        let context = AgentRunContext.current
+        let unattended = context?.unattended ?? false
+        // 账号 / 接口：BotBus 这次另给了就用这次的，否则沿用会话起来时的（手机续聊、排队的轮次）。
+        let processEnvironment = context?.processEnvironment ?? existing?.processEnvironment ?? [:]
         let injection = await AgentToolsInjection.make(tools(), registry: registry, reusing: self.taskId(for: sessionID))
         let launched = try await run(arguments: Self.arguments(resuming: sessionID, injection: injection,
                                                                model: turn.model, effort: turn.effort,
                                                                bypassPermissions: Self.bypassesPermissions(unattended: unattended)),
                                      workingDirectory: workingDirectory, environment: injection?.environment ?? [:],
-                                     stdin: turn.input)
+                                     processEnvironment: processEnvironment, stdin: turn.input)
         let newID = launched.sessionID
         // 会话先改好再 await（绑 token）：这一轮的审批随时可能从 stdout 到（见 `handleControl`）。
         if newID != sessionID {
@@ -1310,6 +1326,8 @@ public actor ClaudeConnector: TaskConnector {
             branched.chosenModel = existing?.chosenModel
             branched.chosenEffort = existing?.chosenEffort
             branched.unattended = unattended
+            branched.processEnvironment = processEnvironment
+            branched.acceptsAnyModel = existing?.acceptsAnyModel ?? false
             sessions[newID] = branched
             // 旧会话被分支取代：从列表中移除，之后的桌面 hook 事件也不再接收。
             // 手机上只看到分支那一条，不会出现"一个会话变成两个"。
@@ -1317,6 +1335,7 @@ public actor ClaudeConnector: TaskConnector {
             superseded.insert(sessionID)
         } else {
             sessions[sessionID]?.unattended = unattended
+            sessions[sessionID]?.processEnvironment = processEnvironment
             // 这一轮的审批若已经早到（挂在新进程的 stdin 上），别被"开始跑了"盖掉。
             let earlyCard = sessions[sessionID]?.pendingRequest.flatMap { holds[$0.id] }
                 .map { hold in controls[sessionID].map(hold.isOn) ?? false } ?? false
@@ -1473,7 +1492,15 @@ public actor ClaudeConnector: TaskConnector {
     /// 手机这次选的与会话上已经记着的合起来，得出之后每轮的 `--model` / `--effort`。
     /// 模型不认识、强度不在该模型的档位里都直接报错；换到不能调强度的模型（Haiku）时强度清掉。
     static func resolve(_ selection: ModelSelection, current session: Session?,
-                        options: [ModelOption] = ClaudeModels.options) throws -> (model: String?, effort: String?) {
+                        options: [ModelOption] = ClaudeModels.options,
+                        acceptsAnyModel: Bool = false) throws -> (model: String?, effort: String?) {
+        if let model = selection.model, acceptsAnyModel {
+            // 自定义接口的模型：只查写法（会变成 `--model` 的值，不能以 `-` 开头），强度不对列表——接口不报档位。
+            guard ModelOption.isValidId(model) else { throw ConnectorError("模型的写法不对：\(model)") }
+            let effort = selection.effort ?? session?.chosenEffort
+            if let effort, !ModelOption.isValidEffort(effort) { throw ConnectorError("思考强度的写法不对：\(effort)") }
+            return (model, effort)
+        }
         if let model = selection.model, ClaudeModels.option(model, in: options) == nil {
             throw ConnectorError("Claude Code 没有「\(model)」这个模型")
         }
@@ -1601,7 +1628,8 @@ public actor ClaudeConnector: TaskConnector {
     /// 这一轮在后台开了子代理 / 命令时 `result` 先出来，它们与跑完后 claude 自己接着起的那一轮要审批时，
     /// stdin 已经关了，全报 "Stream closed"，无人值守的员工因此跑不了命令、改不了文件。
     private func run(arguments: [String], workingDirectory: String,
-                     environment extra: [String: String] = [:], stdin: Data) async throws -> Launch {
+                     environment extra: [String: String] = [:], processEnvironment: [String: String] = [:],
+                     stdin: Data) async throws -> Launch {
         guard let executable = binary() else {
             throw ConnectorError("本机没找到 claude 可执行文件", diagnosis: .agentNotInstalled)
         }
@@ -1612,7 +1640,8 @@ public actor ClaudeConnector: TaskConnector {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        process.environment = Self.environment(adding: Self.streamEnvironment.merging(extra) { _, injected in injected })
+        process.environment = AgentRunContext.applying(
+            processEnvironment, to: Self.environment(adding: Self.streamEnvironment.merging(extra) { _, injected in injected }))
         process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
         let output = Pipe()
         process.standardOutput = output

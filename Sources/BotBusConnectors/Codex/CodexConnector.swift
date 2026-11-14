@@ -596,7 +596,8 @@ public actor CodexConnector: TaskConnector {
                            selection: ModelSelection) async throws -> ConnectorOutcome {
         let injection = await AgentToolsInjection.make(tools(), registry: registry)
         let arguments = CodexExec.arguments(cwd: path, selection: selection, injection: injection, images: images)
-        let process = try launcher.launch(arguments: arguments, workingDirectory: path)
+        let process = try launcher.launch(arguments: arguments, workingDirectory: path,
+                                          processEnvironment: AgentRunContext.current?.processEnvironment ?? [:])
         do {
             try await process.writeStdin(Data(text.utf8))
         } catch {

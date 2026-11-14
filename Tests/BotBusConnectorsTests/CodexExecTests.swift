@@ -334,6 +334,23 @@ final class CodexExecTests: XCTestCase {
 
     // MARK: - 纯函数
 
+    /// 账号池：另一个 Codex 账号经 `CODEX_HOME` 交给 `codex exec`；空串的变量从继承的环境里去掉。
+    func testSubprocessLauncherAppliesProcessEnvironment() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-env-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let script = directory.appendingPathComponent("codex")
+        try "#!/bin/sh\nprintf '%s|%s' \"$CODEX_HOME\" \"${HOME-unset}\"\n".write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let launcher = CodexExecSubprocessLauncher(executablePath: script.path)
+        let process = try launcher.launch(arguments: [], workingDirectory: directory.path,
+                                          processEnvironment: ["CODEX_HOME": "/tmp/acct", "HOME": ""])
+        var output = Data()
+        while let chunk = try await process.readStdout() { output.append(chunk) }
+        _ = await process.waitForExit()
+        XCTAssertEqual(String(decoding: output, as: UTF8.self), "/tmp/acct|unset")
+    }
+
     func testEventParsing() {
         func parse(_ text: String) -> CodexExecEvent? { CodexExecEvent.parse(Data(text.utf8)) }
         XCTAssertEqual(parse(#"{"type":"thread.started","thread_id":"t-1"}"#), .threadStarted(threadId: "t-1"))

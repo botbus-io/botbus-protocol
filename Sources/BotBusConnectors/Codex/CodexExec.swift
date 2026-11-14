@@ -22,6 +22,17 @@ public protocol CodexExecProcess: CodexProcessHandle {
 /// 怎么起一次 `codex exec`。
 public protocol CodexExecLauncher: Sendable {
     func launch(arguments: [String], workingDirectory: String) throws -> any CodexExecProcess
+    /// 带这一轮的账号环境（`AgentRunContext.processEnvironment`，比如另一个账号的 `CODEX_HOME`；空串 = 去掉）起。
+    func launch(arguments: [String], workingDirectory: String,
+                processEnvironment: [String: String]) throws -> any CodexExecProcess
+}
+
+public extension CodexExecLauncher {
+    /// 不认账号环境的启动器（测试里的假的）：照旧起。
+    func launch(arguments: [String], workingDirectory: String,
+                processEnvironment: [String: String]) throws -> any CodexExecProcess {
+        try launch(arguments: arguments, workingDirectory: workingDirectory)
+    }
 }
 
 /// 生产用的启动器：本机的 codex 命令行（`CodexPaths.detectCodexBinary()`），**永远不经桌面桥接**。
@@ -43,8 +54,18 @@ public struct CodexExecSubprocessLauncher: CodexExecLauncher {
     }
 
     public func launch(arguments: [String], workingDirectory: String) throws -> any CodexExecProcess {
-        try CodexSubprocess(executablePath: executablePath, arguments: arguments, environment: environment,
-                            currentDirectory: URL(fileURLWithPath: workingDirectory), forwardStderr: false)
+        try launch(arguments: arguments, workingDirectory: workingDirectory, processEnvironment: [:])
+    }
+
+    public func launch(arguments: [String], workingDirectory: String,
+                       processEnvironment: [String: String]) throws -> any CodexExecProcess {
+        var resolved = environment
+        if !processEnvironment.isEmpty {
+            let base = environment ?? AgentToolsInjection.strippingInherited(ProcessInfo.processInfo.environment)
+            resolved = AgentRunContext.applying(processEnvironment, to: base)
+        }
+        return try CodexSubprocess(executablePath: executablePath, arguments: arguments, environment: resolved,
+                                   currentDirectory: URL(fileURLWithPath: workingDirectory), forwardStderr: false)
     }
 }
 
