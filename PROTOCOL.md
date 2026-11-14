@@ -252,7 +252,7 @@ Relay 仍看得见的元数据：pairId、各电脑的 agentId 与在线状态�
 | status | `ok` \| `degraded` \| `error` | |
 | taskCount | integer | ≥ 0 |
 | lastError | string? | 截断 200 字 |
-| models | [ModelOption]? | 3.2 起。手机续聊时能换的模型，电脑排好序（默认的在前），1–24 个、按 `id` 不重复；省略 = 不能从手机换模型，手机不画入口。Codex 取 app-server 的 `model/list`（去掉 hidden，每代子进程握手完问一次），Claude Code 报 `--model` 认的别名 `fable` / `opus` / `sonnet` / `haiku`，强度从本机 `claude --help` 读取（Haiku 不报强度；CLI 不可用或未列出强度时省略 models），`displayName` 带别名当前指向的版本（「Opus 5.5」：取 transcript 里见过的完整模型名，只往高处抬；没见过的只显示系列名）；其余 agent 省略 |
+| models | [ModelOption]? | 3.2 起。手机续聊时能换的模型，电脑排好序（默认的在前），1–24 个、按 `id` 不重复；省略 = 不能从手机换模型，手机不画入口。Codex 取 app-server 的 `model/list`（去掉 hidden，每代子进程握手完问一次），Claude Code 取 `claude` 自己报的那份（起一次不带 prompt 的 `claude -p`，控制协议 `initialize` 应答里的 `models`，即它 `/model` 选择器里的：别名 `opus` / `sonnet` / `haiku` / `fable` 与带版本的完整模型名如 `claude-fable-5`，同一系列的几个版本都能选，各带自己的强度档位；`default` 与 `id` 写不下的 `opus[1m]` 这类不报；启动时问一次，之后过期、换了 claude、选了列表里没有的模型时重问）。问不到时（老版本不报、没登录）退回 `--model` 认的别名 `fable` / `opus` / `sonnet` / `haiku`，强度从本机 `claude --help` 读取（Haiku 不报强度；CLI 不可用或未列出强度时省略 models），`displayName` 带别名当前指向的版本（「Opus 5.5」：取 transcript 里见过的完整模型名，只往高处抬；没见过的只显示系列名）；其余 agent 省略 |
 | canAutoApprove | boolean? | 3.3 起。**只写 `true`**：这个 agent 支持项目级自动批准（见「项目级自动批准」），不支持时整个键省略。目前 Codex 与 Claude Code 报；手机只对报了的 agent 画「审批」开关 |
 | canDeleteTasks | boolean? | 3.8 起。只有 `true` 才支持永久删除原生会话记录；省略或 `false` = 不支持。当前 Codex 与 Claude Code 报，旧原生程序不支持删除 API 时命令仍可回失败，手机保留会话并显示原因 |
 | canStartTask | boolean? | 2.13 起。**只写 `false`**：这个 agent 不能从手机新建任务（ACP agent 没有启动命令、反向连接也没声明 `newSession`；3.1 起一档的 `dsh` 在电脑上找不到可执行文件、只看得见会话时也写）；能新建时整个键省略（不写 `true`）。手机的新建任务选择器不列 `false` 的 agent |
@@ -306,7 +306,7 @@ HTTP 202 只表示 Relay 收到。手机等待 `CommandResult.ok == true` 才移
 | outsideProject | boolean? | 2.6 起。`true` = 这条会话不在任何项目里；在项目里时整个键省略（不写 `false`）。由 Agent 的 `TaskStore` 按本机规则判定：路径为空、`/`、`/tmp`（含 `/private/tmp`）、主目录本身、主目录下的 `Desktop` / `Downloads` / `Documents` 本身（子目录仍算项目），以及 Agent 的默认工作区（目前是 OpenClaw 的 workspace）。这些路径同时不进 `Snapshot.projects`。客户端把这类任务归进「不在项目中」，不要为它们的目录补出项目 |
 | worktreePath | string? | 2.7 起。会话真实的工作目录，只在它是某个仓库的 git worktree 时出现（此时 `projectPath` 是主仓库），否则整个键省略。由 Agent 的 `TaskStore` 解析，连接器与观察者不感知：`<仓库>/.claude/worktrees/<名字>`（Claude app）按路径归到 `<仓库>`；其余路径里有一层 `worktrees` 目录的，读 worktree 自己的 `.git` 文件（`gitdir: <仓库>/.git/worktrees/<名字>`）得出主仓库，认出的对应关系在 Agent 本机持久化；已删掉又没记过的，在见过的主仓库与项目里恰好只有一个同名目录时归过去（Codex 的 worktree 以仓库命名），同名的有多个时不猜；工作目录是 worktree 里的子目录时，归到主仓库里的同一个子目录（`<worktree>/web` → `<仓库>/web`，3.4 起；之前一律归到 `<仓库>`），和普通会话按工作目录分项目同一口径；submodule、bare 仓库和不在 `worktrees` 目录下的手动 worktree 原样当项目。`Snapshot.projects` 里同样换成主仓库并去重。续聊仍在这个目录里跑；目录已被删掉时 `followUp` 回 `ok: false`，不退回主仓库 |
 | connectorId | string? | 2.13 起。是哪个 ACP agent，值取自清单或注册表里的 id：`[a-z0-9-]`，1–32 字符，不含冒号。只在 `source = acp` 时出现，且必须出现；其余来源带上它即整条拒绝 |
-| model | string? | 3.2 起。这条会话下一轮会用的模型，写法同 `ModelOption.id`；电脑知道时才有。Codex 取线程上记的（`thread/start` / `thread/resume` 的应答，只读观察读 `threads.model`），Claude 取手机选过的，其次 transcript 里最后一条 assistant 消息的模型换成的别名（`claude-opus-5-5` → `opus`），认不出时省略 |
+| model | string? | 3.2 起。这条会话下一轮会用的模型，写法同 `ModelOption.id`；电脑知道时才有。Codex 取线程上记的（`thread/start` / `thread/resume` 的应答，只读观察读 `threads.model`），Claude 取手机选过的，其次 transcript 里最后一条 assistant 消息的模型对到 `models` 里指向它的那一项（`claude-opus-5-5` → `opus`，没有别名指着的 `claude-fable-5` → `claude-fable-5`；只有别名的那份列表按系列换成别名），列表里没有时省略 |
 | autoApprove | boolean? | 3.3 起。**只写 `true`**：这条会话的 `projectPath` 开了自动批准（同 `Project.autoApprove`，任务所在项目不在 `projects` 里时手机也看得到）；没开或 `outsideProject` 时整个键省略。由 Agent 的 `TaskStore` 附加，连接器与观察者不感知 |
 | effort | string? | 3.2 起。下一轮的思考强度，写法同 `ModelOption.efforts` 的值；省略 = 不知道或按模型默认（不是"不思考"）。Codex 取线程上的 `reasoningEffort`，Claude 只在手机选过时有 |
 
@@ -510,7 +510,7 @@ Agent 停下来等人（`waitingInput`）而电脑上正好有密码框聚焦时
 
 #### 状态与锁
 
-- **`GET /status`**：回 `{"sealed": …}`，AAD 仍是 `rc:<agentId>`（GET 没有请求体，回复钉不到请求上；旧 Mac 也有这个端点，手机靠它认出新功能）。明文是 `WorkspaceStatus`：`features`（`files` / `terminal` / `screen` / `pointer` 的子集，开集：不认得的值忽略；Mac 报 `["files", "terminal", "screen", "pointer"]`（没有嵌入 `botbus` 命令行的开发构建不报 `terminal`；`pointer` 见下），没有屏幕的宿主没有 `screen`（Linux 报 `["files", "terminal"]`；Windows 有 ConPTY——Windows 10 1809 起——时报 `["files", "terminal"]`，没有时只有 `files`）；3.6 的 Mac 没有这个键，按只有屏幕处理；1A 的 Mac 没有 `terminal`）、`armed`、`armedUntil`（解锁时是到期的毫秒时间戳，锁着时省略）、`home`（电脑上的主目录）、`platform`（`macos` / `linux` / `windows`），以及有屏幕服务时才有的屏幕字段（`accessibility`、`screenCapture`、`secureInput`、`streaming`、`frontmost`、`displays`，与 2.12 相同）。`POST /status` 回同样的内容，只是请求走下面的密封请求。
+- **`GET /status`**：回 `{"sealed": …}`，AAD 仍是 `rc:<agentId>`（GET 没有请求体，回复钉不到请求上；旧 Mac 也有这个端点，手机靠它认出新功能）。明文是 `WorkspaceStatus`：`features`（`files` / `terminal` / `screen` / `pointer` / `team` 的子集，开集：不认得的值忽略；`team` 见下「团队看板」；Mac 报 `["files", "terminal", "screen", "pointer"]`（没有嵌入 `botbus` 命令行的开发构建不报 `terminal`；`pointer` 见下），没有屏幕的宿主没有 `screen`（Linux 报 `["files", "terminal"]`；Windows 有 ConPTY——Windows 10 1809 起——时报 `["files", "terminal"]`，没有时只有 `files`）；3.6 的 Mac 没有这个键，按只有屏幕处理；1A 的 Mac 没有 `terminal`）、`armed`、`armedUntil`（解锁时是到期的毫秒时间戳，锁着时省略）、`home`（电脑上的主目录）、`platform`（`macos` / `linux` / `windows`），以及有屏幕服务时才有的屏幕字段（`accessibility`、`screenCapture`、`secureInput`、`streaming`、`frontmost`、`displays`，与 2.12 相同）。`POST /status` 回同样的内容，只是请求走下面的密封请求。
 - **锁**：屏幕的点击与键入、所有文件写操作（`/fs/write`、`/fs/mkdir`、`/fs/create`、`/fs/rename`、`/fs/trash`、`/fs/upload/*`）、终端的新开、关闭与输入共用一把。默认锁着；`/arm` 带 `on` 开关并回 `WorkspaceStatus`，请求体解不开按「锁上」处理并照常回状态：出了岔子时落在更安全的一边，手机从回复里看得到。解锁后闲置 10 分钟锁回，每次真实输入或写操作顺延 10 分钟。读（`/fs/list`、`/fs/read`、`/status`、屏幕画面、终端列表与输出）不受锁限制；写在锁着时回失败 `locked`。终端的尺寸锁着也收。
 
 #### 请求与防重放
@@ -664,6 +664,21 @@ Windows 电脑（`/status.platform` 是 `windows`）上的路径是 Windows 的�
 
 **寿命**：shell 退出、`/term/close`、`remoteControl {enabled: false}`、电脑上「全部结束」、BotBus 退出或解除配对时结束（退出时等会话里的进程清理完再走，最多约 2 秒）；没人连着也保留，连续 24 小时没人连着才回收——「有人连着」指连上之后至少发过一条解得开的消息（手机握手后先发的尺寸就算），只连上、什么都不发的连接不算；同时最多 8 个活着的。预览到期、被顶掉、菜单里停止分享都不结束终端。Mac 菜单「正在分享」里有一行「手机终端 · N 个会话」与「全部结束」，Linux 的 `botbus status` 与 `botbus terminals end`、Windows 托盘菜单同样看得见、能全部结束；日志只记会话的开关与数量。
 
+#### 团队看板（不改协议版本）
+
+电脑上的「项目看板 + AI 员工」经同一份工作区加密预览送到手机，**不改协议版本**，Relay 不变：电脑开着团队看板时 `/status.features` 多一个 `team`（开集，旧手机忽略），手机看它决定电脑页的「团队」能不能用；没报的电脑上手机提示升级电脑上的 BotBus。线上类型在 Protocol 包的 `Workspace.swift`（`WorkspacePath.teamPage` / `teamApi`、`WorkspaceFeature.team`、`WorkspaceRequest.TeamApi`、`WorkspaceTeamPage`、`WorkspaceTeamReply`），样本是 `protocol-fixtures/workspace/request-team-api.json`、`team-reply.json`。
+
+| 路径 | 明文请求 | 回复 |
+|---|---|---|
+| `/team/page` | — | `{html}`：团队看板的整页（样式、脚本、员工头像的 `data:` 地址都内嵌，不引用任何外部资源） |
+| `/team/api` | `method`, `url`（`/api/…`，可带查询串）, `body?`（请求体的 JSON 文本） | `{status, body}`：看板接口的 HTTP 状态与回复正文（JSON 文本） |
+
+- 与 `/fs/*` 一样只收带通道号 `c` 的 POST，回复钉在请求上；没插上团队看板（BotBus 正在启动或退出、旧电脑）时回不加密的 `501 unsupported`。
+- **不看输入锁**：看板上的操作（派活、发消息、改设置、唤醒员工）与手机发命令同级，不是在电脑上直接动文件或键鼠。
+- `/team/api` 走电脑本机网页（`127.0.0.1` 上的团队看板）同一套接口，只是不用本机网页的一次性登录码与会话令牌——能封出请求的只有配过对的手机；`/api/session` 回 404，`url` 不在 `/api/` 下回 400。`/api/changes?since=` 最多挂 20 秒（本机网页是 25 秒），给经 Relay 的往返留余量。
+- 手机把 `/team/page` 的 HTML 用 `loadHTMLString` / `loadDataWithBaseURL` 加载在一个解析不了的 origin（`https://team.botbus.invalid/`）上：页面自己不联网，接口经原生桥交给 app（iOS 的 `WKScriptMessageHandlerWithReply`「botbusTeamApi」、Android 的 `addJavascriptInterface`「BotBusTeamBridge」），由 app 封好发成 `/team/api`，回给页面 `{status, body}` 或 `{error}`。`K_rc` 不进网页；页面本身是密封回复，Relay 改不了。主框架只放行 app 发起的那一次加载，页面里的外部链接交给系统浏览器。
+- `GET` 按读的规矩重发，别的方法会改电脑上的东西，按写的规矩：结果不明（502 / 504 / 发出后的超时）不重发，交给页面刷新。
+
 ### 预览主机与隧道
 
 预览入口是 `https://p-<previewId>[<后缀>].<PREVIEW_DOMAIN>`（线上为 `p-<previewId>.botbus.io`，测试环境 `relay-test.botbus.io` 的后缀是 `-t`，即 `p-<previewId>-t.botbus.io`；只用一级通配子域，免费 Universal SSL 才覆盖得到）。后缀是 Relay 的部署配置（`PREVIEW_HOST_SUFFIX`），客户端不拼主机名，只用 `session` 返回的完整 URL。Worker 在所有路径路由之前按 `Host` 分流（主机名不区分大小写）：
@@ -808,6 +823,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 - 版本 3.8 加入 `deleteTask` / `removeProject` 命令、`ConnectorInfo.canDeleteTasks` / `AgentInfo.canRemoveProjects` 能力声明，以及两种手机列表视图和本地删除基线。新命令只发给声明支持的电脑；旧端忽略能力字段，Relay 继续只处理密封形状。当前版本升到 3.8，三条最低线不动。
 - 版本 3.9 加入**手机上的 Agent 管理**与**新建项目选位置**：`restartConnector` 命令与 `AgentInfo.canRestartConnectors`（手机的「停止 / 启动」沿用 2.x 起就有的 `setConnectorEnabled`）；`startTask.newProjectParent` 与 `AgentInfo.canChooseProjectParent`。都在密文里，新命令与新字段只发给声明支持的电脑，旧端忽略能力字段；Relay 只改版本号，三条最低线不动。
 - 终端（「操作电脑」第二期，2026-10）**不改版本号**：管理端点与 `/term/attach` 都在 3.7 的工作区加密预览里，Relay 不变；手机按 `/status.features` 里的 `terminal` 判断，旧手机不认它、照常只有文件与屏幕。
+- 团队看板（2026-11）**不改版本号**：`/team/page`、`/team/api` 在 3.7 的工作区加密预览里，`/status.features` 多一个 `team`（开集，旧手机忽略），Relay 不变；见「工作区（3.7）› 团队看板」。
 - 「操作电脑」第三期（不改版本号）：Linux / Windows 宿主也报 `AgentInfo.workspace`（文件与终端，没有屏幕；`capabilities` 不变）；工作区补上 Windows 的路径写法与「此电脑」（空串）、失败码 `noTrash`（开集，旧手机按 `failed`）、目录项的 `undecodable`（可选，旧手机忽略）。三条最低线与宿主的 `minClientProtocol` 都不动；3.7–3.8 的手机连 Windows 宿主时路径的面包屑与「上一级」不完整（见计划 `docs/superpowers/plans/2026-10-04-remote-workspace-3-hosts.md` 关键决定 1）。
 - 版本 3.10 让**推送按手机的语言显示**：`Notify` 加 `kind`（开集：`approval` / `input` / `secureInput` / `done` / `failed` / `systemPermission`）、`connectorName` 与 `hasScreenshot`，手机按种类用本机语言拼标题与固定说明，电脑照旧写中文的 `title` / `body` 给旧手机（见「七、通知」）。都在推送密文里，Relay 只改版本号，三条最低线不动；新电脑配旧手机、旧电脑配新手机都显示原来的中文。
 - 版本 3.11 让**审批摘要按手机的语言显示**：`PendingRequest` 加 `summaryPhrase` / `detailPhrases`、`Notify` 加 `bodyPhrase`（类型 `RequestPhrase`，`kind` 开集），连接器写的「执行命令：…」「工作目录：…」等由手机用本机语言重写，agent 的原话照旧（见「审批摘要的短语」）。电脑照旧写中文的 `summary` / `detail` / `body` 给旧手机；短语里不认得或缺参数的，手机整段退回中文原文。都在密文里，Relay 只改版本号，三条最低线不动。
@@ -935,5 +951,7 @@ Android 登记 Firebase Installation ID 后，Relay 用 FCM HTTP v1 发高优先
 `protocol-fixtures/workspace/` 是工作区（3.7）的样本，Relay 不读：明文的 `WorkspaceStatus`（`status-mac.json`、`status-linux.json`、3.6 Mac 的 `status-legacy.json`）、`WorkspaceListing`（`listing.json`）、失败外形（`failure-conflict.json`，以及带不认得的 code 的 `failure-unknown-code.json`）、请求明文（`request-write.json`），以及由 `node scripts/seal-fixtures.mjs` 生成的 `sealed.json`（固定钥匙与确定性 nonce 封的请求、钉在请求上的回复、3 个包的 `/fs/read` 流，不要手改）。Swift 的 `WorkspaceWireTests` 与 Android 的 `WorkspaceWireTest` 逐字节核对它们；手机端的 `WorkspaceSealerTests` / `WorkspaceSealerTest` 另用 `sealed.json` 核对手机自己封的请求。
 
 终端（第二期）：`workspace/term-list.json` → `TerminalList`；`workspace/request-term-create.json` → `/term/create` 的请求明文；`workspace/terminal.json`（`node scripts/seal-fixtures.mjs` 生成）→ 握手与两个方向的 7 条消息，Swift `WorkspaceWireTests` 与 Kotlin `WorkspaceWireTest` 逐字节核对。
+
+团队看板：`workspace/request-team-api.json` → `/team/api` 的请求明文，`workspace/team-reply.json` → `WorkspaceTeamReply`，手写，Swift 的 `WorkspaceWireTests` 与 Kotlin 的 `WorkspaceWireTest` 各自对账。
 
 第三期：`workspace/status-windows.json`（Windows 的 `/status`）、`listing-drives.json`（「此电脑」，路径是空串）、`listing-undecodable.json`（Linux 上不是 UTF-8 的名字）、`failure-no-trash.json`（`noTrash`），手写，Swift 的 `WorkspaceWireTests` 与 Kotlin 的 `WorkspaceWireTest` 各自对账；`plain/agent-info-windows-workspace.json`（没有屏幕与开发预览、有工作区的 Windows 宿主）三端往返。

@@ -145,6 +145,11 @@ public actor CommandDispatcher {
         connectors.removeValue(forKey: kind)
     }
 
+    /// 分发器里现在有没有这一类连接器。连接器在宿主启动后异步注册，团队调度据此判断能不能派活。
+    public func hasConnector(_ kind: ConnectorKind) -> Bool {
+        connectors[kind] != nil
+    }
+
     /// 注册（或替换）一个对话读取器。ACP 的 hub 在配对之后才建出来，不能只靠 init 里的那一批。
     public func register(reader: any MessageReader) {
         readers[reader.kind] = reader

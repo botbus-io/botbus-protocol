@@ -62,7 +62,8 @@ final class UnixSocketTests: XCTestCase {
         try server.start()
         defer { server.stop() }
 
-        for _ in 0..<20 {
+        // Windows 上一次 SD_BOTH 丢 EOF 的概率约 1%（#20），20 轮常常碰不到：多跑几轮。
+        for _ in 0..<200 {
             let text = Locked("")
             let client = try UnixSocketConnection.connect(path: directory + "/s.sock")
             client.start(onData: { data in text.withLock { $0 += String(decoding: data, as: UTF8.self) } }, onClose: {})
@@ -70,4 +71,32 @@ final class UnixSocketTests: XCTestCase {
             XCTAssertEqual(text.current, "bye\n")
         }
     }
+
+    #if os(Windows)
+    /// 本端 `close()` 时对端一直不说话：读线程必须自己醒来退出、把句柄关掉，不能靠对端先关。
+    /// Winsock 的 `shutdown` 不保证唤醒另一个线程上阻塞着的 `recv`（#20 压测里见过），句柄就一直关不掉。
+    func testLocalCloseEndsBlockedReaderWhilePeerStaysSilent() async throws {
+        let accepted = Locked<UnixSocketConnection?>(nil)
+        let server = UnixSocketServer(path: directory + "/s.sock") { connection in
+            connection.start(onData: { _ in }, onClose: {})
+            accepted.withLock { $0 = connection }
+        }
+        try server.start()
+        defer { server.stop() }
+
+        for _ in 0..<10 {
+            accepted.withLock { $0 = nil }
+            let client = try UnixSocketConnection.connect(path: directory + "/s.sock")
+            client.start(onData: { _ in }, onClose: {})
+            await assertEventually(timeout: 5) { accepted.current != nil }
+            guard let connection = accepted.current else { return }
+            // 让读线程先等在读上。
+            try await Task.sleep(nanoseconds: 50_000_000)
+            connection.close()
+            await assertEventually(timeout: 5) { connection.isHandleClosed }
+            await assertEventually(timeout: 5) { client.isClosed }
+            client.close()
+        }
+    }
+    #endif
 }

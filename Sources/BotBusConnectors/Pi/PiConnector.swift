@@ -421,7 +421,7 @@ final class PiSubprocess: PiProcessHandle, @unchecked Sendable {
             finished.terminationHandler = nil
         }
         do {
-            try process.run()
+            try PlatformProcess.run(process)
         } catch {
             output.fileHandleForReading.finishPortableReading()
             try? output.fileHandleForWriting.close()

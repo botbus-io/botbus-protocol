@@ -149,4 +149,222 @@ final class ClaudeModelsTests: XCTestCase {
         _ = ClaudeConnector(store: store, binary: { nil })
         XCTAssertNil(store.connectors.models(for: .claude))
     }
+
+    // MARK: - claude 自己报的列表
+
+    /// `initialize` 应答里的 `models`，照 2.1.318 的真实形状删短了：`default`、别名、带版本的、不能调强度的，
+    /// 外加协议写不下的 `opus[1m]` 与一条重复的。
+    private static let initializeAnswer: String = {
+        let efforts = #""supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"]"#
+        let models = [
+            #"{"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)",\#(efforts)}"#,
+            #"{"value":"opus","resolvedModel":"claude-opus-5-5","displayName":"Opus 5.5",\#(efforts)}"#,
+            #"{"value":"claude-fable-5-2","resolvedModel":"claude-fable-5-2","displayName":"Fable 5.2",\#(efforts)}"#,
+            #"{"value":"fable","resolvedModel":"claude-fable-5-1","displayName":"Fable 5.1",\#(efforts)}"#,
+            #"{"value":"opus[1m]","resolvedModel":"claude-opus-5-5[1m]","displayName":"Opus 5.5 (1M context)",\#(efforts)}"#,
+            #"{"value":"claude-haiku-4-5-20251001","resolvedModel":"claude-haiku-4-5-20251001","displayName":"Haiku 4.5","supportsThinkingOff":true}"#,
+            #"{"value":"claude-fable-5","resolvedModel":"claude-fable-5","displayName":"Fable 5","supportsEffort":true,"supportedEffortLevels":["low","medium","high","max"]}"#,
+            #"{"value":"opus","resolvedModel":"claude-opus-5-5","displayName":"Opus 5.5 again"}"#,
+        ].joined(separator: ",")
+        return #"{"type":"control_response","response":{"subtype":"success","request_id":"botbus-models","response":{"commands":[],"models":[\#(models)],"pid":1}}}"#
+    }()
+
+    private static var listedModels: [ClaudeListedModel] {
+        ClaudeModels.initializeModels(inLine: Data(initializeAnswer.utf8)) ?? []
+    }
+
+    func testListedModelsComeFromTheInitializeAnswer() throws {
+        let listed = try XCTUnwrap(ClaudeModels.initializeModels(inLine: Data(Self.initializeAnswer.utf8)))
+        XCTAssertEqual(listed.map(\.option.id),
+                       ["opus", "claude-fable-5-2", "fable", "claude-haiku-4-5-20251001", "claude-fable-5"],
+                       "default 不收，方括号的 id 协议写不下，重复的只留第一个")
+        XCTAssertEqual(listed.map(\.option.displayName), ["Opus 5.5", "Fable 5.2", "Fable 5.1", "Haiku 4.5", "Fable 5"])
+        XCTAssertEqual(listed[0].option.efforts, ["low", "medium", "high", "xhigh", "max"])
+        XCTAssertNil(listed[3].option.efforts, "没说 supportsEffort 的不能调强度")
+        XCTAssertEqual(listed[4].option.efforts, ["low", "medium", "high", "max"], "各模型的档位各算各的")
+        XCTAssertEqual(listed[2].resolved, "claude-fable-5-1", "别名现在指向哪个模型")
+        // 报出去之前还要过注册表的清洗：这份列表本身就是干净的。
+        XCTAssertEqual(ConnectorRegistry.sanitized(listed.map(\.option)), listed.map(\.option))
+
+        // 别的行不是应答；老版本的应答里没有 models，是空的（不用再等）。
+        XCTAssertNil(ClaudeModels.initializeModels(inLine: Data(#"{"type":"system","subtype":"hook_started"}"#.utf8)))
+        XCTAssertNil(ClaudeModels.initializeModels(inLine: Data(
+            #"{"type":"control_response","response":{"subtype":"success","request_id":"other","response":{"models":[]}}}"#.utf8)))
+        XCTAssertEqual(ClaudeModels.initializeModels(inLine: Data(
+            #"{"type":"control_response","response":{"subtype":"success","request_id":"botbus-models","response":{"commands":[]}}}"#.utf8)), [])
+        XCTAssertNil(ClaudeModels.initializeModels(inLine: Data("not json".utf8)))
+    }
+
+    func testTranscriptModelsMapToListedOptions() {
+        let listed = Self.listedModels
+        XCTAssertEqual(ClaudeModels.optionId(forTranscriptModel: "claude-opus-5-5", in: listed), "opus", "别名指着它")
+        XCTAssertEqual(ClaudeModels.optionId(forTranscriptModel: "claude-opus-5-5[1m]", in: listed), "opus")
+        XCTAssertEqual(ClaudeModels.optionId(forTranscriptModel: "claude-fable-5-1", in: listed), "fable")
+        XCTAssertEqual(ClaudeModels.optionId(forTranscriptModel: "claude-fable-5-2", in: listed), "claude-fable-5-2")
+        XCTAssertEqual(ClaudeModels.optionId(forTranscriptModel: "claude-fable-5", in: listed), "claude-fable-5")
+        XCTAssertNil(ClaudeModels.optionId(forTranscriptModel: "claude-opus-4-1", in: listed), "列表里没有的不硬说成 Opus")
+        XCTAssertNil(ClaudeModels.optionId(forTranscriptModel: "<synthetic>", in: listed))
+    }
+
+    /// 假的 `claude`：记下参数、设置文件与 stdin 的第一行，先吐一行 hook 事件再答 `initialize`，然后等 stdin 关。
+    private func fakeClaudeAnsweringInitialize(_ body: String? = nil) throws -> URL {
+        try skipPOSIXScriptOnWindows()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("claude-list-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let binary = directory.appendingPathComponent("claude")
+        try Self.initializeAnswer.write(to: directory.appendingPathComponent("answer"), atomically: true, encoding: .utf8)
+        let script = body ?? """
+        #!/bin/sh
+        here=$(dirname "$0")
+        printf '%s\\n' "$@" > "$here/args"
+        while [ $# -gt 0 ]; do
+          if [ "$1" = "--settings" ]; then cat "$2" > "$here/settings"; fi
+          shift
+        done
+        IFS= read -r line
+        printf '%s\\n' "$line" > "$here/stdin"
+        printf '%s\\n' '{"type":"system","subtype":"hook_started"}'
+        cat "$here/answer"
+        printf '\\n'
+        cat > /dev/null
+        """
+        try script.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: binary.path)
+        return binary
+    }
+
+    func testListAsksTheCLIWithHooksDisabled() async throws {
+        let binary = try fakeClaudeAnsweringInitialize()
+        let directory = binary.deletingLastPathComponent()
+        let listed = await ClaudeModels.list(binary: binary.path, timeout: 10)
+        XCTAssertEqual(listed?.map(\.option.id),
+                       ["opus", "claude-fable-5-2", "fable", "claude-haiku-4-5-20251001", "claude-fable-5"])
+
+        let arguments = try String(contentsOf: directory.appendingPathComponent("args"), encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        XCTAssertEqual(Array(arguments.prefix(7)),
+                       ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--settings"])
+        XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent("settings"), encoding: .utf8),
+                       #"{"disableAllHooks":true}"#, "探测不该触发用户的 SessionStart / SessionEnd hook")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(arguments.last)), "临时设置文件用完就删")
+        let request = try String(contentsOf: directory.appendingPathComponent("stdin"), encoding: .utf8)
+        XCTAssertTrue(request.contains(#""subtype":"initialize""#) && request.contains(#""request_id":"botbus-models""#))
+    }
+
+    func testListGivesUpWhenTheCLIDoesNotAnswer() async throws {
+        // 没答就退出（没登录、不认这些参数）。
+        let quitter = try fakeClaudeAnsweringInitialize("#!/bin/sh\nexit 1\n")
+        let none = await ClaudeModels.list(binary: quitter.path, timeout: 10)
+        XCTAssertNil(none)
+        // 一直不答：到点放弃，进程被终止。
+        let silent = try fakeClaudeAnsweringInitialize("#!/bin/sh\nexec sleep 30\n")
+        let started = ContinuousClock.now
+        let timedOut = await ClaudeModels.list(binary: silent.path, timeout: 0.3)
+        XCTAssertNil(timedOut)
+        XCTAssertLessThan((started.duration(to: .now) / .seconds(1)), 10)
+        // 连 SIGTERM 都不理：`list` 等它退出才返回，所以到点得强制结束它。
+        let stubborn = try fakeClaudeAnsweringInitialize("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 0.1; done\n")
+        let stubbornStarted = ContinuousClock.now
+        let killed = await ClaudeModels.list(binary: stubborn.path, timeout: 0.3, exitGrace: 0.3)
+        XCTAssertNil(killed)
+        XCTAssertLessThan((stubbornStarted.duration(to: .now) / .seconds(1)), 10)
+        // 起不来。
+        let missing = await ClaudeModels.list(binary: "/nonexistent/claude", timeout: 1)
+        XCTAssertNil(missing)
+    }
+
+    private func helpOnlyClaude() throws -> String {
+        try skipPOSIXScriptOnWindows()
+        let binary = FileManager.default.temporaryDirectory.appendingPathComponent("claude-help-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: binary) }
+        try "#!/bin/sh\nprintf '%s\\n' '  --effort <level>  Effort level (low, medium, high, xhigh, max)'\n"
+            .write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: binary.path)
+        return binary.path
+    }
+
+    private func startError(_ connector: ClaudeConnector, _ selection: ModelSelection) async -> String {
+        do {
+            // 项目目录不存在：过了模型校验也起不来，报的是目录的错。
+            _ = try await connector.start(projectPath: "/nonexistent/botbus-\(UUID().uuidString)", prompt: "hi", images: [],
+                                          selection: selection)
+            return ""
+        } catch {
+            return (error as? ConnectorError)?.message ?? String(describing: error)
+        }
+    }
+
+    /// 问到列表之后：报给手机的换成 claude 自己那份，会话上显示的模型按 transcript 里的完整名字重新对一遍，
+    /// 带版本的模型（Fable 5）能选，强度按各模型自己的档位校验。
+    func testConnectorReportsListedModelsAndRemapsSessions() async throws {
+        let binary = try helpOnlyClaude()
+        let store = TaskStore(identity: AgentIdentity(agentId: "agent-1", name: "本机", appVersion: "1.0"))
+        let listed = Self.listedModels
+        let connector = ClaudeConnector(store: store, paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                        binary: { binary }, modelLister: { _ in listed })
+        XCTAssertEqual(store.connectors.models(for: .claude)?.map(\.id), ["fable", "opus", "sonnet", "haiku"], "还没问：写死的别名")
+
+        let transcript = FileManager.default.temporaryDirectory.appendingPathComponent("claude-models-\(UUID().uuidString).jsonl")
+        addTeardownBlock { try? FileManager.default.removeItem(at: transcript) }
+        try #"{"type":"assistant","message":{"model":"claude-fable-5","content":[{"type":"text","text":"好"}]}}"#
+            .write(to: transcript, atomically: true, encoding: .utf8)
+        let hook: [String: Any] = ["hook_event_name": "Stop", "session_id": "s1", "cwd": "/p", "transcript_path": transcript.path]
+        _ = await connector.handleHook(LocalHookServer.Request(method: "POST", target: "/hooks/claude", path: "/hooks/claude",
+                                                               headers: ["content-type": "application/json"],
+                                                               body: try JSONSerialization.data(withJSONObject: hook)))
+        let before = await store.task(id: "claude:s1")
+        XCTAssertEqual(before?.model, "fable", "只有别名时，Fable 5 只能说成 fable")
+
+        await connector.refreshModels()
+        XCTAssertEqual(store.connectors.models(for: .claude), listed.map(\.option))
+        let after = await store.task(id: "claude:s1")
+        XCTAssertEqual(after?.model, "claude-fable-5", "列表换了，会话上的模型跟着换成带版本的那一项")
+
+        let accepted = await startError(connector, ModelSelection(model: "claude-fable-5", effort: "max"))
+        XCTAssertFalse(accepted.contains("这个模型") || accepted.contains("思考强度"), "过了模型校验：\(accepted)")
+        let wrongEffort = await startError(connector, ModelSelection(model: "claude-fable-5", effort: "xhigh"))
+        XCTAssertTrue(wrongEffort.contains("没有「xhigh」这档思考强度"), wrongEffort)
+        let fixedEffort = await startError(connector, ModelSelection(model: "claude-haiku-4-5-20251001", effort: "high"))
+        XCTAssertTrue(fixedEffort.contains("不能调思考强度"), fixedEffort)
+    }
+
+    /// 选的模型不在手头的列表里：刚问过就直接拒，过了一会儿再来就现问一次；列表过期了在后台重问。
+    func testUnknownModelTriggersAFreshListing() async throws {
+        let binary = try helpOnlyClaude()
+        let store = TaskStore(identity: AgentIdentity(agentId: "agent-1", name: "本机", appVersion: "1.0"))
+        let clock = Locked(Date(timeIntervalSince1970: 1_800_000_000))
+        let answers = Locked<[ClaudeListedModel]?>(Array(Self.listedModels.prefix(1)))
+        let asked = Locked(0)
+        let connector = ClaudeConnector(store: store, paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                        binary: { binary }, now: { clock.current },
+                                        modelLister: { _ in
+                                            asked.withLock { $0 += 1 }
+                                            return answers.current
+                                        })
+        await connector.refreshModels()
+        XCTAssertEqual(store.connectors.models(for: .claude)?.map(\.id), ["opus"])
+        XCTAssertEqual(asked.current, 1)
+
+        let rejected = await startError(connector, ModelSelection(model: "claude-fable-5"))
+        XCTAssertTrue(rejected.contains("没有「claude-fable-5」这个模型"), rejected)
+        XCTAssertEqual(asked.current, 1, "刚问过，不为同一个答案再等一次")
+
+        // Claude Code 新上了模型：过一会儿再选，现问一次就认得了。
+        answers.withLock { $0 = Self.listedModels }
+        clock.withLock { $0 += ClaudeConnector.modelListRetryInterval + 1 }
+        let accepted = await startError(connector, ModelSelection(model: "claude-fable-5"))
+        XCTAssertFalse(accepted.contains("这个模型"), accepted)
+        XCTAssertEqual(asked.current, 2)
+        XCTAssertEqual(store.connectors.models(for: .claude)?.count, Self.listedModels.count)
+
+        // 这次没问到（超时）：之前问到的留着。
+        answers.withLock { $0 = nil }
+        clock.withLock { $0 += ClaudeConnector.modelListTTL + 1 }
+        _ = await startError(connector, ModelSelection(model: "opus"))
+        let reasked = await eventually { asked.current == 3 }
+        XCTAssertTrue(reasked, "列表过期了，在后台重问")
+        await connector.refreshModels()
+        XCTAssertEqual(store.connectors.models(for: .claude)?.count, Self.listedModels.count)
+    }
 }

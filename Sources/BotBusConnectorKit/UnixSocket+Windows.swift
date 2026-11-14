@@ -201,6 +201,9 @@ public final class UnixSocketConnection: @unchecked Sendable {
 
     public var isClosed: Bool { lock.withLock { closed } }
 
+    /// 句柄已 `closesocket`（读线程已退出、写队列已排空）。测试用。
+    var isHandleClosed: Bool { lock.withLock { handleClosed } }
+
     public func start(onData: @escaping @Sendable (Data) -> Void, onClose: @escaping @Sendable () -> Void) {
         let closedAlready: Bool = lock.withLock {
             guard !started else { return false }
@@ -249,7 +252,11 @@ public final class UnixSocketConnection: @unchecked Sendable {
             return (onClose, started)
         }
         guard let taken else { return }
-        shutdown(descriptor, SD_BOTH)
+        // 先单独 SD_SEND（对端读完排队的数据后收到 EOF），再 SD_RECEIVE。不用 SD_BOTH：Windows 的 AF_UNIX 在
+        // 本端读线程还没进第一次 recv 时一次 SD_BOTH，约 1% 的连接对端永远收不到 EOF（之后 closesocket 也补不回来），
+        // 本端随后的 recv 也不返回（#20 在 CI 上 300 次压测复现 2 次，分两次调用 0 次）。
+        shutdown(descriptor, SD_SEND)
+        shutdown(descriptor, SD_RECEIVE)
         // 读线程在跑的话由它退出时关句柄；从没 start 过就在这里（写队列排空后）关。
         if !taken.reading { writeQueue.async { self.closeHandle() } }
         taken.onClose?()
@@ -267,6 +274,9 @@ public final class UnixSocketConnection: @unchecked Sendable {
     private func readLoop(_ onData: @Sendable (Data) -> Void) {
         var buffer = [UInt8](repeating: 0, count: Self.readChunk)
         while true {
+            // 不直接阻塞在 recv 上：Winsock 的 shutdown 不保证唤醒别的线程上卡着的 recv，本端 close 之后
+            // 读线程得自己发现、退出并关句柄。等到可读（含 EOF / 出错）才 recv。
+            guard waitReadable() else { break }
             let count = buffer.withUnsafeMutableBytes {
                 recv(descriptor, $0.baseAddress!.assumingMemoryBound(to: CChar.self), Int32($0.count), 0)
             }
@@ -275,6 +285,18 @@ public final class UnixSocketConnection: @unchecked Sendable {
         }
         close()
         writeQueue.async { self.closeHandle() }
+    }
+
+    static let readPollInterval: Int32 = 200
+
+    /// 等到可读（数据、EOF、出错都算）返回 true；本端已经 close 返回 false。
+    private func waitReadable() -> Bool {
+        while !isClosed {
+            var entry = WSAPOLLFD(fd: descriptor, events: Int16(POLLRDNORM), revents: 0)
+            let ready = WSAPoll(&entry, 1, Self.readPollInterval)
+            if ready != 0 { return true }
+        }
+        return false
     }
 }
 #endif

@@ -19,6 +19,10 @@ public enum WorkspacePath {
     public static let fsUploadBegin = "/fs/upload/begin"
     public static let fsUploadChunk = "/fs/upload/chunk"
     public static let fsUploadCommit = "/fs/upload/commit"
+    /// 团队看板（电脑报了 `team` 才有，不改协议版本）：页面本身。
+    public static let teamPage = "/team/page"
+    /// 团队看板：转一个看板接口请求（`WorkspaceRequest.TeamApi` → `WorkspaceTeamReply`）。
+    public static let teamApi = "/team/api"
 }
 
 /// `WorkspaceStatus.features` 里的值。开集：不认得的值忽略。
@@ -29,6 +33,8 @@ public enum WorkspaceFeature {
     /// 屏幕服务认 `/move`（只挪指针）与 `/click` 的 `button: "right"`：手机单指按住移动就是挪鼠标。
     /// 没报的旧 Mac 上单指划动照旧是滚动。
     public static let pointer = "pointer"
+    /// 电脑上开着项目看板 + AI 员工：`/team/page`、`/team/api` 可用，手机在「操作电脑」里画「团队」段。
+    public static let team = "team"
 }
 
 public enum WorkspaceLimits {
@@ -257,6 +263,19 @@ public enum WorkspaceReply {
 
 /// 各端点的请求体（明文里还会并上 `p`、`t`、`c`）。
 public enum WorkspaceRequest {
+    /// `/team/api`：看板网页的一个接口请求原样转过来。`url` 是 `/api/…`（可带查询串），`body` 是请求体的 JSON 文本
+    ///（没有请求体时省略）。电脑按本机网页同一套路由处理，只是不用本机网页的登录令牌——能封出这条请求就说明是配过对的手机。
+    public struct TeamApi: Codable, Hashable, Sendable {
+        public var method: String
+        public var url: String
+        public var body: String?
+        public init(method: String, url: String, body: String? = nil) {
+            self.method = method
+            self.url = url
+            self.body = body
+        }
+    }
+
     public struct List: Codable, Hashable, Sendable {
         public var path: String
         public var hidden: Bool?
@@ -324,6 +343,23 @@ public enum WorkspaceRequest {
     public struct Arm: Codable, Hashable, Sendable {
         public var on: Bool
         public init(on: Bool) { self.on = on }
+    }
+}
+
+/// `/team/page` 的回复：团队看板的整页 HTML（样式、脚本、员工头像都内嵌）。手机用 `loadHTMLString` 加载它，
+/// 页面自己不联网，接口经 app 原生转成 `/team/api`。页面走的是密封回复，Relay 改不了它。
+public struct WorkspaceTeamPage: Codable, Hashable, Sendable {
+    public var html: String
+    public init(html: String) { self.html = html }
+}
+
+/// `/team/api` 的回复：看板接口的 HTTP 状态与回复正文（JSON 文本）。
+public struct WorkspaceTeamReply: Codable, Hashable, Sendable {
+    public var status: Int
+    public var body: String
+    public init(status: Int, body: String) {
+        self.status = status
+        self.body = body
     }
 }
 

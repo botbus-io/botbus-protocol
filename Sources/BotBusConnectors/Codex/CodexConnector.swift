@@ -111,6 +111,9 @@ public actor CodexConnector: TaskConnector {
         /// 协议 3.3：共用桌面时，当前这一轮是不是手机起的（本连接器发了 `turn/start` / `turn/steer`，
         /// 到 `turn/completed` 为止）。只有这样的轮次里的审批才按项目的自动批准放行；不进 `TaskRecord`。
         var phoneTurn = false
+        /// 当前这一轮是宿主自己派的无人值守轮次（`AgentRunContext.unattended`）：审批直接放行，不看项目开关。
+        /// 与 `phoneTurn` 同进同退（`turn/completed`、进程退出时清掉）。
+        var unattended = false
     }
 
     /// 子进程现在什么情况。菜单栏要能看出 `codex app-server` 是活着、正在起、还是死了等着重启——
@@ -197,6 +200,19 @@ public actor CodexConnector: TaskConnector {
     private var eventLoop: Task<Void, Never>?
     private var activeCommands = 0
     private var handoffRequested = false
+    /// 宿主派的无人值守新任务用的 `codex exec` 启动器（见 `CodexExec.swift`）；每次现取，nil = 照旧走 app-server。
+    private let execLauncher: @Sendable () -> (any CodexExecLauncher)?
+    /// 正在跑的 `codex exec`，按线程 id。线程同时也在 `threads` 里（owned），由 `followExec` 收尾。
+    private var execRuns: [String: ExecRun] = [:]
+
+    private struct ExecRun {
+        let process: any CodexExecProcess
+        /// 老板 / 手机点了停止（或连接器要停了）：进程退出时记 interrupted 而不是 failed。
+        var interrupted = false
+    }
+
+    /// 发 SIGINT 之后等这么久还没退出就直接结束进程。
+    static let execInterruptGrace: TimeInterval = 5
 
     /// Stop accepting new commands once all in-flight commands have completed.
     public func prepareForDesktopHandoff() -> Bool {
@@ -218,13 +234,15 @@ public actor CodexConnector: TaskConnector {
     /// - Parameters:
     ///   - tools: 每次 `thread/start` / `thread/resume` 前现取；nil 或不可用 = 不注入 agent 工具。
     ///   - registry: 签发与绑定 task token；app 里与本机工具服务器共用同一个实例。
+    ///   - execLauncher: 宿主派的无人值守新任务改用 `codex exec`（不进 Codex 桌面）；返回 nil 时照旧走 app-server。
     public init(server: CodexAppServer, store: TaskStore,
                 now: @escaping @Sendable () -> Date = { Date() },
                 statusObserver: @escaping @Sendable (Status) -> Void = { _ in },
                 tools: @escaping @Sendable () -> AgentToolsConfiguration? = { nil },
                 registry: TaskContextRegistry = TaskContextRegistry(),
                 sharedDesktop: Bool = false,
-                streamInterval: TimeInterval = CodexConnector.defaultStreamInterval) {
+                streamInterval: TimeInterval = CodexConnector.defaultStreamInterval,
+                execLauncher: @escaping @Sendable () -> (any CodexExecLauncher)? = { nil }) {
         self.server = server
         self.store = store
         self.now = now
@@ -233,6 +251,7 @@ public actor CodexConnector: TaskConnector {
         self.registry = registry
         self.sharedDesktop = sharedDesktop
         self.streamInterval = streamInterval
+        self.execLauncher = execLauncher
     }
 
     // MARK: - 生命周期
@@ -258,6 +277,12 @@ public actor CodexConnector: TaskConnector {
     public func stop() async {
         eventLoop?.cancel()
         eventLoop = nil
+        // `codex exec` 不随 app-server 停：自己结束它们，记成中断再交还（跟随任务随后看到 stdout 关了，账本已清空，不再动）。
+        for (threadId, run) in execRuns {
+            run.process.terminate()
+            mutate(threadId) { $0.status = .interrupted }
+        }
+        execRuns.removeAll()
         await server.stop()
         for threadId in order {
             // 不动 markControlled：那是"重启后要不要 resume"的账，跟停机无关。
@@ -312,6 +337,11 @@ public actor CodexConnector: TaskConnector {
         // 在 `thread/start` 之前就查：选错了不该先建出一条空线程。
         try validate(selection, threadId: nil)
 
+        // 宿主派的无人值守轮次（团队员工）走 `codex exec`：命令行版本，会话不进 Codex 桌面（见 `CodexExec.swift`）。
+        if !text.isEmpty, AgentRunContext.current?.unattended == true, let launcher = execLauncher() {
+            return try await startExec(launcher: launcher, path: path, text: text, images: images, selection: selection)
+        }
+
         let injection = await AgentToolsInjection.make(tools(), registry: registry)
         let response = try await server.request("thread/start",
                                                 params: Self.threadStartParams(cwd: path, injection: injection))
@@ -336,7 +366,11 @@ public actor CodexConnector: TaskConnector {
         await publish(threadId)
 
         // 先记下再发：这一轮的第一条审批可能比 `turn/start` 的应答先到。
-        mutate(threadId) { $0.phoneTurn = true }
+        let unattended = AgentRunContext.current?.unattended ?? false
+        mutate(threadId) {
+            $0.phoneTurn = true
+            $0.unattended = unattended
+        }
         do {
             _ = try await server.request("turn/start",
                                          params: Self.turnStartParams(threadId: threadId, text: text, images: images,
@@ -346,7 +380,10 @@ public actor CodexConnector: TaskConnector {
                 if let effort = selection.effort { $0.effort = effort }
             }
         } catch {
-            mutate(threadId) { $0.phoneTurn = false }
+            mutate(threadId) {
+                $0.phoneTurn = false
+                $0.unattended = false
+            }
             // 轮次没起来就别霸着所有权，让只读观察接手这条线程。
             await release(threadId)
             throw error
@@ -372,6 +409,8 @@ public actor CodexConnector: TaskConnector {
         let threadId = try Self.nativeId(taskId)
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !images.isEmpty else { throw ConnectorError("followUp 的 prompt 是空的") }
+        // `codex exec` 这一轮插不进话：等它跑完，再经 app-server `thread/resume` 接着聊。
+        guard execRuns[threadId] == nil else { throw ConnectorError("这一轮还在电脑上的 Codex 命令行里跑，结束后再续聊") }
         try validate(selection, threadId: threadId)
 
         if let question = await pendingUserInput(threadId: threadId) {
@@ -418,7 +457,12 @@ public actor CodexConnector: TaskConnector {
         // 协议 3.3：从这里到 `turn/completed` 都算手机的轮次（插进桌面那一轮时，剩下的部分也算）。先记下再发，
         // 这一轮的第一条审批可能比应答先到；没发出去就撤回。
         let wasPhoneTurn = threads[threadId]?.phoneTurn ?? false
-        mutate(threadId) { $0.phoneTurn = true }
+        let wasUnattended = threads[threadId]?.unattended ?? false
+        let unattended = AgentRunContext.current?.unattended ?? false
+        mutate(threadId) {
+            $0.phoneTurn = true
+            $0.unattended = unattended
+        }
         do {
             if sharedDesktop, let activeTurn = threads[threadId]?.currentTurnId {
                 let input = params["input"] ?? .array([])
@@ -433,7 +477,10 @@ public actor CodexConnector: TaskConnector {
                 }
             }
         } catch {
-            mutate(threadId) { $0.phoneTurn = wasPhoneTurn }
+            mutate(threadId) {
+                $0.phoneTurn = wasPhoneTurn
+                $0.unattended = wasUnattended
+            }
             throw error
         }
         mutate(threadId) { $0.status = .running }
@@ -491,9 +538,14 @@ public actor CodexConnector: TaskConnector {
     /// `turn/interrupt {threadId, turnId}`。轮次 id 来自最近一条 `turn/started`——
     /// 协议要求必填，不知道就明确失败，而不是发一条注定被 app-server 拒掉的请求。
     public func interrupt(taskId: String) async throws -> ConnectorOutcome {
+        let threadId = try Self.nativeId(taskId)
+        // `codex exec` 的一轮：发 SIGINT，进程退出时由 `followExec` 记 interrupted 并交还。桌面接管中也照停。
+        if execRuns[threadId] != nil {
+            interruptExec(threadId)
+            return ConnectorOutcome(taskId: Self.protocolId(threadId), retainsLiveOwnership: true)
+        }
         try enterCommand()
         defer { activeCommands -= 1 }
-        let threadId = try Self.nativeId(taskId)
         guard let turnId = threads[threadId]?.currentTurnId, !turnId.isEmpty else {
             throw ConnectorError("Codex 线程 \(threadId) 上没有本机在驱动的轮次，无法中断")
         }
@@ -508,7 +560,7 @@ public actor CodexConnector: TaskConnector {
         let threadId = try Self.nativeId(taskId)
         try enterCommand()
         defer { activeCommands -= 1 }
-        if let thread = threads[threadId], thread.currentTurnId != nil {
+        if let thread = threads[threadId], thread.currentTurnId != nil || execRuns[threadId] != nil {
             throw ConnectorError("会话还在进行中，等它停下来再删除")
         }
         // 使用上游的删除事务，绝不写 Codex 数据库。老版本不支持时原样回失败。
@@ -521,6 +573,7 @@ public actor CodexConnector: TaskConnector {
     /// 尽力而为：桌面正在接管、app-server 不认这个方法都只记日志，会话早已由 `TaskStore.hide` 藏起来。
     public func discard(taskId: String) async {
         guard let threadId = try? Self.nativeId(taskId) else { return }
+        if execRuns[threadId] != nil { interruptExec(threadId) }
         do {
             try enterCommand()
         } catch {
@@ -534,6 +587,128 @@ public actor CodexConnector: TaskConnector {
             Self.log.error("thread/archive 失败：\(String(describing: error), privacy: .public)")
         }
     }
+
+    // MARK: - codex exec（宿主派的无人值守轮次）
+
+    /// 起 `codex exec --json`，等到 `thread.started` 拿到线程 id 就登记成本连接器实时驱动的任务并返回；
+    /// 之后的事件由 `followExec` 跟到进程退出。`thread.started` 之前就退出了 = 没起来，抛错。
+    private func startExec(launcher: any CodexExecLauncher, path: String, text: String, images: [URL],
+                           selection: ModelSelection) async throws -> ConnectorOutcome {
+        let injection = await AgentToolsInjection.make(tools(), registry: registry)
+        let arguments = CodexExec.arguments(cwd: path, selection: selection, injection: injection, images: images)
+        let process = try launcher.launch(arguments: arguments, workingDirectory: path,
+                                          processEnvironment: AgentRunContext.current?.processEnvironment ?? [:])
+        do {
+            try await process.writeStdin(Data(text.utf8))
+        } catch {
+            process.terminate()
+            throw ConnectorError("没能把提示词交给 codex exec：\(Self.describe(error))")
+        }
+        process.closeInput()
+
+        let events = CodexExecEvents(process)
+        var threadId: String?
+        var lastError: String?
+        reading: while let event = await events.next() {
+            switch event {
+            case .threadStarted(let id):
+                threadId = id
+                break reading
+            case .error(let message), .turnFailed(let message):
+                if !message.isEmpty { lastError = message }
+            default:
+                continue
+            }
+        }
+        guard let threadId else {
+            process.terminate()
+            let exit = await process.waitForExit()
+            let reason = nonEmpty(lastError) ?? nonEmpty(exit.reason) ?? "退出码 \(exit.status)"
+            throw ConnectorError("codex exec 没有起来：\(Self.clampLine(reason, limit: Self.summaryLimit))",
+                                 containsPrivateDetail: true, diagnosis: CodexExec.diagnosis(message: reason))
+        }
+
+        let taskId = Self.protocolId(threadId)
+        if let injection { await registry.bind(injection.token, taskId: taskId) }
+        let title = CodexThreadReader.truncate(CodexThreadReader.singleLine(text), limit: Self.titleLimit)
+        register(threadId: threadId, projectPath: path, title: title, origin: .watch)
+        mutate(threadId) {
+            $0.status = .running
+            $0.diagnosis = nil
+            if let model = selection.model { $0.model = model }
+            if let effort = selection.effort { $0.effort = effort }
+        }
+        execRuns[threadId] = ExecRun(process: process)
+        await claim(threadId)
+        await publish(threadId)
+        Task { [weak self] in await self?.followExec(threadId: threadId, events: events) }
+        Self.log.info("codex exec 起了线程 \(threadId, privacy: .public)")
+        return ConnectorOutcome(taskId: taskId, retainsLiveOwnership: true)
+    }
+
+    /// 跟着一次 `codex exec` 到进程退出：agent 回复写进 `lastMessage`，`turn.completed` / `turn.failed` 定结局，
+    /// 两样都没等到就看是不是被中断了。最后交还给只读观察（线程在 `~/.codex` 里，来源是 `exec`）。
+    private func followExec(threadId: String, events: CodexExecEvents) async {
+        var outcome: TaskStatus?
+        var failure: String?
+        var lastError: String?
+        while let event = await events.next() {
+            switch event {
+            case .agentMessage(let text):
+                guard nonEmpty(text) != nil, execRuns[threadId] != nil else { continue }
+                mutate(threadId) { $0.lastMessage = CodexThreadReader.truncate(text, limit: Self.messageLimit) }
+                await publish(threadId)
+            case .turnCompleted:
+                outcome = .completed
+            case .turnFailed(let message):
+                outcome = .failed
+                failure = nonEmpty(message)
+            case .error(let message):
+                if let message = nonEmpty(message) { lastError = message }
+            case .threadStarted, .turnStarted, .other:
+                break
+            }
+        }
+        let exit = await events.process.waitForExit()
+        // 连接器 `stop()` 已经收过尾（记了中断、清了账本）：不再动。
+        guard let run = execRuns.removeValue(forKey: threadId) else { return }
+        let status: TaskStatus
+        if let outcome {
+            status = outcome
+        } else if run.interrupted {
+            status = .interrupted
+        } else {
+            status = .failed
+            failure = lastError ?? nonEmpty(exit.reason) ?? "codex exec 退出码 \(exit.status)"
+        }
+        mutate(threadId) {
+            $0.status = status
+            $0.diagnosis = status == .failed ? CodexExec.diagnosis(message: failure) : nil
+            // 失败时把错误当作最后一条消息：TaskStore 的 TASK_FAILED 通知正文取的就是 lastMessage。
+            if status == .failed, let failure {
+                $0.lastMessage = CodexThreadReader.truncate(failure, limit: Self.messageLimit)
+            }
+        }
+        Self.log.info("codex exec 线程 \(threadId, privacy: .public) 结束：\(status.rawValue, privacy: .public)")
+        await release(threadId, relinquishControl: false)
+    }
+
+    /// SIGINT，宽限 `execInterruptGrace` 秒后还在就结束进程。
+    private func interruptExec(_ threadId: String) {
+        guard var run = execRuns[threadId] else { return }
+        run.interrupted = true
+        execRuns[threadId] = run
+        run.process.interrupt()
+        let process = run.process
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.execInterruptGrace))
+            // 一个线程 id 只对应一次 exec（续聊走 app-server），账本里还在就是这个进程还没退。
+            guard await self?.isExecRunning(threadId) == true else { return }
+            process.terminate()
+        }
+    }
+
+    private func isExecRunning(_ threadId: String) -> Bool { execRuns[threadId] != nil }
 
     // MARK: - 事件
 
@@ -639,6 +814,7 @@ public actor CodexConnector: TaskConnector {
                 if turnId.isEmpty || $0.currentTurnId == turnId { $0.currentTurnId = nil }
                 // 往保守的方向收：任何一轮结束都不再算手机的轮次，下一轮要由手机重新起。
                 $0.phoneTurn = false
+                $0.unattended = false
                 // 这一轮挂着的审批已经被 CodexAppServer 丢掉了，任务上也不能再留着。
                 $0.pendingKey = nil
                 $0.pendingRequest = nil
@@ -715,10 +891,14 @@ public actor CodexConnector: TaskConnector {
     /// 「手机驱动」：不共用桌面时，BotBus 自己的 app-server 里只跑手机起的轮次（含重启后自动 resume 的），都算；
     /// 共用桌面时只算 `phoneTurn` 标着的那一轮，桌面自己的轮次照旧交给人。
     private func autoApprove(_ request: CodexServerRequest, threadId: String) async -> Bool {
-        guard !sharedDesktop || threads[threadId]?.phoneTurn == true,
-              await store.autoApproves(taskId: Self.protocolId(threadId),
-                                       workingDirectory: threads[threadId]?.projectPath),
-              let result = Self.approvalResult(for: request, decision: .accept) else { return false }
+        // 宿主派的无人值守轮次（`AgentRunContext.unattended`）不看项目开关；提问（requestUserInput）照旧挂起。
+        let unattended = threads[threadId]?.unattended == true
+        if !unattended {
+            guard !sharedDesktop || threads[threadId]?.phoneTurn == true,
+                  await store.autoApproves(taskId: Self.protocolId(threadId),
+                                           workingDirectory: threads[threadId]?.projectPath) else { return false }
+        }
+        guard let result = Self.approvalResult(for: request, decision: .accept) else { return false }
         do {
             try await server.respond(to: request.key, result: result)
             Self.log.info("项目已开自动批准，放行 \(request.method, privacy: .public) \(request.key, privacy: .public)")
@@ -737,13 +917,15 @@ public actor CodexConnector: TaskConnector {
     private func handleProcessExit() async {
         messageBuffers.removeAll()
         dropAllStreams()
-        for threadId in order {
+        // `codex exec` 的轮次是另一个进程，app-server 死了不影响它们。
+        for threadId in order where execRuns[threadId] == nil {
             mutate(threadId) {
                 $0.pendingKey = nil
                 $0.pendingRequest = nil
                 $0.currentTurnId = nil
                 $0.loadedGeneration = nil
                 $0.phoneTurn = false
+                $0.unattended = false
             }
             await release(threadId, relinquishControl: false)
         }
@@ -1051,7 +1233,8 @@ public actor CodexConnector: TaskConnector {
             hasFinalAnswer: existing?.hasFinalAnswer ?? false,
             model: existing?.model,
             effort: existing?.effort,
-            phoneTurn: existing?.phoneTurn ?? false)
+            phoneTurn: existing?.phoneTurn ?? false,
+            unattended: existing?.unattended ?? false)
         evictIfNeeded(keeping: threadId)
     }
 

@@ -168,7 +168,7 @@ public struct DshTranscriptDecoder: Sendable {
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
         do {
-            try process.run()
+            try PlatformProcess.run(process)
         } catch {
             try? stdout.fileHandleForReading.close()
             try? stdout.fileHandleForWriting.close()

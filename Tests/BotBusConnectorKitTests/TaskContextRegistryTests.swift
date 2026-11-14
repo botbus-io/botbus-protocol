@@ -25,10 +25,10 @@ final class TaskContextRegistryTests: XCTestCase {
 
     func testUnknownTokenResolvesToNilImmediately() async {
         let registry = TaskContextRegistry()
-        let started = Date()
+        let started = ContinuousClock.now
         let resolved = await registry.resolve("nope", wait: 5)
         XCTAssertNil(resolved)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 1, "没签发过的 token 不该等")
+        XCTAssertLessThan((started.duration(to: .now) / .seconds(1)), 1, "没签发过的 token 不该等")
     }
 
     func testBindIgnoresTokensThisRegistryNeverIssued() async {
@@ -53,10 +53,10 @@ final class TaskContextRegistryTests: XCTestCase {
     func testResolveGivesUpAfterWait() async {
         let registry = TaskContextRegistry()
         let token = await registry.issue()
-        let started = Date()
+        let started = ContinuousClock.now
         let resolved = await registry.resolve(token, wait: 0.2)
         XCTAssertNil(resolved)
-        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.15)
+        XCTAssertGreaterThanOrEqual((started.duration(to: .now) / .seconds(1)), 0.15)
         // 超时之后再绑定不会碰到已经落定的等待者（OneShotContinuation 兜住二次 resume）。
         await registry.bind(token, taskId: "claude:after")
         let later = await registry.resolve(token, wait: 0)

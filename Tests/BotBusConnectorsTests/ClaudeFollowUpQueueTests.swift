@@ -80,9 +80,9 @@ final class ClaudeFollowUpQueueTests: XCTestCase {
         // 两条几乎同时到：第二条落在第一条"起了进程、还没拿到 id"的空当里。
         async let first = connector.followUp(taskId: "claude:sess-q", prompt: "slow one", images: [])
         try await Task.sleep(for: .milliseconds(100))
-        let startedSecond = Date()
+        let startedSecond = ContinuousClock.now
         let second = try await connector.followUp(taskId: "claude:sess-q", prompt: "second", images: [])
-        XCTAssertLessThan(Date().timeIntervalSince(startedSecond), 0.2, "排队的续聊立刻回执，不等上一轮")
+        XCTAssertLessThan((startedSecond.duration(to: .now) / .seconds(1)), 0.2, "排队的续聊立刻回执，不等上一轮")
         XCTAssertEqual(second.taskId, "sess-q")
         _ = try await first
         // 第三条在第一轮跑着时到。

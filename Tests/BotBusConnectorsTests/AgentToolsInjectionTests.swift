@@ -73,6 +73,31 @@ final class AgentToolsInjectionTests: XCTestCase {
         XCTAssertEqual(reused?.token, fresh.token)
     }
 
+    /// 宿主自己派的活（团队看板）：预签的 token、换掉的说明文字、追加的环境变量都只作用于带着上下文的这次调用。
+    func testRunContextOverridesTokenInstructionsAndEnvironment() async throws {
+        let registry = TaskContextRegistry()
+        let usable = AgentToolsConfiguration(cliPath: anyExecutablePath, toolsURL: "http://127.0.0.1:1")
+        let preset = await registry.issue()
+        let context = AgentRunContext(token: preset, instructions: "你是团队的开发", unattended: true,
+                                      environment: ["BOTBUS_TEAM_MEMBER": "dev", "BOTBUS_TASK_TOKEN": "spoofed"])
+        let made = await AgentRunContext.$current.withValue(context) {
+            await AgentToolsInjection.make(usable, registry: registry)
+        }
+        let injection = try XCTUnwrap(made)
+        XCTAssertEqual(injection.token, preset)
+        XCTAssertEqual(injection.instructions, "你是团队的开发")
+        XCTAssertEqual(injection.cliOnlyInstructions, "你是团队的开发")
+        XCTAssertEqual(injection.environment["BOTBUS_TEAM_MEMBER"], "dev")
+        XCTAssertEqual(injection.environment["BOTBUS_TASK_TOKEN"], preset, "注入的三个变量优先")
+        XCTAssertTrue(injection.mcpConfigJSON().contains("BOTBUS_TEAM_MEMBER"))
+        XCTAssertTrue(injection.claudeArguments().contains("你是团队的开发"))
+
+        let plain = await AgentToolsInjection.make(usable, registry: registry)
+        XCTAssertNotEqual(plain?.token, preset, "上下文之外照常签发")
+        XCTAssertNil(plain?.environment["BOTBUS_TEAM_MEMBER"])
+        XCTAssertTrue(plain?.instructions.hasPrefix("This task was sent from the user's phone") == true)
+    }
+
     // MARK: - Claude 命令行
 
     func testClaudeArgumentsWithoutInjection() {
@@ -195,7 +220,108 @@ final class AgentToolsInjectionTests: XCTestCase {
         await connector.stop()
     }
 
-    func testClaudeWithoutToolsInheritsEnvironmentUntouched() async throws {
+    /// 团队看板的员工（无人值守）以最高权限跑：`--permission-mode bypassPermissions` 排在可变参数之前，不会被 `--allowedTools` 吞掉。
+    func testClaudeBypassModeComesBeforeTheVariadicFlags() throws {
+        let value = injection()
+        let arguments = ClaudeConnector.arguments(resuming: nil, injection: value, name: "员工", bypassPermissions: true)
+        XCTAssertEqual(Array(arguments.prefix(4)), ["-p", "--name=员工", "--permission-mode", "bypassPermissions"])
+        XCTAssertEqual(Array(arguments[4..<(4 + value.claudeArguments().count)]), value.claudeArguments())
+        XCTAssertFalse(ClaudeConnector.arguments(resuming: nil, injection: value).contains("--permission-mode"))
+    }
+
+    /// 只有无人值守的轮次用 bypass；以 root 跑时 claude 拒绝这个模式（直接退出），不带，审批照旧由连接器放行。
+    func testClaudeBypassesPermissionsOnlyForUnattendedTurnsAndNotAsRoot() {
+        XCTAssertTrue(ClaudeConnector.bypassesPermissions(unattended: true, isRoot: false))
+        XCTAssertFalse(ClaudeConnector.bypassesPermissions(unattended: true, isRoot: true))
+        XCTAssertFalse(ClaudeConnector.bypassesPermissions(unattended: false, isRoot: false))
+    }
+
+    /// 员工（`AgentRunContext.unattended`）新建与续聊都带 bypass；手机起的一轮不带，照常审批。
+    func testUnattendedClaudeTurnsRunInBypassModeButPhoneTurnsDoNot() async throws {
+        let directory = try tempDirectory()
+        let claude = try fakeClaude(in: directory)
+        let store = makeClaudeStore()
+        let connector = ClaudeConnector(store: store,
+                                        paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                        binary: { claude.path })
+        let expected = !ClaudeConnector.runsAsRoot
+        _ = try await AgentRunContext.$current.withValue(AgentRunContext(unattended: true)) {
+            try await connector.start(projectPath: directory.path, prompt: "员工干活")
+        }
+        XCTAssertEqual(try recorded(directory, "sess-1").arguments.contains("bypassPermissions"), expected)
+        await assertEventually(timeout: 5) { await store.task(id: "claude:sess-1")?.status == .completed }
+        _ = try await AgentRunContext.$current.withValue(AgentRunContext(unattended: true)) {
+            try await connector.followUp(taskId: "claude:sess-1", prompt: "接着干")
+        }
+        XCTAssertEqual(try recorded(directory, "fork-1").arguments.contains("bypassPermissions"), expected)
+        await connector.stop()
+
+        let phone = try tempDirectory()
+        let phoneClaude = try fakeClaude(in: phone)
+        let phoneConnector = ClaudeConnector(store: makeClaudeStore(),
+                                             paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                             binary: { phoneClaude.path })
+        _ = try await phoneConnector.start(projectPath: phone.path, prompt: "手机上新建")
+        XCTAssertFalse(try recorded(phone, "sess-1").arguments.contains("--permission-mode"))
+        await phoneConnector.stop()
+    }
+
+    /// 账号池：BotBus 起的这一轮带账号环境（只给 claude 进程，空串 = 去掉继承来的），自定义接口的模型不对 Claude 的列表；
+    /// 之后手机的续聊（没有上下文）沿用同一份环境和模型，不会换回本机登录的账号。
+    func testProcessEnvironmentAndAnyModelStickToTheSession() async throws {
+        let directory = try tempDirectory()
+        let record = directory.path
+        let claude = try executable("claude", in: directory, script: """
+        #!/bin/sh
+        sid="sess-1"
+        for a in "$@"; do [ "$a" = "--resume" ] && sid="fork-1"; done
+        for a in "$@"; do printf '%s\\0' "$a"; done > "\(record)/$sid.args"
+        printf '%s|%s|%s' "$ANTHROPIC_BASE_URL" "$ANTHROPIC_AUTH_TOKEN" "${PROFILE_PROBE-unset}" > "\(record)/$sid.env"
+        head -n 1 > /dev/null
+        echo '{"type":"system","subtype":"init","session_id":"'"$sid"'"}'
+        echo '{"type":"result","subtype":"success","result":"done"}'
+        sleep 0.5
+        """)
+        setTestEnvironment("PROFILE_PROBE", "inherited")
+        defer { setTestEnvironment("PROFILE_PROBE", nil) }
+        let store = makeClaudeStore()
+        let connector = ClaudeConnector(store: store,
+                                        paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                        binary: { claude.path })
+        let context = AgentRunContext(unattended: true,
+                                      processEnvironment: ["ANTHROPIC_BASE_URL": "https://api.example.com",
+                                                           "ANTHROPIC_AUTH_TOKEN": "sk-1", "PROFILE_PROBE": ""],
+                                      acceptsAnyModel: true)
+        _ = try await AgentRunContext.$current.withValue(context) {
+            try await connector.start(projectPath: directory.path, prompt: "员工干活", images: [],
+                                      selection: ModelSelection(model: "my-model"))
+        }
+        let env = { (sid: String) in try String(contentsOf: directory.appendingPathComponent("\(sid).env"), encoding: .utf8) }
+        let args = { (sid: String) -> [String] in
+            let data = try Data(contentsOf: directory.appendingPathComponent("\(sid).args"))
+            return data.split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+        }
+        XCTAssertEqual(try env("sess-1"), "https://api.example.com|sk-1|unset", "空串的变量从继承的环境里去掉")
+        XCTAssertTrue(try args("sess-1").contains("my-model"))
+        await assertEventually(timeout: 5) { await store.task(id: "claude:sess-1")?.status == .completed }
+        _ = try await connector.followUp(taskId: "claude:sess-1", prompt: "手机上接着问")
+        XCTAssertEqual(try env("fork-1"), "https://api.example.com|sk-1|unset", "手机续聊沿用这条会话的账号")
+        XCTAssertTrue(try args("fork-1").contains("my-model"))
+        await connector.stop()
+
+        // 没有担保时，列表里没有的模型照旧不收。
+        let plain = ClaudeConnector(store: makeClaudeStore(),
+                                    paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),
+                                    binary: { claude.path })
+        do {
+            _ = try await plain.start(projectPath: directory.path, prompt: "x", images: [], selection: ModelSelection(model: "my-model"))
+            XCTFail("不认识的模型应该报错")
+        } catch {}
+        XCTAssertThrowsError(try ClaudeConnector.resolve(ModelSelection(model: "-x"), current: nil, acceptsAnyModel: true))
+        await plain.stop()
+    }
+
+    func testClaudeWithoutToolsInheritsEnvironmentButNotToolVariables() async throws {
         let directory = try tempDirectory()
         let claude = try fakeClaude(in: directory)
         let connector = ClaudeConnector(store: makeClaudeStore(),
@@ -205,7 +331,7 @@ final class AgentToolsInjectionTests: XCTestCase {
         let recorded = try recorded(directory, "sess-1")
         XCTAssertEqual(recorded.arguments, ["-p", "--name=hi", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--output-format", "stream-json", "--verbose"])
         XCTAssertEqual(try stdinText(directory, "sess-1"), "hi")
-        XCTAssertEqual(recorded.environment[1], ProcessInfo.processInfo.environment["BOTBUS_TASK_TOKEN"] ?? "")
+        XCTAssertEqual(recorded.environment[1], "", "没配工具：宿主从别的会话继承来的 token 也不能漏给 claude")
         // 空环境的 claude 找不到 HOME 下的登录态，只会回 "Not logged in"。
         let home = try String(contentsOf: directory.appendingPathComponent("sess-1.home"), encoding: .utf8)
         XCTAssertEqual(home, ProcessInfo.processInfo.environment["HOME"])
@@ -365,5 +491,37 @@ final class AgentToolsInjectionTests: XCTestCase {
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("fork-1.args").path))
         await connector.stop()
+    }
+
+    // MARK: - 继承来的工具变量（宿主从某个 agent 会话里起来时）
+
+    private let inherited = ["BOTBUS_TOOLS_URL": "http://127.0.0.1:9", "BOTBUS_TASK_TOKEN": "parent-token",
+                             "BOTBUS_CLI": "/parent/botbus", "BOTBUS_TEAM_MEMBER": "dev",
+                             "HOME": "/Users/me", "BOTBUS_LOG_PRIVATE": "1"]
+
+    func testInheritedToolVariablesAreStrippedFromAgentEnvironment() {
+        let environment = AgentBinary.environment(for: "/opt/fake/bin/pi", base: inherited)
+        for name in AgentToolsInjection.inheritedVariables {
+            XCTAssertNil(environment[name], "\(name) 是父会话的，不能漏给子 agent")
+        }
+        XCTAssertEqual(environment["HOME"], "/Users/me")
+        XCTAssertEqual(environment["BOTBUS_LOG_PRIVATE"], "1", "只剔工具变量，别的 BOTBUS_* 照常继承")
+
+        let claude = ClaudeConnector.environment(adding: [:], to: inherited)
+        XCTAssertNil(claude[AgentToolsInjection.taskTokenVariable])
+        XCTAssertNil(claude[AgentToolsInjection.teamMemberVariable])
+        XCTAssertEqual(claude["HOME"], "/Users/me")
+    }
+
+    func testInjectedToolVariablesReplaceInheritedOnes() {
+        let injected = injection(token: "own-token").environment
+        let environment = AgentBinary.environment(for: "/opt/fake/bin/pi", adding: injected, base: inherited)
+        XCTAssertEqual(environment[AgentToolsInjection.taskTokenVariable], "own-token")
+        XCTAssertEqual(environment[AgentToolsInjection.cliVariable], cliPath)
+        XCTAssertNil(environment[AgentToolsInjection.teamMemberVariable], "手机任务不是员工，不能看到 team_* 工具")
+
+        let claude = ClaudeConnector.environment(adding: injected, to: inherited)
+        XCTAssertEqual(claude[AgentToolsInjection.taskTokenVariable], "own-token")
+        XCTAssertEqual(claude[AgentToolsInjection.toolsURLVariable], "http://127.0.0.1:4567")
     }
 }

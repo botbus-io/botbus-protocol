@@ -228,13 +228,13 @@ final class DshTranscriptDecoderTests: XCTestCase {
 
     func testProcessTimeoutStopsAChildIgnoringTermination() async throws {
         #if !os(Windows)
-        let started = Date()
+        let started = ContinuousClock.now
         do {
             _ = try await DshTranscriptDecoder.runProcess("/bin/sh", ["-c", "trap '' TERM; while :; do sleep 0.1; done"], 0.3)
             XCTFail("A timed-out decoder must fail")
         } catch {
             XCTAssertEqual((error as? ConnectorError)?.message, "解会话记录超时")
-            XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+            XCTAssertLessThan((started.duration(to: .now) / .seconds(1)), 3)
         }
         #endif
     }
@@ -251,13 +251,13 @@ final class DshTranscriptDecoderTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(20))
         }
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "The decoder must have started before cancellation")
-        let started = Date()
+        let started = ContinuousClock.now
         task.cancel()
         do {
             _ = try await task.value
             XCTFail("Cancelled decoding must not return partial output")
         } catch is CancellationError {
-            XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+            XCTAssertLessThan((started.duration(to: .now) / .seconds(1)), 3)
         }
         #endif
     }

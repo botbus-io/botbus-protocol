@@ -78,13 +78,13 @@ final class DirectoryProbeTests: XCTestCase {
             return .denied
         }, folder: { _ in .documents })
         let path = "/cancelled-\(UUID().uuidString)"
-        let started = Date()
+        let started = ContinuousClock.now
         let task = Task { await probe.diagnose(path) }
         try? await Task.sleep(for: .milliseconds(50))
         task.cancel()
         let result = await task.value
         XCTAssertNil(result)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 0.8)
+        XCTAssertLessThan((started.duration(to: .now) / .seconds(1)), 0.8)
     }
 
     func testErrorsMapToAccess() {

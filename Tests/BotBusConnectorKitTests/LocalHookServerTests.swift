@@ -182,6 +182,32 @@ final class LocalHookServerTests: XCTestCase {
         XCTAssertEqual(calls.current, 1, "被畸形请求折腾过之后服务还活着")
     }
 
+    /// 本机网页（团队看板）要 GET 与自定义响应头；hook 与工具服务器保持只收 POST（上面的 405）。
+    func testAllowedMethodsAndExtraResponseHeaders() async throws {
+        let server = LocalHookServer(supportDirectory: makeSupportDirectory(), portFileName: nil,
+                                     allowedMethods: ["GET", "post", "DELETE"]) { request in
+            .now(LocalHookServer.Response(status: 200, contentType: "text/plain", body: Data("\(request.method) ok".utf8),
+                                          headers: ["Cache-Control": "no-store", "X-Evil": "a\r\nSet-Cookie: x=1",
+                                                    "Content-Length": "999"]))
+        }
+        addTeardownBlock { await server.stop() }
+        let port = try await server.start()
+
+        let get = try await rawRequest("GET /page?x=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", port: port)
+        XCTAssertTrue(get.hasPrefix("HTTP/1.1 200 OK\r\n"), get)
+        XCTAssertTrue(get.contains("Cache-Control: no-store\r\n"), get)
+        XCTAssertTrue(get.contains("X-Evil: aSet-Cookie: x=1\r\n"), "值里的换行被去掉，注入不了新头：\(get)")
+        XCTAssertFalse(get.contains("Content-Length: 999"), "保留头由服务器自己写")
+        XCTAssertTrue(get.hasSuffix("GET ok"), get)
+
+        let delete = try await rawRequest("DELETE /x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", port: port)
+        XCTAssertTrue(delete.hasSuffix("DELETE ok"), delete)
+        let put = try await rawRequest("PUT /x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n", port: port)
+        XCTAssertTrue(put.hasPrefix("HTTP/1.1 405 "), put)
+        let postWithoutLength = try await rawRequest("POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", port: port)
+        XCTAssertTrue(postWithoutLength.hasPrefix("HTTP/1.1 400 "), "带 body 的方法照旧要 Content-Length")
+    }
+
     func testHandlerCanHoldResponseForApproval() async throws {
         let held = Locked<LocalHookServer.Hold?>(nil)
         let answered = Locked<String?>(nil)
@@ -219,9 +245,9 @@ final class LocalHookServerTests: XCTestCase {
             return .hold(hold)
         }
 
-        let begin = Date()
+        let begin = ContinuousClock.now
         let response = try await rawRequest(post(path: "/hooks/claude", body: "{}"), port: started.port)
-        XCTAssertLessThan(Date().timeIntervalSince(begin), 3, "超时必须真的把响应放出来")
+        XCTAssertLessThan((begin.duration(to: .now) / .seconds(1)), 3, "超时必须真的把响应放出来")
         XCTAssertTrue(response.hasSuffix(#"{"decision":"ask"}"#), response)
 
         let hold = try XCTUnwrap(held.current)
@@ -359,10 +385,10 @@ final class LocalHookServerTests: XCTestCase {
             try await rawRequest(post(path: "/hooks/claude", body: "{}"), port: started.port, readTimeout: 10)
         }
         await assertEventually { held.current != nil }
-        let begin = Date()
+        let begin = ContinuousClock.now
         await started.server.stop()
         let text = try await pending.value
-        XCTAssertLessThan(Date().timeIntervalSince(begin), 3)
+        XCTAssertLessThan((begin.duration(to: .now) / .seconds(1)), 3)
         XCTAssertFalse(text.hasPrefix("HTTP/1.1 200 "), text)
         XCTAssertFalse(try XCTUnwrap(held.current).answer(.json("{}")))
     }

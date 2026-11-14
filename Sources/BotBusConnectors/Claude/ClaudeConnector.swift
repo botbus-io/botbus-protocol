@@ -1,3 +1,10 @@
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 import Foundation
 #if canImport(os)
 import os
@@ -105,14 +112,26 @@ public actor ClaudeConnector: TaskConnector {
         var transcriptPath: String?
         /// 这一轮从什么时候算起：进入 running / waitingApproval 的时刻。
         var turnStartedAt: Date?
-        /// transcript 里最近一次用的模型（`ClaudeModels` 的别名），只用来显示。
+        /// transcript 里最近一次用的模型，换成模型列表里的 id（`displayModel`），只用来显示。
         var model: String?
+        /// 上面那个模型在 transcript 里的完整名字（`claude-opus-5-5`）：模型列表换了（问到 claude 自己报的那份、
+        /// 换了一份 claude）时按它重新对一遍 `model`。
+        var transcriptModel: String?
         /// 协议 3.2：手机选过的模型与思考强度。之后每次 `--resume` 都带上——`claude -p` 不记得上一轮的 `--model`。
         var chosenModel: String?
         var chosenEffort: String?
         /// 协议 3.7：这一次 failed 的原因，在失败处由错误原文得出（StopFailure 的类别与详情、报错的 `result` 行、
         /// 起不了进程的错误），不由 `lastMessage` 推——那可能是 agent 自己说的最后一段话。
         var failureDiagnosis: FailureDiagnosis?
+        /// 最近一次 BotBus 起的这一轮是无人值守的（`AgentRunContext.unattended`，宿主自己派的活）：
+        /// 审批直接放行、提问直接拒绝。手机续聊（不带这个上下文）起的轮次把它清掉。
+        var unattended = false
+        /// 这条会话用的账号 / 接口（`AgentRunContext.processEnvironment`）：BotBus 起它时给的，之后每次 `--resume`
+        ///（手机续聊、排队的轮次）照样带上，免得续聊换回本机登录的账号、而 `chosenModel` 是只有那个接口认得的模型。
+        /// 只在内存里：连接器重启后续聊用本机登录的账号。
+        var processEnvironment: [String: String] = [:]
+        /// `chosenModel` 由起它的调用方担保（`AgentRunContext.acceptsAnyModel`，自定义接口的模型）。
+        var acceptsAnyModel = false
 
         /// 一轮正跑着：没有 hook 能保证把它收尾（中断不发 Stop），得盯着。
         var isMidTurn: Bool { status == .running || status == .waitingApproval }
@@ -124,6 +143,15 @@ public actor ClaudeConnector: TaskConnector {
     private let directoryProbe: DirectoryProbe
     /// 本机 `claude --help` 认的强度；nil = CLI 不可用，不报 models。
     private var supportedEfforts: [String]?
+    /// 问 `claude` 它有哪些模型（`ClaudeModels.list`）。nil = 不问，只报写死的别名（测试、没传的调用方）。
+    private let modelLister: ModelLister?
+    /// `claude` 自己报的模型列表；nil = 没问或没问到，退回写死的别名（`ClaudeModels.options`）。
+    private var listedModels: [ClaudeListedModel]?
+    /// 上一次问列表（问没问到都算）的时间，与当时那份 claude（软链接解析到底的路径）。
+    private var modelsListedAt: Date?
+    private var modelsListedBinary: String?
+    /// 正在问的那一次；同时只问一次，后来的等它。
+    private var modelListing: Task<Void, Never>?
     /// `supportedEfforts` 是哪一份 claude 报的（软链接解析到底的路径）。挑中的那份换了（升级、桌面 app
     /// 更新了自带的那份）就重读一次，见 `refreshSupportedEfforts`。
     private var effortsBinary: String?
@@ -250,6 +278,7 @@ public actor ClaudeConnector: TaskConnector {
     ///   - turnEndCheckInterval: nil = `ClaudeConnector.turnEndCheckInterval`；测试传短的。
     ///   - presenceSweepInterval: nil = `ClaudeConnector.presenceSweepInterval`；测试直接调 `sweepPresence()`。
     ///   - approvalTimeout: nil = `LocalHookServer.defaultHoldTimeout`（与 hook 挂起同一个上限）；测试传短的。
+    ///   - modelLister: 问 `claude` 有哪些模型；宿主传 `liveModelLister`，nil = 只报写死的别名。
     public init(store: TaskStore,
                 paths: ClaudePaths = ClaudePaths(),
                 binary: @escaping @Sendable () -> String? = { ClaudePaths.detectClaudeBinary() },
@@ -260,8 +289,10 @@ public actor ClaudeConnector: TaskConnector {
                 titleRetryDelays: [TimeInterval]? = nil,
                 turnEndCheckInterval: TimeInterval? = nil,
                 presenceSweepInterval: TimeInterval? = nil,
-                approvalTimeout: TimeInterval? = nil) {
+                approvalTimeout: TimeInterval? = nil,
+                modelLister: ModelLister? = nil) {
         self.store = store
+        self.modelLister = modelLister
         self.paths = paths
         self.binary = binary
         self.directoryProbe = directoryProbe
@@ -279,9 +310,16 @@ public actor ClaudeConnector: TaskConnector {
                                    for: .claude)
     }
 
-    /// 报给手机的模型列表：版本号来自见过的 transcript，强度来自本机 CLI。
+    /// 报给手机的模型列表：`claude` 自己报的那份；没问到时是写死的别名（版本号来自见过的 transcript，强度来自本机 CLI）。
     private var modelOptions: [ModelOption]? {
-        supportedEfforts.map { ClaudeModels.options(versions: modelVersions, efforts: $0) }
+        if let listedModels { return listedModels.map(\.option) }
+        return supportedEfforts.map { ClaudeModels.options(versions: modelVersions, efforts: $0) }
+    }
+
+    /// transcript 里的完整模型名换成模型列表里的 id；列表里没有的是 nil（手机显示「默认」）。
+    private func displayModel(_ name: String) -> String? {
+        if let listedModels { return ClaudeModels.optionId(forTranscriptModel: name, in: listedModels) }
+        return ClaudeModels.optionId(forTranscriptModel: name)
     }
 
     /// 停连接器：放掉所有挂起的审批（让 Claude Code 回落到自己的弹窗，而不是干等；自己的子进程里按拒绝回），
@@ -306,7 +344,8 @@ public actor ClaudeConnector: TaskConnector {
         desktopMissing.removeAll()
     }
 
-    /// 手机发起新一轮之前看一眼挑中的 claude 换没换：换了就重读它认的强度，变了下一次 `publish` 补发快照。
+    /// 手机发起新一轮之前看一眼挑中的 claude 换没换：换了就重读它认的强度，之前问到的模型列表是另一份 claude 的、
+    /// 丢掉（先退回别名，`refreshModels(for:)` 接着重问）；变了下一次 `publish` 补发快照。
     /// 没换时只是找一遍可执行文件（版本号有缓存），不起进程。
     private func refreshSupportedEfforts() {
         let executable = binary()
@@ -314,9 +353,81 @@ public actor ClaudeConnector: TaskConnector {
         guard resolved != effortsBinary else { return }
         effortsBinary = resolved
         let efforts = ClaudeModels.efforts(forBinary: executable)
-        guard efforts != supportedEfforts else { return }
+        guard efforts != supportedEfforts || listedModels != nil else { return }
         supportedEfforts = efforts
+        listedModels = nil
+        remapSessionModels()
         if store.connectors.setModels(modelOptions, for: .claude) { modelsChanged = true }
+    }
+
+    // MARK: - 模型列表
+
+    /// 问 `claude` 有哪些模型，签名见 `ClaudeModels.list(binary:)`；问不到返回 nil。
+    public typealias ModelLister = @Sendable (_ binary: String) async -> [ClaudeListedModel]?
+
+    /// 真的去问本机的 `claude`（起一次不带 prompt 的 `claude -p`，不花 token、不留会话）。
+    public static let liveModelLister: ModelLister = { await ClaudeModels.list(binary: $0) }
+
+    /// 问到的列表用多久：别名会随 Claude Code 升级指到新模型，换账号后能用的模型也会变。
+    static let modelListTTL: TimeInterval = 30 * 60
+    /// 这一轮选的模型不在列表里时会现问一次；刚问过（这么久以内）就不再问，免得每次都等一个注定一样的答案。
+    static let modelListRetryInterval: TimeInterval = 60
+
+    /// 问一次 `claude` 的模型列表并换上。宿主在连接器起来后调一次；之后手机 / 团队每次发起新一轮时，
+    /// 过期了、换了 claude、选了列表里没有的模型都会自己重问（`refreshModels(for:)`）。没传 `modelLister` 时什么都不做。
+    public func refreshModels() async {
+        if let modelListing {
+            await modelListing.value
+            return
+        }
+        refreshSupportedEfforts()
+        guard let modelLister, let executable = binary() else { return }
+        let resolved = URL(fileURLWithPath: executable).resolvingSymlinksInPath().path
+        let listing = Task { [weak self] in
+            let listed = await modelLister(executable)
+            await self?.applyListedModels(listed, binary: resolved)
+        }
+        modelListing = listing
+        await listing.value
+    }
+
+    /// 这次问到的换上；没问到（nil）时同一份 claude 之前问到的留着——多半是一时的（超时、刚好没网）。
+    private func applyListedModels(_ listed: [ClaudeListedModel]?, binary: String) async {
+        modelListing = nil
+        modelsListedAt = now()
+        modelsListedBinary = binary
+        // 问的时候挑中的 claude 已经换了：这份答案是旧的那份的，不用（`refreshModels(for:)` 见路径对不上会重问）。
+        guard binary == effortsBinary else { return }
+        guard let listed, !listed.isEmpty, listed != listedModels else { return }
+        listedModels = listed
+        remapSessionModels()
+        if store.connectors.setModels(modelOptions, for: .claude) { modelsChanged = true }
+        // 没有任务事件在路上：自己推一次，把换了 id 的会话与新的模型列表发出去。
+        await publish(notify: false)
+    }
+
+    /// 模型列表换了：会话上显示用的模型按 transcript 里的完整名字重新对一遍。
+    private func remapSessionModels() {
+        for (id, session) in sessions {
+            guard let name = session.transcriptModel else { continue }
+            sessions[id]?.model = displayModel(name)
+        }
+    }
+
+    /// 手机 / 团队发起新一轮之前：看一眼 claude 换没换，模型列表该不该重问。
+    /// 这一轮选的模型不在手头的列表里（还没问到、刚换了 claude、Claude Code 新上了模型）就现问一次再判；
+    /// 只是过期了的在后台重问，不让这一轮等。
+    private func refreshModels(for selection: ModelSelection) async {
+        refreshSupportedEfforts()
+        guard modelLister != nil else { return }
+        let age = modelsListedAt.map { now().timeIntervalSince($0) }
+        let stale = modelsListedBinary != effortsBinary || age.map { $0 > Self.modelListTTL } ?? true
+        if let model = selection.model, ClaudeModels.option(model, in: modelOptions ?? []) == nil,
+           stale || (age ?? .infinity) > Self.modelListRetryInterval {
+            await refreshModels()
+        } else if stale, modelListing == nil {
+            Task { await self.refreshModels() }
+        }
     }
 
     /// 见到一个完整模型名：版本比记着的新就更新手机上的模型列表，下一次 `publish` 补发快照。
@@ -376,12 +487,16 @@ public actor ClaudeConnector: TaskConnector {
         case .stop:
             let name = event.transcriptPath.flatMap { ClaudeModels.lastModel(inTranscriptAt: $0) }
             if let name { noteModel(name) }
-            let model = name.flatMap { ClaudeModels.optionId(forTranscriptModel: $0) }
+            let model = name.flatMap { displayModel($0) }
             apply(event) { session, event in
                 session.status = .completed
                 session.pendingRequest = nil
                 if let text = self.finalMessage(for: event) { session.lastMessage = text }
-                if let model { session.model = model }
+                // 读到了名字就照它记，哪怕列表里没有这个模型（记成 nil，手机显示「默认」，不留着上一轮的）。
+                if let name {
+                    session.transcriptModel = name
+                    session.model = model
+                }
             }
         case .stopFailure:
             apply(event) { session, event in
@@ -524,6 +639,15 @@ public actor ClaudeConnector: TaskConnector {
             let object = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any]
             let asked = ClaudeAskedQuestions(toolName: toolName, input: object)
             let cwd = sessions[sessionID]?.projectPath ?? workingDirectory
+            if sessions[sessionID]?.unattended == true {
+                // 宿主自己派的无人值守轮次：没有人看着，审批放行；提问没人答，直接拒掉让 agent 自己拿主意。
+                let decision: ClaudePermissionDecision = asked == nil
+                    ? .allow(updatedInput: nil)
+                    : .deny(message: AgentRunContext.unattendedQuestionRefusal)
+                Self.log.info("无人值守的轮次，\(asked == nil ? "放行" : "拒绝提问", privacy: .public) \(toolName, privacy: .public)")
+                stdin.send(ClaudeControlOutput.response(requestID: requestID, decision: decision, originalInput: input))
+                return
+            }
             if asked == nil, await store.autoApproves(taskId: taskId(for: sessionID), workingDirectory: cwd) {
                 Self.log.info("项目已开自动批准，放行 \(toolName, privacy: .public)")
                 stdin.send(ClaudeControlOutput.response(requestID: requestID, decision: .allow(updatedInput: nil),
@@ -686,14 +810,17 @@ public actor ClaudeConnector: TaskConnector {
     private func adopt(_ entry: ClaudeSessionHistory.Entry, now current: Date) {
         let startedAt = ProtocolJSON.timestamp(entry.startedAt)
         if let name = entry.model { noteModel(name) }
-        let model = entry.model.flatMap { ClaudeModels.optionId(forTranscriptModel: $0) }
+        let model = entry.model.flatMap { displayModel($0) }
         if var session = sessions[entry.sessionID] {
             if let title = entry.title, entry.titleSource.replaces(session.titleSource) {
                 session.title = title
                 session.titleSource = entry.titleSource
             }
             if session.lastMessage == nil { session.lastMessage = entry.lastMessage }
-            if session.model == nil { session.model = model }
+            if session.transcriptModel == nil {
+                session.transcriptModel = entry.model
+                session.model = model
+            }
             if startedAt < session.startedAt { session.startedAt = startedAt }
             sessions[entry.sessionID] = session
             return
@@ -707,6 +834,7 @@ public actor ClaudeConnector: TaskConnector {
         session.status = current.timeIntervalSince(entry.updatedAt) > SessionFormatting.idleAfter ? .idle : .completed
         session.lastMessage = entry.lastMessage
         session.model = model
+        session.transcriptModel = entry.model
         session.startedAt = startedAt
         session.updatedAt = ProtocolJSON.timestamp(entry.updatedAt)
         sessions[entry.sessionID] = session
@@ -1070,16 +1198,22 @@ public actor ClaudeConnector: TaskConnector {
     public func start(projectPath: String, prompt: String, images: [URL],
                       selection: ModelSelection) async throws -> ConnectorOutcome {
         // 先查模型、再读图：不对就别起进程，也别签 token。
-        refreshSupportedEfforts()
-        let chosen = try Self.resolve(selection, current: nil, options: modelOptions ?? [])
+        await refreshModels(for: selection)
+        let context = AgentRunContext.current
+        let anyModel = context?.acceptsAnyModel ?? false
+        let processEnvironment = context?.processEnvironment ?? [:]
+        let chosen = try Self.resolve(selection, current: nil, options: modelOptions ?? [], acceptsAnyModel: anyModel)
         let input = try Self.stdinMessage(prompt: prompt, images: images)
         let injection = await AgentToolsInjection.make(tools(), registry: registry)
         let executable = binary().map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
         let name = executable != nil && executable == binaryWithoutName ? nil : Self.sessionName(for: prompt)
+        let unattended = AgentRunContext.current?.unattended ?? false
         let launch = { (name: String?) in
             try await self.run(arguments: Self.arguments(resuming: nil, injection: injection,
-                                                         model: chosen.model, effort: chosen.effort, name: name),
-                               workingDirectory: projectPath, environment: injection?.environment ?? [:], stdin: input)
+                                                         model: chosen.model, effort: chosen.effort, name: name,
+                                                         bypassPermissions: Self.bypassesPermissions(unattended: unattended)),
+                               workingDirectory: projectPath, environment: injection?.environment ?? [:],
+                               processEnvironment: processEnvironment, stdin: input)
         }
         let launched: Launch
         do {
@@ -1096,6 +1230,9 @@ public actor ClaudeConnector: TaskConnector {
         var session = makeSession(id: sessionID, projectPath: projectPath, origin: .watch)
         session.chosenModel = chosen.model
         session.chosenEffort = chosen.effort
+        session.unattended = unattended
+        session.processEnvironment = processEnvironment
+        session.acceptsAnyModel = anyModel
         Self.applyPromptTitle(&session, prompt: prompt, hasImages: !images.isEmpty)
         if let existing = sessions[sessionID], existing.pendingRequest != nil {
             session.status = existing.status
@@ -1118,10 +1255,11 @@ public actor ClaudeConnector: TaskConnector {
     public func followUp(taskId: String, prompt: String, images: [URL],
                          selection: ModelSelection) async throws -> ConnectorOutcome {
         let sessionID = try nativeID(taskId)
-        refreshSupportedEfforts()
+        await refreshModels(for: selection)
         var chosen = (model: sessions[sessionID]?.chosenModel, effort: sessions[sessionID]?.chosenEffort)
         if !selection.isEmpty {
-            chosen = try Self.resolve(selection, current: sessions[sessionID], options: modelOptions ?? [])
+            chosen = try Self.resolve(selection, current: sessions[sessionID], options: modelOptions ?? [],
+                                      acceptsAnyModel: sessions[sessionID]?.acceptsAnyModel ?? false)
             sessions[sessionID]?.chosenModel = chosen.model
             sessions[sessionID]?.chosenEffort = chosen.effort
         }
@@ -1162,11 +1300,17 @@ public actor ClaudeConnector: TaskConnector {
         // 续聊沿用这条任务之前的 token（agent 若把它记在了别处也照样有效）；分支出新 session 时改绑到新 id。
         launching.insert(sessionID)
         defer { launching.remove(sessionID) }
+        // 这一轮是不是无人值守：手机续聊与排队的轮次读不到上下文，一律清掉。
+        let context = AgentRunContext.current
+        let unattended = context?.unattended ?? false
+        // 账号 / 接口：BotBus 这次另给了就用这次的，否则沿用会话起来时的（手机续聊、排队的轮次）。
+        let processEnvironment = context?.processEnvironment ?? existing?.processEnvironment ?? [:]
         let injection = await AgentToolsInjection.make(tools(), registry: registry, reusing: self.taskId(for: sessionID))
         let launched = try await run(arguments: Self.arguments(resuming: sessionID, injection: injection,
-                                                               model: turn.model, effort: turn.effort),
+                                                               model: turn.model, effort: turn.effort,
+                                                               bypassPermissions: Self.bypassesPermissions(unattended: unattended)),
                                      workingDirectory: workingDirectory, environment: injection?.environment ?? [:],
-                                     stdin: turn.input)
+                                     processEnvironment: processEnvironment, stdin: turn.input)
         let newID = launched.sessionID
         // 会话先改好再 await（绑 token）：这一轮的审批随时可能从 stdout 到（见 `handleControl`）。
         if newID != sessionID {
@@ -1178,14 +1322,20 @@ public actor ClaudeConnector: TaskConnector {
             Self.applyPromptTitle(&branched, prompt: turn.prompt, hasImages: turn.hasImages)
             // 分支是同一段对话的延续：手机选的模型跟过去。
             branched.model = existing?.model
+            branched.transcriptModel = existing?.transcriptModel
             branched.chosenModel = existing?.chosenModel
             branched.chosenEffort = existing?.chosenEffort
+            branched.unattended = unattended
+            branched.processEnvironment = processEnvironment
+            branched.acceptsAnyModel = existing?.acceptsAnyModel ?? false
             sessions[newID] = branched
             // 旧会话被分支取代：从列表中移除，之后的桌面 hook 事件也不再接收。
             // 手机上只看到分支那一条，不会出现"一个会话变成两个"。
             if let old = sessions.removeValue(forKey: sessionID) { releaseHold(for: old) }
             superseded.insert(sessionID)
         } else {
+            sessions[sessionID]?.unattended = unattended
+            sessions[sessionID]?.processEnvironment = processEnvironment
             // 这一轮的审批若已经早到（挂在新进程的 stdin 上），别被"开始跑了"盖掉。
             let earlyCard = sessions[sessionID]?.pendingRequest.flatMap { holds[$0.id] }
                 .map { hold in controls[sessionID].map(hold.isOn) ?? false } ?? false
@@ -1342,7 +1492,15 @@ public actor ClaudeConnector: TaskConnector {
     /// 手机这次选的与会话上已经记着的合起来，得出之后每轮的 `--model` / `--effort`。
     /// 模型不认识、强度不在该模型的档位里都直接报错；换到不能调强度的模型（Haiku）时强度清掉。
     static func resolve(_ selection: ModelSelection, current session: Session?,
-                        options: [ModelOption] = ClaudeModels.options) throws -> (model: String?, effort: String?) {
+                        options: [ModelOption] = ClaudeModels.options,
+                        acceptsAnyModel: Bool = false) throws -> (model: String?, effort: String?) {
+        if let model = selection.model, acceptsAnyModel {
+            // 自定义接口的模型：只查写法（会变成 `--model` 的值，不能以 `-` 开头），强度不对列表——接口不报档位。
+            guard ModelOption.isValidId(model) else { throw ConnectorError("模型的写法不对：\(model)") }
+            let effort = selection.effort ?? session?.chosenEffort
+            if let effort, !ModelOption.isValidEffort(effort) { throw ConnectorError("思考强度的写法不对：\(effort)") }
+            return (model, effort)
+        }
         if let model = selection.model, ClaudeModels.option(model, in: options) == nil {
             throw ConnectorError("Claude Code 没有「\(model)」这个模型")
         }
@@ -1363,17 +1521,22 @@ public actor ClaudeConnector: TaskConnector {
     /// 否则后面的参数会被当成 MCP 配置文件或工具名吞掉。
     ///
     /// prompt 不是位置参数：一律经 stdin 写一行 stream-json（见 `stdinPayload`，发图时图也在里面），
-    /// stdin 开着等控制协议的回答（`--permission-prompt-tool stdio`，见 `ClaudeControlRequest`），这一轮 `result` 后关掉。
+    /// stdin 开着等控制协议的回答（`--permission-prompt-tool stdio`，见 `ClaudeControlRequest`），
+    /// claude 连后台的子代理 / 命令都做完了才关（`StreamJSONReader.onIdle`）。
     /// `model` / `effort`（协议 3.2）的值已由 `resolve` 限定在 `ClaudeModels` 里，不会以 `-` 开头。
     /// `name`（只在新建时给，见 `sessionName`）写成一个 `--name=…`：名字来自用户的话，可能以 `-` 开头，
     /// 分成两个参数会被当成别的选项。
+    /// `bypassPermissions`（见 `bypassesPermissions(unattended:)`）：`--permission-mode bypassPermissions`，
+    /// 团队看板的员工以最高权限干活，命令、改文件、联网都不发 `can_use_tool`；只有提问还经控制协议到（无人值守时拒掉）。
     static func arguments(resuming sessionID: String?, injection: AgentToolsInjection?,
-                          model: String? = nil, effort: String? = nil, name: String? = nil) -> [String] {
+                          model: String? = nil, effort: String? = nil, name: String? = nil,
+                          bypassPermissions: Bool = false) -> [String] {
         var arguments = ["-p"]
         if let sessionID { arguments += ["--resume", sessionID] }
         if let model { arguments += ["--model", model] }
         if let effort { arguments += ["--effort", effort] }
         if let name { arguments.append("--name=\(name)") }
+        if bypassPermissions { arguments += ["--permission-mode", "bypassPermissions"] }
         if let injection { arguments += injection.claudeArguments() }
         arguments += ["--input-format", "stream-json", "--permission-prompt-tool", "stdio",
                       "--output-format", "stream-json", "--verbose"]
@@ -1416,14 +1579,34 @@ public actor ClaudeConnector: TaskConnector {
         }
     }
 
-    /// 子进程环境：继承本进程，再叠上注入的变量（同名以注入为准）。
+    /// 子进程环境：继承本进程（剔掉继承来的 `BOTBUS_*` 工具变量），再叠上注入的变量（同名以注入为准）。
     ///
     /// 总是给出完整的一份：`Process.environment = nil` 在 macOS 26 上起出来的是**空**环境而不是继承，
     /// 没有 HOME 的 claude 读不到登录态，只会回 "Not logged in"。
     static func environment(adding extra: [String: String],
                             to base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
-        base.merging(extra) { _, injected in injected }
+        AgentToolsInjection.strippingInherited(base).merging(extra) { _, injected in injected }
     }
+
+    /// 宿主派的无人值守轮次（团队看板的员工）以 bypassPermissions 跑，同 Codex 员工的
+    /// `--dangerously-bypass-approvals-and-sandbox`。以 root 跑时 claude 拒绝这个模式、直接退出
+    /// （"cannot be used with root/sudo privileges"，Linux 宿主可能以 root 跑），这时不带，审批照旧由 `handleControl` 一律放行。
+    /// 手机续聊、排队的轮次不是无人值守，照常审批。
+    static func bypassesPermissions(unattended: Bool, isRoot: Bool = runsAsRoot) -> Bool {
+        unattended && !isRoot
+    }
+
+    static var runsAsRoot: Bool {
+        #if os(Windows)
+        false
+        #else
+        geteuid() == 0
+        #endif
+    }
+
+    /// 每次 `claude -p` 都加的变量：让它在 stdout 报 `session_state_changed`（idle 要等后台子代理跑完才来），
+    /// `StreamJSONReader` 据此判断什么时候能关 stdin。不认得它的旧版本照旧，退回到读到 `result` 就关。
+    static let streamEnvironment = ["CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"]
 
     /// `run` 起好的一轮。调用方把会话记好（新建、分支或标成在跑）之后调 `registered()`，这一轮的 `finish` 才会跑：
     /// claude 早早退出（没登录……）时，读端收尾的 `Task` 可能比 `run` 的返回先抢到 actor，找不到会话就把结果丢了，
@@ -1441,9 +1624,12 @@ public actor ClaudeConnector: TaskConnector {
     /// 一轮可能跑几分钟，不能让客户端的请求挂在那里。
     ///
     /// stdin 是一根管道：起来后先写 `stdin`（这一轮的 user 消息），之后留着写控制协议的回答，
-    /// 读到 `result`（或进程退出）时关掉。
+    /// claude 报空闲且没有后台任务（`StreamJSONReader.onIdle`）或进程退出时关掉。只看 `result` 会关早：
+    /// 这一轮在后台开了子代理 / 命令时 `result` 先出来，它们与跑完后 claude 自己接着起的那一轮要审批时，
+    /// stdin 已经关了，全报 "Stream closed"，无人值守的员工因此跑不了命令、改不了文件。
     private func run(arguments: [String], workingDirectory: String,
-                     environment extra: [String: String] = [:], stdin: Data) async throws -> Launch {
+                     environment extra: [String: String] = [:], processEnvironment: [String: String] = [:],
+                     stdin: Data) async throws -> Launch {
         guard let executable = binary() else {
             throw ConnectorError("本机没找到 claude 可执行文件", diagnosis: .agentNotInstalled)
         }
@@ -1454,7 +1640,8 @@ public actor ClaudeConnector: TaskConnector {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        process.environment = Self.environment(adding: extra)
+        process.environment = AgentRunContext.applying(
+            processEnvironment, to: Self.environment(adding: Self.streamEnvironment.merging(extra) { _, injected in injected }))
         process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
         let output = Pipe()
         process.standardOutput = output
@@ -1470,8 +1657,8 @@ public actor ClaudeConnector: TaskConnector {
         reader.onControl = { [weak self] line, id in
             Task { await self?.handleControl(line, sessionID: id, stdin: channel, workingDirectory: workingDirectory) }
         }
-        // 一轮结束：关 stdin（EOF），claude 才会退出。
-        reader.onResult = { channel.close() }
+        // 这一轮连同后台的事都做完了：关 stdin（EOF），claude 才会退出。
+        reader.onIdle = { channel.close() }
         let launched = OneShotContinuation<Void>()
         reader.onFinished = { [weak self] result in
             // 一行 init 都没读到就结束了：别让调用方一直等到超时。
@@ -1489,7 +1676,7 @@ public actor ClaudeConnector: TaskConnector {
         }
 
         do {
-            try process.run()
+            try PlatformProcess.run(process)
         } catch {
             // 没起来：两根管子剩下的三端也关掉（stdin 的写端由 channel 关），Linux 上不会有人替我们关。
             channel.close()
