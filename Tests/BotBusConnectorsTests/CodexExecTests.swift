@@ -336,6 +336,7 @@ final class CodexExecTests: XCTestCase {
 
     /// 账号池：另一个 Codex 账号经 `CODEX_HOME` 交给 `codex exec`；空串的变量从继承的环境里去掉。
     func testSubprocessLauncherAppliesProcessEnvironment() async throws {
+        try skipPOSIXScriptOnWindows()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-env-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -282,8 +282,8 @@ final class AgentToolsInjectionTests: XCTestCase {
         echo '{"type":"result","subtype":"success","result":"done"}'
         sleep 0.5
         """)
-        setenv("PROFILE_PROBE", "inherited", 1)
-        defer { unsetenv("PROFILE_PROBE") }
+        setTestEnvironment("PROFILE_PROBE", "inherited")
+        defer { setTestEnvironment("PROFILE_PROBE", nil) }
         let store = makeClaudeStore()
         let connector = ClaudeConnector(store: store,
                                         paths: ClaudePaths(claudeHome: URL(fileURLWithPath: "/nonexistent")),

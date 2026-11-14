@@ -1,5 +1,22 @@
 import Foundation
 import XCTest
+#if os(Windows)
+import WinSDK
+#endif
+
+/// 改本进程的环境变量（nil = 删掉），子进程会继承。Windows 没有 `setenv` / `unsetenv`（#45）。
+func setTestEnvironment(_ name: String, _ value: String?) {
+    #if os(Windows)
+    _ = name.withCString(encodedAs: UTF16.self) { key in
+        if let value {
+            return value.withCString(encodedAs: UTF16.self) { SetEnvironmentVariableW(key, $0) }
+        }
+        return SetEnvironmentVariableW(key, nil)
+    }
+    #else
+    if let value { setenv(name, value, 1) } else { unsetenv(name) }
+    #endif
+}
 
 extension XCTestCase {
     /// 建符号链接。Windows 上没开开发者模式（也没以管理员运行）时建不了（`ERROR_PRIVILEGE_NOT_HELD`）：
